@@ -23,10 +23,9 @@ from projects.rl.reward_function.llm_judge_reward import (
     compute_caption_judge_rewards_batch,
 )
 
-# 模块加载时初始化一次。从 env vars 读 endpoint:
+# 仅当 batch 含 LLM-as-a-judge source 时初始化。从 env vars 读 endpoint:
 #   export LLM_AS_A_JUDGE_BASES="http://<LLM_JUDGE_HOST>:<PORT>/v1"
 #   export LLM_AS_A_JUDGE_MODEL="qwen-judge"
-init_judge_clients()
 
 # openai_api_key = "OSBGk4dbKaJULxniW3L5k37bYtQJLAYd"
 # openai_api_base_list = [
@@ -1043,6 +1042,7 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             if ri["source"] in ("dam_captioning", "tg_captioning")
         ]
         if judge_caption_indices:
+            init_judge_clients()
             judge_rewards = compute_caption_judge_rewards_batch(
                 responses=[reward_inputs[i]["response"]         for i in judge_caption_indices],
                 gts      =[reward_inputs[i]["cap_ground_truth"] for i in judge_caption_indices],

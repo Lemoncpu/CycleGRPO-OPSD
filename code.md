@@ -177,7 +177,7 @@ localization:
 | `groundingme` / `denseworld_*` / `refcoco_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
 | `gres_no_target` | no-target/null 正确性 + 非重复奖励 |
 | `tg_multi_merged` | 视频循环：tIoU、时间格式、段数门控、禁止 caption 泄漏时间 |
-| `dam_captioning` / `tg_captioning` | 外部 OpenAI-compatible vLLM judge 的布尔 caption reward；不是主 CycleGRPO 路径 |
+| `dam_captioning` / `tg_captioning` | 外部 OpenAI-compatible vLLM judge 的布尔 caption reward；仅当 batch 实际包含这些 source 时才初始化 judge client，不是主 CycleGRPO 路径 |
 | `dam_grounding` / `tg_grounding` | 独立 grounding 任务，分别做 mask-token 或时间区间奖励 |
 | `gcg`、`psg` 等 | grounded caption/scene graph 的 token、短语、格式奖励或保留分支 |
 
@@ -246,7 +246,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
-| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE 和 torchvision，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
+| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
 
 ### 5.2 `verl/`：RL 引擎
@@ -429,3 +429,17 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.3 节和根目录依赖职责说明。
 - 行为：转换器现在将单目标 VQ-SAM2 返回的 `(1, 1, 2)` code 张量校验后展平为两个 SAMTok code；元素数不是两个时仍明确报错。依赖清单加入 SAM2 Hiera backbone 所需的 `iopath>=0.1.10`。
 - 验证：`python3 -m py_compile projects/rl/datasets/prepare_refcoco_rl_dataset.py` 和 `git diff --check` 通过；服务器实际输出确认此前 code 张量为 `[[73, 5]]`，即单目标的有效两层 code。本机缺少 PyTorch 和服务器侧 GPU/权重，未运行转换。
+
+### 2026-07-20 - 补全奖励模块运行时依赖
+
+- 代码：修改 `requirements.txt`。
+- 文档：更新根目录依赖职责说明。
+- 行为：显式安装 `text2mask.py` 导入 CIDER 所需的 `pycocoevalcap`；将 NumPy 约束为 `<2`，避免当前 W&B 版本在导入时访问已删除的 `np.float_`。
+- 验证：服务器训练初始化已确认缺失 `pycocoevalcap`，并以 NumPy 2.1.3 复现 W&B 导入错误；未在本机安装完整 CUDA/Ray 依赖。
+
+### 2026-07-20 - 延迟初始化外部 caption judge
+
+- 代码：修改 `projects/rl/reward_function/text2mask.py` 和 `projects/rl/reward_function/llm_judge_reward.py`。
+- 文档：更新奖励 source 表。
+- 行为：仅当 reward batch 包含 `dam_captioning` 或 `tg_captioning` 时才创建 OpenAI-compatible judge client，且同一 reward actor 只创建一次。纯 `refcoco_cycle` 训练不再依赖 HTTP/SOCKS proxy、judge endpoint 或 `socksio`。
+- 验证：`python3 -m py_compile` 和 `git diff --check`；服务器在纯 RefCOCO 数据加载期间复现了导入阶段创建 judge client 后缺失 `socksio` 的失败。未在本机执行 GPU/Ray 训练。

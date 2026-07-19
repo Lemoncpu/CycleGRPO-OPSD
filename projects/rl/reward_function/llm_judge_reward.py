@@ -128,6 +128,9 @@ def init_judge_clients(
     """
     global _ASYNC_CLIENTS, _MODEL_NAMES
 
+    if _ASYNC_CLIENTS:
+        return
+
     if api_bases is None:
         env = os.environ.get(
             "LLM_AS_A_JUDGE_BASES",
