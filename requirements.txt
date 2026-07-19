@@ -3,6 +3,7 @@ codetiming
 datasets
 flash-attn>=2.4.3
 hydra-core
+iopath>=0.1.10
 liger-kernel
 mathruler
 numpy

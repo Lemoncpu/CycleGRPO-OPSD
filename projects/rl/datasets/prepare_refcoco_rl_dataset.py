@@ -109,9 +109,14 @@ def encode_mask_token(model: VQ_SAM2, image: Image.Image, binary_mask: np.ndarra
         reconstruct_mask=False,
         freeze_codebook=True,
     )
-    local_codes = output.quant_codes.squeeze(0).detach().cpu().tolist()
-    if len(local_codes) != 2:
-        raise ValueError(f"Expected two VQ codes, got {local_codes}")
+    quant_codes = output.quant_codes.detach()
+    if quant_codes.numel() != 2:
+        raise ValueError(
+            "Expected exactly two VQ codes for one RefCOCO mask, "
+            f"got shape {tuple(quant_codes.shape)}: {quant_codes.cpu().tolist()}"
+        )
+    # VQ_SAM2 returns codes as (batch, mask_tokens, codebook_depth).
+    local_codes = quant_codes.reshape(-1).cpu().tolist()
     global_codes = [depth * 256 + int(code) for depth, code in enumerate(local_codes)]
     return "<|mt_start|>" + "".join(f"<|mt_{code:04d}|>" for code in global_codes) + "<|mt_end|>"
 

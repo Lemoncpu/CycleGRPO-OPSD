@@ -66,7 +66,9 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 `projects/rl/datasets/prepare_refcoco_rl_dataset.py` 可把标准 RefCOCO 的
 `instances.json`、`refs(unc).p` 和 COCO 图像目录转换成当前 RL loader 所需的
 Parquet。它按 seed 固定打乱 train refs，逐个用当前 SAMTok VQ-SAM2 权重编码目标
-mask，并在获得 `max_samples` 条有效样本后停止；默认正好产出 20,000 条。
+mask，并在获得 `max_samples` 条有效样本后停止；默认正好产出 20,000 条。VQ-SAM2
+返回的 code 张量形状为 `(batch, mask_tokens, codebook_depth)`；转换器仅接受一个
+mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 
 生成数据的 source 是 `refcoco_cycle`，会进入图像 CycleGRPO 分支。每条数据同时
 保存 mask token 和压缩 COCO RLE，因此 OPSD 训练奖励优先使用原始 RLE 计算像素 IoU。
@@ -244,7 +246,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
-| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、COCO RLE 和 torchvision，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
+| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE 和 torchvision，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
 
 ### 5.2 `verl/`：RL 引擎
@@ -420,3 +422,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.3、3.2、3.3、3.5、5.3 节的 RefCOCO 数据契约、`refcoco_cycle` 路由和目录职责。
 - 行为：转换工具从标准 RefCOCO train refs 固定采样指定数量，使用当前 VQ-SAM2 生成两个 mask token，写入 RL schema 和原始 COCO RLE；`refcoco_cycle` 与 DenseWorld 一样执行图像 CycleGRPO caption/localization 奖励与真实像素 IoU。依赖清单显式包含转换所需的 Hydra、COCO RLE 和 torchvision。该数据源是对论文 DenseWorld 的受控替代，不是论文原始数据复现。
 - 验证：新增脚本、trainer 和 reward 文件通过 `py_compile`；`git diff --check` 通过。当前机器没有服务器侧 RefCOCO、SAMTok/SAM2 权重和 CUDA，未执行 20k 转换或 FSDP/vLLM smoke training。
+
+### 2026-07-20 - 修正 RefCOCO VQ code 形状和 SAM2 依赖
+
+- 代码：修改 `projects/rl/datasets/prepare_refcoco_rl_dataset.py` 和 `requirements.txt`。
+- 文档：更新第 2.3 节和根目录依赖职责说明。
+- 行为：转换器现在将单目标 VQ-SAM2 返回的 `(1, 1, 2)` code 张量校验后展平为两个 SAMTok code；元素数不是两个时仍明确报错。依赖清单加入 SAM2 Hiera backbone 所需的 `iopath>=0.1.10`。
+- 验证：`python3 -m py_compile projects/rl/datasets/prepare_refcoco_rl_dataset.py` 和 `git diff --check` 通过；服务器实际输出确认此前 code 张量为 `[[73, 5]]`，即单目标的有效两层 code。本机缺少 PyTorch 和服务器侧 GPU/权重，未运行转换。
