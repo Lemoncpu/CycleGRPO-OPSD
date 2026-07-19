@@ -2,6 +2,7 @@ accelerate
 codetiming
 datasets
 flash-attn>=2.4.3
+hydra-core
 liger-kernel
 mathruler
 numpy
@@ -10,11 +11,13 @@ pandas
 peft
 pillow
 pyarrow>=15.0.0
+pycocotools
 pylatexenc
 qwen-vl-utils
 ray[default]
 tensordict
 torchdata
+torchvision
 transformers>=4.54.0,<=4.57.0
 vllm>=0.8.0
 wandb

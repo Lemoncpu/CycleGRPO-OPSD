@@ -552,7 +552,7 @@ class RayPPOTrainer:
                 "video_fps": self.config.data.video_fps,
             }
 
-            DW_SOURCES = ['denseworld_single', 'denseworld_multiple', 'tg_multi_merged', 'dam_cyclegrpo', None]
+            DW_SOURCES = ['denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'tg_multi_merged', 'dam_cyclegrpo', None]
             new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object

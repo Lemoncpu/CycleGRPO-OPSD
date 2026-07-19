@@ -1252,7 +1252,7 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                     }
                 )
 
-            elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'dam_cyclegrpo'] or source is None:
+            elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'dam_cyclegrpo'] or source is None:
                 # format_score = format_reward(reward_input["response"])
                 # response_think_content, response_answer_content = extract_think_and_answer_robust(reward_input["response"])
                 # gt_think_content, gt_answer_content = extract_think_and_answer_robust(reward_input["ground_truth"])
@@ -1323,7 +1323,7 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 #     if k != "score" and isinstance(v, (int, float)):
                 #         score_dict[f"tg_{k}"] = v
                 # scores.append(score_dict)
-            elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'dam_cyclegrpo', None] or source is None:
+            elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'dam_cyclegrpo', None] or source is None:
                 # format_score = format_reward(reward_input["response"])
                 # _, answer_content = extract_think_and_answer_robust(reward_input["response"])
                 iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"]

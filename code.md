@@ -61,6 +61,18 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
+### 2.3 RefCOCO 20k 受控训练数据
+
+`projects/rl/datasets/prepare_refcoco_rl_dataset.py` 可把标准 RefCOCO 的
+`instances.json`、`refs(unc).p` 和 COCO 图像目录转换成当前 RL loader 所需的
+Parquet。它按 seed 固定打乱 train refs，逐个用当前 SAMTok VQ-SAM2 权重编码目标
+mask，并在获得 `max_samples` 条有效样本后停止；默认正好产出 20,000 条。
+
+生成数据的 source 是 `refcoco_cycle`，会进入图像 CycleGRPO 分支。每条数据同时
+保存 mask token 和压缩 COCO RLE，因此 OPSD 训练奖励优先使用原始 RLE 计算像素 IoU。
+该数据替代论文报告的 DenseWorld 约 20k 区域数据，属于受控数据替换实验，不能将结果
+直接表述为论文原始数据设置的复现。
+
 ## 3. 主训练调用链
 
 ### 3.1 启动与配置合并
@@ -91,7 +103,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | `seg_problem` | 预置定位 prompt/描述字段；循环训练时会被 actor 新生成的 caption 替换 |
 | `seg_answer` | 原目标 mask token，作为闭环重建目标 |
 | `images` / `videos` | 多模态输入路径列表 |
-| `source` | 决定 cycle/non-cycle 分流和奖励分支 |
+| `source` | 决定 cycle/non-cycle 分流和奖励分支；RefCOCO 转换工具写入 `refcoco_cycle` |
 | `masks`、`extra_info` | 部分数据/评测分支的附加信息 |
 
 `verl/utils/dataset.py` 的关键行为：
@@ -111,7 +123,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 1. 从 dataloader 取 batch，为原始 prompt 分配 `uid`，用 `cap_*` 字段构造 `task=caption` 的 `DataProto`。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
-4. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
+4. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
 5. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -160,7 +172,7 @@ localization:
 
 | `source` | 奖励行为 |
 |---|---|
-| `groundingme` / `denseworld_*` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
+| `groundingme` / `denseworld_*` / `refcoco_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
 | `gres_no_target` | no-target/null 正确性 + 非重复奖励 |
 | `tg_multi_merged` | 视频循环：tIoU、时间格式、段数门控、禁止 caption 泄漏时间 |
 | `dam_captioning` / `tg_captioning` | 外部 OpenAI-compatible vLLM judge 的布尔 caption reward；不是主 CycleGRPO 路径 |
@@ -232,7 +244,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
-| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
+| `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、COCO RLE 和 torchvision，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
 
 ### 5.2 `verl/`：RL 引擎
@@ -283,6 +295,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
+- `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
 - `prepare_gres_rl_dataset.py`、`prepare_more_gres_rl_dataset.py`、`prepare_res_rl_dataset.py`、`prepare_reasonseg_rl_dataset.py`：不同 referring segmentation 数据转统一 schema。
 - `prepare_gm_rl_dataset.py`：GroundingME；`prepare_padt_ric_rl_dataset.py`：PADT region-in-context。
@@ -400,3 +413,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2、3、6 节的诊断配置、输出位置、隔离边界和特权信息处理要求。
 - 行为：每步最多对两条低/中路由候选运行独立 EMA teacher diagnosis，并将安全清洗后的文字结论写入 `teacher_diagnoses.jsonl`；不改变 regenerate target、JSD、GRPO 或 student 输入。仅真实 IoU 消融自动跳过该 pass。
 - 验证：修改文件通过 `py_compile`；8 个纯 OPSD 测试通过，包含 analysis prompt 契约；FSDP/vLLM runtime 未在本机执行。
+
+### 2026-07-19 - 增加 RefCOCO 20k CycleGRPO 数据转换
+
+- 代码：新增 `projects/rl/datasets/prepare_refcoco_rl_dataset.py`；修改 `verl/trainer/ray_trainer.py`、`projects/rl/reward_function/text2mask.py` 和 `requirements.txt`。
+- 文档：更新第 2.3、3.2、3.3、3.5、5.3 节的 RefCOCO 数据契约、`refcoco_cycle` 路由和目录职责。
+- 行为：转换工具从标准 RefCOCO train refs 固定采样指定数量，使用当前 VQ-SAM2 生成两个 mask token，写入 RL schema 和原始 COCO RLE；`refcoco_cycle` 与 DenseWorld 一样执行图像 CycleGRPO caption/localization 奖励与真实像素 IoU。依赖清单显式包含转换所需的 Hydra、COCO RLE 和 torchvision。该数据源是对论文 DenseWorld 的受控替代，不是论文原始数据复现。
+- 验证：新增脚本、trainer 和 reward 文件通过 `py_compile`；`git diff --check` 通过。当前机器没有服务器侧 RefCOCO、SAMTok/SAM2 权重和 CUDA，未执行 20k 转换或 FSDP/vLLM smoke training。
