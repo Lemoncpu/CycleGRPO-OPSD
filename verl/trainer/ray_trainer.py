@@ -1109,6 +1109,83 @@ class RayPPOTrainer:
         ]
         return student
 
+    def _select_teacher_analysis_indices(self, caption_batch: DataProto) -> list[int]:
+        config = self.config.worker.opsd.teacher_analysis
+        if (
+            not config.enabled
+            or not self.config.worker.opsd.routing.enabled
+            or not self.config.worker.opsd.ema_teacher.enabled
+            or config.max_samples_per_step == 0
+        ):
+            return []
+        routes = caption_batch.non_tensor_batch["route"]
+        scores = caption_batch.non_tensor_batch["R_Ci"]
+        selected = []
+        for route in ("regenerate", "on_policy_distill"):
+            candidates = [index for index, value in enumerate(routes) if value == route]
+            if candidates:
+                selected.append(min(candidates, key=lambda index: float(scores[index])))
+        remaining = sorted(
+            [
+                index
+                for index, value in enumerate(routes)
+                if value in {"regenerate", "on_policy_distill"} and index not in selected
+            ],
+            key=lambda index: float(scores[index]),
+        )
+        return (selected + remaining)[: config.max_samples_per_step]
+
+    def _write_teacher_diagnoses(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        os.makedirs(self.config.trainer.save_checkpoint_path, exist_ok=True)
+        path = os.path.join(self.config.trainer.save_checkpoint_path, "teacher_diagnoses.jsonl")
+        with open(path, "a", encoding="utf-8") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _generate_teacher_diagnoses(self, caption_batch: DataProto) -> list[dict[str, Any]]:
+        indices = self._select_teacher_analysis_indices(caption_batch)
+        if not indices:
+            return []
+        config = self.config.worker.opsd.teacher_analysis
+        prompts = self._build_opsd_prompt_batch(caption_batch, indices, mode="analysis")
+        prompts.meta_info.update(
+            {
+                "n": 1,
+                "temperature": config.temperature,
+                "top_p": 1.0,
+                "max_tokens": config.max_new_tokens,
+                "task": "opsd_teacher_analysis",
+            }
+        )
+        prompts, pad_size = pad_dataproto_to_divisor(prompts, self.actor_rollout_ref_wg.world_size)
+        self.actor_rollout_ref_wg.prepare_teacher_rollout_engine()
+        output = self.actor_rollout_ref_wg.generate_sequences_with_teacher(prompts)
+        self.actor_rollout_ref_wg.release_teacher_rollout_engine()
+        output = unpad_dataproto(output, pad_size)
+
+        records = []
+        response_lengths = torch.sum(output.batch["response_mask"], dim=-1)
+        for output_index, caption_index in enumerate(indices):
+            response_ids = output.batch["responses"][output_index][: int(response_lengths[output_index].item())]
+            analysis = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+            analysis = re.sub(r"<\|[^|]+\|>", "", analysis).strip()
+            context = caption_batch.non_tensor_batch["privileged_context"][caption_index]
+            records.append(
+                {
+                    "step": self.global_step,
+                    "route": str(caption_batch.non_tensor_batch["route"][caption_index]),
+                    "sample_uid": str(caption_batch.non_tensor_batch["uid"][caption_index]),
+                    "caption_index": int(caption_batch.non_tensor_batch["caption_index"][caption_index]),
+                    "R_Ci": float(context["R_Ci"]),
+                    "pixel_ious": [float(value) for value in context["pixel_ious"]],
+                    "student_caption": str(context["student_caption"]),
+                    "analysis": analysis,
+                }
+            )
+        return records
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1260,6 +1337,9 @@ class RayPPOTrainer:
                             metrics["opsd/raw_gt_reference_rate"] = references.count("raw_gt") / max(
                                 len(references), 1
                             )
+                            teacher_diagnoses = self._generate_teacher_diagnoses(cycle_cap_batch)
+                            self._write_teacher_diagnoses(teacher_diagnoses)
+                            metrics["opsd/teacher_analysis_count"] = len(teacher_diagnoses)
                             distillation_batch = self._build_distillation_batch(cycle_cap_batch)
                             regenerate_batch, regenerate_metrics = self._generate_regenerate_supervision(
                                 cycle_cap_batch

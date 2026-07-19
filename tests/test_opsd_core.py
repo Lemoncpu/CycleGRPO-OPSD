@@ -17,6 +17,7 @@ from verl.workers.opsd.routing import (
     build_privileged_context,
     classify_route,
     distillation_weight,
+    format_privileged_prompt,
     regenerate_weight,
     teacher_caption_is_safe,
 )
@@ -104,6 +105,9 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(context["representative_mask"]["shape"], [2, 2])
         self.assertEqual(context["relative_position"]["horizontal"], "aligned")
         self.assertEqual(context["valid_mask_token_count"], 0)
+        diagnosis_prompt = format_privileged_prompt(context, mode="analysis")
+        self.assertIn("failure_mode", diagnosis_prompt)
+        self.assertIn("correction_focus", diagnosis_prompt)
 
     def test_route_weights(self):
         self.assertAlmostEqual(regenerate_weight(0.4, 0.7), 0.5)

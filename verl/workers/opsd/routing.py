@@ -179,6 +179,12 @@ def format_privileged_prompt(context: dict[str, object], *, mode: str) -> str:
             "Evaluate the exact student caption trajectory token by token. Shift probability toward visible "
             "details supported by the target and away from details supported only by the reconstruction."
         )
+    if mode == "analysis":
+        return base + (
+            "Produce a concise training-only diagnosis as JSON with the keys failure_mode, missing_evidence, "
+            "distractor_evidence, and correction_focus. Describe visible evidence in natural language. "
+            "Do not output mask tokens, region labels, IoU values, scores, or a replacement caption."
+        )
     raise ValueError(f"Unknown privileged prompt mode: {mode}")
 
 

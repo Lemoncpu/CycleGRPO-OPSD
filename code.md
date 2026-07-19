@@ -50,6 +50,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
 | EMA teacher | `decay=0.999`、CPU offload | 与 frozen reference policy 完全独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
+| teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
 | rollout/global batch | `128` | 与论文一致 |
 | epoch | `1` | 与论文一致 |
 | GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
@@ -182,6 +183,8 @@ localization:
 low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，过滤所有特殊 token/诊断泄漏，以当前 actor 做一次 greedy 重建，选每个低分轨迹的最佳改进 caption；相对原 `R_Ci` 提升至少 `0.05` 才采用，同 prompt 去重后最多两个 target。student 始终在原始 prompt 上做加权 CE，权重为 `(R_teacher-R_Ci)/(1-R_Ci+eps)`。
 
 mid route 不重采样 caption。EMA teacher 在包含原图、目标/典型/最佳 mask token、IoU 向量及空间差异摘要的 privileged prompt 上 teacher-force 同一 student 轨迹；student 仍使用原 prompt。两者在完整词表上计算 `beta=0.5` generalized JSD，以归一化的 `exp(-H_teacher)` 强调 teacher 有把握的 token，样本权重为 `clamp((0.85-R_Ci)/0.35,0.1,1)`。
+
+为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
 当 captioner 和 segmenter 都启用时，trainer 不分别 optimizer step，而是：
 
@@ -351,6 +354,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 11. **OPSD dataclass 默认关闭，项目 YAML 显式开启。** 原始 SAMTok 消融设 `worker.opsd.enabled=false`；仅真实 IoU 的 CycleGRPO 设 `opsd.enabled=true`、`routing.enabled=false`、`ema_teacher.enabled=false`；完整版本保持主 YAML 默认。
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度再计算完整词表 JSD；其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
+14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -389,3 +393,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：训练时完整解码 mask token；按 `R_Ci<0.5`、`0.5<=R_Ci<=0.85`、`R_Ci>0.85` 分别执行 teacher regenerate、on-policy generalized JSD 和 CycleGRPO。localization 对全部 route 保持 `R_Ci*s_i,k`；optimizer 后更新独立 EMA teacher，checkpoint 保存到 `actor/ema_teacher/`。
 - 工程：vLLM 与 VQ-SAM2 分时驻留；每图复用一次 SAM2 embedding；route 子批次补齐到 world size；teacher/student 多图输入分离；JSD 只保留有效 response logits；privileged mask 压缩且每 caption 只传一份；特殊 token 与诊断文本不会进入 teacher SFT target。
 - 验证：所有修改 Python 文件通过 `py_compile`，`git diff --check` 通过；8 个纯 OPSD 单元测试通过，覆盖 token offset、mask IoU、单图 embedding 复用、路由边界/穷尽、权重、privileged context 和泄漏过滤。当前机器缺少完整 veRL 依赖、8 卡 GPU 与模型 checkpoint，未执行 FSDP/vLLM 单 batch smoke training。
+
+### 2026-07-19 - 增加 teacher 特权诊断日志
+
+- 代码：修改 `verl/workers/opsd/config.py`、`routing.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 2、3、6 节的诊断配置、输出位置、隔离边界和特权信息处理要求。
+- 行为：每步最多对两条低/中路由候选运行独立 EMA teacher diagnosis，并将安全清洗后的文字结论写入 `teacher_diagnoses.jsonl`；不改变 regenerate target、JSD、GRPO 或 student 输入。仅真实 IoU 消融自动跳过该 pass。
+- 验证：修改文件通过 `py_compile`；8 个纯 OPSD 测试通过，包含 analysis prompt 契约；FSDP/vLLM runtime 未在本机执行。

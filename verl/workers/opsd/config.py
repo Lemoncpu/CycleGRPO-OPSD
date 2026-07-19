@@ -83,6 +83,20 @@ class DistillationConfig:
 
 
 @dataclass
+class TeacherAnalysisConfig:
+    enabled: bool = True
+    max_samples_per_step: int = 2
+    max_new_tokens: int = 96
+    temperature: float = 0.0
+
+    def post_init(self):
+        if self.max_samples_per_step < 0 or self.max_new_tokens <= 0:
+            raise ValueError("Teacher analysis sample count and max_new_tokens must be valid.")
+        if self.temperature < 0.0:
+            raise ValueError("teacher_analysis.temperature must be non-negative.")
+
+
+@dataclass
 class OPSDConfig:
     enabled: bool = False
     localization_rollouts: int = 6
@@ -93,6 +107,7 @@ class OPSDConfig:
     ema_teacher: EMATeacherConfig = field(default_factory=EMATeacherConfig)
     regenerate: RegenerateConfig = field(default_factory=RegenerateConfig)
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    teacher_analysis: TeacherAnalysisConfig = field(default_factory=TeacherAnalysisConfig)
 
     def post_init(self):
         if self.localization_rollouts <= 0:

@@ -73,6 +73,11 @@ worker:
       temperature: 1.0
       entropy_weight_beta: 1.0
       min_sample_weight: 0.1
+    teacher_analysis:
+      enabled: true
+      max_samples_per_step: 2
+      max_new_tokens: 96
+      temperature: 0.0
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
