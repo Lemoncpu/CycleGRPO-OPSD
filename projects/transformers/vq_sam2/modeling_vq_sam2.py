@@ -349,6 +349,39 @@ class VQ_SAM2(PreTrainedModel):
         pred_masks = self.model.inject_language_embd(sam2_states, quant_mask_embeds, nf_nobj=(batch_size, 1))
 
         return pred_masks
+
+    @torch.no_grad()
+    def forward_codes_single_image(self, pixel_values, quant_codes):
+        """Decode many code pairs while encoding a shared image only once."""
+        sam2_states = self.encode_single_image(pixel_values)
+        return self.decode_codes_from_single_image(sam2_states, quant_codes)
+
+    def encode_single_image(self, pixel_values):
+        """Encode one image into reusable SAM2 backbone features."""
+        if pixel_values.shape[0] != 1:
+            raise ValueError("encode_single_image expects exactly one image.")
+        pixel_values = torch.stack([self.model.preprocess_image(pixel_values[0])])
+        return self.model.get_sam2_embeddings(pixel_values, expand_size=1)
+
+    def decode_codes_from_single_image(self, sam2_states, quant_codes):
+        """Decode a code batch from a cached single-image SAM2 state."""
+        batch_size = len(quant_codes)
+        expanded_states = {
+            "current_vision_feats": [
+                feature.expand(-1, batch_size, -1).contiguous()
+                for feature in sam2_states["current_vision_feats"]
+            ],
+            "current_vision_pos_embeds": [
+                position.expand(-1, batch_size, -1).contiguous()
+                for position in sam2_states["current_vision_pos_embeds"]
+            ],
+            "feat_sizes": sam2_states["feat_sizes"],
+        }
+
+        quant_mask_embeds = self.quantizer.embed_code(quant_codes).unsqueeze(1)
+        quant_mask_embeds = self.deconcate_quant_embed(quant_mask_embeds)
+        quant_mask_embeds = quant_mask_embeds.reshape(batch_size, self.num_mask_tokens, -1).contiguous()
+        return self.model.inject_language_embd(expanded_states, quant_mask_embeds, nf_nobj=(batch_size, 1))
     
     def forward_with_embeds(self, pixel_values, embeds):
         batch_size = len(embeds)

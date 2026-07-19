@@ -36,6 +36,43 @@ algorithm:
   filter_high: 0.99
 
 worker:
+  opsd:
+    enabled: true
+    localization_rollouts: 6
+    caption_loss_weight: 0.5
+    localization_loss_weight: 0.5
+    pixel_iou:
+      enabled: true
+      decode_batch_size: 64
+      mask_threshold: 0.5
+      prefer_raw_gt: true
+      invalid_iou: 0.0
+    routing:
+      enabled: true
+      low_threshold: 0.5
+      high_threshold: 0.85
+    ema_teacher:
+      enabled: true
+      decay: 0.999
+      fsdp:
+        enable_full_shard: true
+        enable_cpu_offload: false
+        enable_rank0_init: true
+      offload:
+        offload_params: true
+    regenerate:
+      n: 6
+      temperature: 0.8
+      top_p: 0.95
+      max_new_tokens: 192
+      validation_rollouts: 1
+      min_improvement: 0.05
+      max_targets_per_prompt: 2
+    distillation:
+      beta: 0.5
+      temperature: 1.0
+      entropy_weight_beta: 1.0
+      min_sample_weight: 0.1
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
@@ -65,7 +102,7 @@ worker:
       offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 
   rollout:
-    n: 8
+    n: 6
     temperature: 1.0
     top_p: 1.0
     max_num_batched_tokens: 16384

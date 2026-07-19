@@ -604,6 +604,71 @@ class RLHFDataset(Dataset):
         example["seg_ground_truth"] = example.pop('seg_ground_truth')
         return example
 
+    def preprocess_opsd_prompt(self, prompt_text: str, multi_modal_data: dict[str, Any]) -> dict[str, Any]:
+        """Tokenize an image OPSD prompt with the same Qwen-VL path as training data."""
+        if "images" not in multi_modal_data or not multi_modal_data["images"]:
+            raise ValueError("OPSD privileged prompts currently require one image.")
+        clean_text = re.sub(r"^\s*<image>\s*", "", prompt_text)
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": clean_text}],
+            }
+        ]
+        prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        prompt = add_no_think_prefix(prompt, self.enable_no_think_prefix)
+        images = list(multi_modal_data["images"][:1])
+        processed_images = [process_image(image, self.min_pixels, self.max_pixels) for image in images]
+        model_inputs = self.processor(
+            text=[prompt], images=processed_images, add_special_tokens=False, return_tensors="pt"
+        )
+        input_ids = model_inputs.pop("input_ids")[0]
+        attention_mask = model_inputs.pop("attention_mask")[0]
+
+        if "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                from ..models.transformers.qwen3_vl import get_rope_index
+            else:
+                from ..models.transformers.qwen2_vl import get_rope_index
+            vision_position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids,
+                image_grid_thw=model_inputs.get("image_grid_thw"),
+                attention_mask=attention_mask,
+            )
+            text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)
+            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)
+        else:
+            position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0)
+
+        input_ids, attention_mask, position_ids = VF.postprocess_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            max_length=self.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.truncation,
+        )
+        raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.max_prompt_length:
+            if self.truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
+            elif self.truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
+            else:
+                raise RuntimeError(
+                    f"OPSD prompt length {len(raw_prompt_ids)} exceeds {self.max_prompt_length}."
+                )
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "raw_prompt_ids": raw_prompt_ids,
+            "multi_modal_data": {"images": images},
+            "prompt_text": prompt_text,
+        }
+
     def _build_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         cap_prompt_str: str = example.get(self.cap_prompt_key) or ""
         seg_prompt_str: str = example.get(self.seg_prompt_key) or ""

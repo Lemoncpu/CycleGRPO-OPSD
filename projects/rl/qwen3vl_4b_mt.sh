@@ -24,7 +24,7 @@ python3 -m verl.trainer.main \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.optimize_captioner=true \
     worker.actor.optimize_segmenter=true \
-    worker.rollout.n=8 \
+    worker.rollout.n=6 \
     trainer.experiment_name=cyclegrpo_qwen3vl_4b \
     trainer.total_epochs=1 \
     trainer.val_freq=-1 \

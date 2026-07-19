@@ -230,6 +230,8 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+        if "policy_loss_mask" in data.batch:
+            select_keys.append("policy_loss_mask")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -259,6 +261,8 @@ class DataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
+                    if "policy_loss_mask" in model_inputs:
+                        response_mask = response_mask * model_inputs["policy_loss_mask"].unsqueeze(-1)
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -311,4 +315,39 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         grad_norm = self._optimizer_step()
         metrics["actor/grad_norm"] = grad_norm.detach().item()
+        return metrics
+
+    def update_supervised(self, data: DataProto, grad_weight: float = 1.0) -> dict[str, Any]:
+        """Accumulate weighted teacher-forcing CE for regenerated captions."""
+        self.actor_module.train()
+        select_keys = [
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "responses",
+            "response_mask",
+            "sample_weight",
+        ]
+        non_tensor_select_keys = ["multi_modal_inputs"]
+        selected = data.select(select_keys, non_tensor_select_keys)
+        micro_batches = selected.split(self.config.micro_batch_size_per_device_for_update)
+        total_response_tokens = torch.sum(selected.batch["response_mask"])
+        dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
+        metrics = defaultdict(list)
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            response_mask = model_inputs["response_mask"].to(dtype=torch.float32)
+            sample_weight = model_inputs["sample_weight"].to(dtype=torch.float32).unsqueeze(-1)
+            log_probs = self._forward_micro_batch(model_inputs, temperature=1.0)
+            weighted_mask = response_mask * sample_weight
+            loss_numerator = -(log_probs * weighted_mask).sum()
+            scaled_loss = (
+                loss_numerator
+                * self.world_size
+                / total_response_tokens.clamp_min(1.0)
+                * grad_weight
+            )
+            scaled_loss.backward()
+            local_loss = loss_numerator / response_mask.sum().clamp_min(1.0)
+            append_to_dict(metrics, {"opsd/regenerate_ce": local_loss.detach().item()})
         return metrics

@@ -21,6 +21,7 @@ from .actor import ActorConfig, FSDPConfig, ModelConfig, OptimConfig, RefConfig
 from .critic import CriticConfig
 from .reward import RewardConfig
 from .rollout import RolloutConfig
+from .opsd import OPSDConfig
 
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "FSDPConfig",
     "ModelConfig",
     "OptimConfig",
+    "OPSDConfig",
     "RefConfig",
     "RewardConfig",
     "RolloutConfig",
@@ -44,6 +46,7 @@ class WorkerConfig:
     ref: RefConfig = field(default_factory=RefConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    opsd: OPSDConfig = field(default_factory=OPSDConfig)
 
     def post_init(self):
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
@@ -51,3 +54,5 @@ class WorkerConfig:
         self.ref.dynamic_batching = self.actor.dynamic_batching
         self.ref.ulysses_size = self.actor.ulysses_size
         self.ref.use_torch_compile = self.actor.use_torch_compile
+        if self.opsd.enabled and self.actor.ulysses_size != 1:
+            raise ValueError("OPSD privileged distillation currently requires actor.ulysses_size=1.")

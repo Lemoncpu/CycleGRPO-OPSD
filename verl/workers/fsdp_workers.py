@@ -17,6 +17,8 @@ The main entry point to run the PPO algorithm
 
 from typing import Literal, Optional, Union, cast, Tuple, List
 
+import os
+import math
 import re
 import hydra
 import copy
@@ -32,6 +34,7 @@ from codetiming import Timer
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -62,7 +65,7 @@ except ImportError:
                 PreTrainedModel.init_weights = old_init
 
 from ..models.monkey_patch import apply_ulysses_patch
-from ..protocol import DataProto
+from ..protocol import DataProto, batch_collate
 from ..single_controller.base import Worker
 from ..single_controller.base.decorator import Dispatch, register
 from ..utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -85,6 +88,13 @@ from .rollout import vLLMRollout
 from .sharding_manager import FSDPVLLMShardingManager
 from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
+from .opsd import (
+    build_privileged_context,
+    coerce_raw_mask,
+    compute_binary_iou,
+    decode_mask_tokens,
+    extract_mask_token,
+)
 
 class DirectResize:
     def __init__(self, target_length: int) -> None:
@@ -451,6 +461,12 @@ class FSDPWorker(Worker):
         self._has_critic = self.role == "critic"
         self._has_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._has_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._has_teacher = (
+            self._has_actor
+            and self.config.opsd.enabled
+            and self.config.opsd.routing.enabled
+            and self.config.opsd.ema_teacher.enabled
+        )
         if self._has_actor and self._has_critic:
             raise ValueError("Actor and critic cannot be both initialized.")
 
@@ -460,6 +476,7 @@ class FSDPWorker(Worker):
         self._use_param_offload = False
         self._use_optimizer_offload = False
         self._use_ref_param_offload = False
+        self._use_teacher_param_offload = False
         if self._has_actor:
             self._use_param_offload = self.config.actor.offload.offload_params
             self._use_optimizer_offload = self.config.actor.offload.offload_optimizer
@@ -472,6 +489,8 @@ class FSDPWorker(Worker):
 
         if self._has_ref:  # NOTE: it seems that manual offload is slower than FSDP offload
             self._use_ref_param_offload = self.config.ref.offload.offload_params
+        if self._has_teacher:
+            self._use_teacher_param_offload = self.config.opsd.ema_teacher.offload.offload_params
 
         # mask tokenizer
         self.vq_sam2 = None
@@ -524,9 +543,9 @@ class FSDPWorker(Worker):
         fsdp_config: FSDPConfig,
         optim_config: Optional[OptimConfig],
         padding_free: bool,
-        role: Literal["actor", "critic", "ref"],
+        role: Literal["actor", "critic", "ref", "teacher"],
     ) -> None:
-        if role != "ref":  # ref model's tokenizer is same as actor
+        if role not in ["ref", "teacher"]:  # read-only models share the actor tokenizer/config
             self.tokenizer = get_tokenizer(
                 model_config.tokenizer_path,
                 trust_remote_code=model_config.trust_remote_code,
@@ -558,7 +577,8 @@ class FSDPWorker(Worker):
             self.print_rank0("Ulysses patch applied!")
 
         if fsdp_config.torch_dtype is None:
-            torch_dtype = torch.float32 if role != "ref" else torch.bfloat16
+            # EMA keeps FP32 master shards; only the frozen KL reference is stored in BF16.
+            torch_dtype = torch.bfloat16 if role == "ref" else torch.float32
         else:
             torch_dtype = PrecisionType.to_dtype(fsdp_config.torch_dtype)
 
@@ -594,7 +614,7 @@ class FSDPWorker(Worker):
         if model_config.enable_gradient_checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        if role == "ref":
+        if role in ["ref", "teacher"]:
             model.requires_grad_(False)
 
         if model_config.freeze_vision_tower:
@@ -694,10 +714,15 @@ class FSDPWorker(Worker):
             if self._use_optimizer_offload:
                 offload_fsdp_optimizer(optimizer=self.optimizer)
                 print_gpu_memory_usage(f"After offload {role} optimizer during init")
-        else:
+        elif role == "ref":
             self.ref_fsdp_module = fsdp_module
             if self._use_ref_param_offload:
                 offload_fsdp_model(self.ref_fsdp_module)
+                print_gpu_memory_usage(f"After offload {role} model during init")
+        else:
+            self.teacher_fsdp_module = fsdp_module
+            if self._use_teacher_param_offload:
+                offload_fsdp_model(self.teacher_fsdp_module)
                 print_gpu_memory_usage(f"After offload {role} model during init")
 
     def _build_rollout(self) -> None:
@@ -738,6 +763,17 @@ class FSDPWorker(Worker):
         )
         print_gpu_memory_usage("After ref rollout sharding manager init")
 
+    def _build_teacher_rollout_sharding_manager(self) -> None:
+        tp_size = self.config.rollout.tensor_parallel_size
+        dp_size = self.world_size // tp_size
+        teacher_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        self.teacher_rollout_sharding_manager = FSDPVLLMShardingManager(
+            module=self.teacher_fsdp_module,
+            inference_engine=self.rollout.inference_engine,
+            device_mesh=teacher_mesh,
+            use_param_offload=self._use_teacher_param_offload,
+        )
+
     def _build_mask_tokenizer(self):
         """
         Initializes vq_sam2 and other components for reward computation on CPU.
@@ -767,7 +803,8 @@ class FSDPWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        # self._build_mask_tokenizer()
+        if self.config.opsd.enabled and self.config.opsd.pixel_iou.enabled:
+            self._build_mask_tokenizer()
 
         if self._has_critic:
             self._build_model_optimizer(
@@ -814,9 +851,6 @@ class FSDPWorker(Worker):
                 critic_optimizer=self.optimizer,
             )
 
-        if self._has_rollout:  # must after actor
-            self._build_rollout()
-
         if self._has_ref:
             from .actor.dp_actor import DataParallelPPOActor  # lazy import
 
@@ -824,10 +858,22 @@ class FSDPWorker(Worker):
                 config=self.config.ref,
                 actor_module=self.ref_fsdp_module,
             )
-            # Build ref rollout sharding manager for generation with pretrained model
-            # Reuses the same vLLM engine but syncs ref model weights
-            if self._has_rollout:
+        if self._has_teacher:
+            self._build_model_optimizer(
+                model_config=self.config.actor.model,
+                fsdp_config=self.config.opsd.ema_teacher.fsdp,
+                optim_config=None,
+                padding_free=self.config.actor.padding_free,
+                role="teacher",
+            )
+
+        # Build all FSDP models before vLLM reserves its GPU memory pool.
+        if self._has_rollout:  # must be after actor
+            self._build_rollout()
+            if self._has_ref:
                 self._build_ref_rollout_sharding_manager()
+            if self._has_teacher:
+                self._build_teacher_rollout_sharding_manager()
 
         if self._has_actor or self._has_critic:
             self.flops_counter = FlopsCounter(self.model_config)
@@ -839,11 +885,8 @@ class FSDPWorker(Worker):
             )
         
         if self.vq_sam2 is not None:
-            device = torch.cuda.current_device()
-            self.print_rank0(f"Moving mask tokenizer to device: {device}")
-            self.vq_sam2.to(device)
             self.vq_sam2.eval()
-            print_gpu_memory_usage("After moving vq_sam2 to device")
+            self.print_rank0("Mask tokenizer initialized on CPU; it is loaded after vLLM is released.")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, path: str, save_model_only: bool = False):
@@ -852,6 +895,16 @@ class FSDPWorker(Worker):
             load_fsdp_model(self.fsdp_module)
 
         self.checkpoint_manager.save_checkpoint(path, save_model_only)
+        if self._has_teacher:
+            teacher_path = os.path.join(path, "ema_teacher")
+            os.makedirs(teacher_path, exist_ok=True)
+            teacher_state = get_model_state_dict(
+                self.teacher_fsdp_module, options=StateDictOptions(cpu_offload=True)
+            )
+            torch.save(
+                teacher_state,
+                os.path.join(teacher_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"),
+            )
         dist.barrier()
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
@@ -863,6 +916,38 @@ class FSDPWorker(Worker):
             load_fsdp_model(self.fsdp_module)
 
         self.checkpoint_manager.load_checkpoint(path)
+        if self._has_teacher:
+            teacher_file = os.path.join(
+                path, "ema_teacher", f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
+            )
+            if os.path.exists(teacher_file):
+                if self._use_teacher_param_offload:
+                    load_fsdp_model(self.teacher_fsdp_module)
+                teacher_state = torch.load(teacher_file, map_location="cpu", weights_only=False)
+                set_model_state_dict(
+                    self.teacher_fsdp_module,
+                    teacher_state,
+                    options=StateDictOptions(cpu_offload=True),
+                )
+                if self._use_teacher_param_offload:
+                    offload_fsdp_model(self.teacher_fsdp_module)
+            else:
+                self.print_rank0(
+                    f"EMA teacher checkpoint not found at {teacher_file}; initializing it from resumed actor."
+                )
+                if self._use_teacher_param_offload:
+                    load_fsdp_model(self.teacher_fsdp_module)
+                actor_state = get_model_state_dict(
+                    self.fsdp_module, options=StateDictOptions(cpu_offload=True)
+                )
+                set_model_state_dict(
+                    self.teacher_fsdp_module,
+                    actor_state,
+                    options=StateDictOptions(cpu_offload=True),
+                )
+                del actor_state
+                if self._use_teacher_param_offload:
+                    offload_fsdp_model(self.teacher_fsdp_module)
         dist.barrier()
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
@@ -1134,6 +1219,19 @@ class FSDPWorker(Worker):
         with self.ulysses_sharding_manager:
             metrics = self.actor.optimizer_step()
 
+            if self._has_teacher:
+                if self._use_teacher_param_offload:
+                    load_fsdp_model(self.teacher_fsdp_module)
+                decay = self.config.opsd.ema_teacher.decay
+                with torch.no_grad():
+                    for teacher_param, actor_param in zip(
+                        self.teacher_fsdp_module.parameters(), self.fsdp_module.parameters(), strict=True
+                    ):
+                        teacher_param.mul_(decay).add_(actor_param.detach(), alpha=1.0 - decay)
+                metrics["opsd/ema_decay"] = decay
+                if self._use_teacher_param_offload:
+                    offload_fsdp_model(self.teacher_fsdp_module)
+
             lr = self.lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
             self.lr_scheduler.step()
@@ -1162,6 +1260,144 @@ class FSDPWorker(Worker):
         self.rollout_sharding_manager.offload_vllm()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_mask_decoder(self):
+        if self.vq_sam2 is None:
+            raise RuntimeError("Pixel IoU is enabled but VQ-SAM2 was not initialized.")
+        self.vq_sam2.to(torch.cuda.current_device())
+        self.vq_sam2.eval()
+        print_gpu_memory_usage("After loading VQ-SAM2 mask decoder")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_mask_decoder(self):
+        if self.vq_sam2 is not None:
+            self.vq_sam2.to("cpu")
+            torch.cuda.empty_cache()
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_pixel_mask_ious(self, data: DataProto):
+        """Decode localization mask tokens and attach candidate-level OPSD metadata."""
+        if self.vq_sam2 is None:
+            raise RuntimeError("VQ-SAM2 mask decoder is not available.")
+
+        response_ids = data.batch["responses"]
+        response_lengths = torch.sum(data.batch["response_mask"], dim=-1)
+        responses = []
+        for index in range(len(data)):
+            length = int(response_lengths[index].item())
+            responses.append(
+                self.tokenizer.decode(
+                    response_ids[index][:length],
+                    skip_special_tokens=False,
+                )
+            )
+
+        sample_uids = data.non_tensor_batch["sample_uid"]
+        caption_uids = data.non_tensor_batch["caption_uid"]
+        targets = data.non_tensor_batch["seg_ground_truth"]
+        media = data.non_tensor_batch["multi_modal_data"]
+        raw_gt_masks = data.non_tensor_batch.get("raw_gt_mask")
+        rollout_scores = data.non_tensor_batch.get("mask_token_accuracy")
+        pixel_ious = (
+            np.asarray(rollout_scores, dtype=np.float32).copy()
+            if rollout_scores is not None
+            else np.zeros(len(data), dtype=np.float32)
+        )
+        predicted_tokens = np.array([extract_mask_token(text) for text in responses], dtype=object)
+        target_tokens = np.array([extract_mask_token(text) for text in targets], dtype=object)
+        reference_sources = np.full(len(data), "rollout_score", dtype=object)
+        decoded_predictions = [None] * len(data)
+        decoded_targets = {}
+
+        sample_groups = {}
+        for index, uid in enumerate(sample_uids):
+            sample_groups.setdefault(str(uid), []).append(index)
+
+        pixel_config = self.config.opsd.pixel_iou
+        for sample_uid, indices in sample_groups.items():
+            first = indices[0]
+            mm_data = media[first]
+            if "images" not in mm_data or not mm_data["images"]:
+                # Video routes keep their existing temporal IoU implementation.
+                continue
+            image = mm_data["images"][0]
+            reference_sources[indices] = "decoded_target"
+            texts = [target_tokens[first], *[predicted_tokens[index] for index in indices]]
+            decoded, image_size = decode_mask_tokens(
+                vq_sam2=self.vq_sam2,
+                image=image,
+                token_texts=texts,
+                codebook_size=self.config.reward.codebook_size,
+                codebook_depth=self.config.reward.codebook_depth,
+                threshold=pixel_config.mask_threshold,
+                decode_batch_size=pixel_config.decode_batch_size,
+            )
+            target_mask = decoded[0]
+            if raw_gt_masks is not None and raw_gt_masks[first] is not None and pixel_config.prefer_raw_gt:
+                raw_target = coerce_raw_mask(raw_gt_masks[first], image_size)
+                if raw_target is not None:
+                    target_mask = raw_target
+                    reference_sources[indices] = "raw_gt"
+            decoded_targets[sample_uid] = target_mask
+
+            for local_index, data_index in enumerate(indices, start=1):
+                prediction = decoded[local_index]
+                decoded_predictions[data_index] = prediction
+                if target_mask is None or prediction is None:
+                    pixel_ious[data_index] = pixel_config.invalid_iou
+                    continue
+                if prediction.shape != target_mask.shape:
+                    prediction = torch.nn.functional.interpolate(
+                        prediction[None, None].float(), size=target_mask.shape, mode="nearest"
+                    )[0, 0].bool()
+                    decoded_predictions[data_index] = prediction
+                pixel_ious[data_index] = float(
+                    compute_binary_iou(target_mask[None], prediction[None])[0].item()
+                )
+
+        caption_groups = {}
+        for index, uid in enumerate(caption_uids):
+            caption_groups.setdefault(str(uid), []).append(index)
+        r_ci = np.zeros(len(data), dtype=np.float32)
+        routes = np.full(len(data), "", dtype=object)
+        privileged_contexts = np.empty(len(data), dtype=object)
+        privileged_contexts[:] = None
+        captions = data.non_tensor_batch.get("caption_text", np.full(len(data), "", dtype=object))
+        routing = self.config.opsd.routing
+        for caption_uid, indices in caption_groups.items():
+            sample_uid = str(sample_uids[indices[0]])
+            context = build_privileged_context(
+                student_caption=str(captions[indices[0]]),
+                target_mask_token=target_tokens[indices[0]],
+                predicted_mask_tokens=[predicted_tokens[index] for index in indices],
+                pixel_ious=[pixel_ious[index] for index in indices],
+                target_mask=decoded_targets.get(sample_uid),
+                predicted_masks=[decoded_predictions[index] for index in indices],
+                low_threshold=routing.low_threshold,
+                high_threshold=routing.high_threshold,
+            )
+            mm_data = media[indices[0]]
+            if "images" not in mm_data or not mm_data["images"]:
+                # OPSD mask routing is image-only; preserve temporal CycleGRPO behavior.
+                context["route"] = "grpo"
+            if not routing.enabled:
+                context["route"] = "grpo"
+            for index in indices:
+                r_ci[index] = context["R_Ci"]
+                routes[index] = context["route"]
+            # Keep the large privileged payload once per caption; scalar routing data is repeated.
+            privileged_contexts[indices[0]] = context
+
+        data.non_tensor_batch["predicted_mask_token"] = predicted_tokens
+        data.non_tensor_batch["target_mask_token"] = target_tokens
+        data.non_tensor_batch["pixel_iou"] = pixel_ious.astype(object)
+        data.non_tensor_batch["mask_token_accuracy"] = pixel_ious.astype(object)
+        data.non_tensor_batch["R_Ci"] = r_ci.astype(object)
+        data.non_tensor_batch["route"] = routes
+        data.non_tensor_batch["iou_reference"] = reference_sources
+        data.non_tensor_batch["privileged_context"] = privileged_contexts
+        return data
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_multi_modal_cache(self):
         """Clear the multi-modal inputs cache. 
         
@@ -1181,6 +1417,16 @@ class FSDPWorker(Worker):
         """Release the reference model's vLLM engine."""
         assert self._has_ref and hasattr(self, 'ref_rollout_sharding_manager')
         self.ref_rollout_sharding_manager.offload_vllm()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_teacher_rollout_engine(self):
+        assert self._has_teacher and hasattr(self, "teacher_rollout_sharding_manager")
+        self.teacher_rollout_sharding_manager.load_vllm_and_sync_weights()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_teacher_rollout_engine(self):
+        assert self._has_teacher and hasattr(self, "teacher_rollout_sharding_manager")
+        self.teacher_rollout_sharding_manager.offload_vllm()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def swap_to_ref_weights(self):
@@ -1395,6 +1641,169 @@ class FSDPWorker(Worker):
         #     output.non_tensor_batch["correct_mask"] = np.array(successes, dtype=object)
 
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def accumulate_supervised_gradients(self, data: DataProto):
+        assert self._has_actor
+        grad_weight = data.meta_info.get("grad_weight", 1.0)
+        self._process_multi_modal_inputs(data)
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            metrics = self.actor.update_supervised(data=data, grad_weight=grad_weight)
+            output = DataProto(
+                non_tensor_batch={
+                    key: np.array([value] if np.isscalar(value) else value) for key, value in metrics.items()
+                }
+            )
+        return output.to("cpu")
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def accumulate_distillation_gradients(self, data: DataProto):
+        """Accumulate privileged EMA-teacher generalized-JSD on student trajectories."""
+        assert self._has_actor and self._has_teacher
+        grad_weight = data.meta_info.get("grad_weight", 1.0)
+        self._process_multi_modal_inputs(data)
+        teacher_multi_modal_inputs = []
+        min_pixels = data.meta_info["min_pixels"]
+        max_pixels = data.meta_info["max_pixels"]
+        for multi_modal_data in data.non_tensor_batch["teacher_multi_modal_data"]:
+            images = [process_image(image, min_pixels, max_pixels) for image in multi_modal_data["images"]]
+            teacher_multi_modal_inputs.append(
+                dict(self.processor.image_processor(images=images, return_tensors="pt"))
+            )
+        data.non_tensor_batch["teacher_multi_modal_inputs"] = np.array(
+            teacher_multi_modal_inputs, dtype=object
+        )
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_teacher_param_offload:
+            load_fsdp_model(self.teacher_fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        self.fsdp_module.train()
+        self.teacher_fsdp_module.eval()
+        config = self.config.opsd.distillation
+        micro_batches = data.split(self.config.actor.micro_batch_size_per_device_for_update)
+        total_response_tokens = torch.sum(data.batch["response_mask"])
+        dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
+        metric_values = defaultdict(list)
+        for micro_batch in micro_batches:
+            mm_inputs = batch_collate(micro_batch.non_tensor_batch["multi_modal_inputs"])
+            mm_inputs = {
+                key: torch.cat(value, dim=0).to(torch.cuda.current_device())
+                for key, value in mm_inputs.items()
+            }
+            teacher_mm_inputs = batch_collate(
+                micro_batch.non_tensor_batch["teacher_multi_modal_inputs"]
+            )
+            teacher_mm_inputs = {
+                key: torch.cat(value, dim=0).to(torch.cuda.current_device())
+                for key, value in teacher_mm_inputs.items()
+            }
+
+            full_response_length = micro_batch.batch["responses"].shape[-1]
+            response_length = int(micro_batch.batch["response_mask"].sum(dim=-1).max().item())
+            response_length = max(response_length, 1)
+
+            def forward_logits(module, multi_modal_inputs, prefix=""):
+                input_ids = micro_batch.batch[f"{prefix}input_ids"]
+                prompt_length = input_ids.shape[-1] - full_response_length
+                sequence_length = prompt_length + response_length
+                position_ids = micro_batch.batch[f"{prefix}position_ids"][..., :sequence_length]
+                if position_ids.ndim == 3:
+                    position_ids = position_ids.transpose(0, 1)
+                output = module(
+                    input_ids=input_ids[..., :sequence_length],
+                    attention_mask=micro_batch.batch[f"{prefix}attention_mask"][..., :sequence_length],
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    logits_to_keep=response_length + 1,
+                )
+                return output.logits[:, :-1, :]
+
+            student_logits = forward_logits(self.fsdp_module, mm_inputs)
+            with torch.no_grad():
+                teacher_logits = forward_logits(
+                    self.teacher_fsdp_module, teacher_mm_inputs, "teacher_"
+                )
+            student_log_probs = torch.log_softmax(student_logits.float() / config.temperature, dim=-1)
+            teacher_log_probs = torch.log_softmax(teacher_logits.float() / config.temperature, dim=-1)
+            teacher_probs = teacher_log_probs.exp()
+            beta = config.beta
+            mixture_log_probs = torch.logsumexp(
+                torch.stack(
+                    [student_log_probs + math.log(1.0 - beta), teacher_log_probs + math.log(beta)]
+                ),
+                dim=0,
+            )
+            kl_student = torch.nn.functional.kl_div(
+                mixture_log_probs, student_log_probs, reduction="none", log_target=True
+            ).sum(dim=-1)
+            kl_teacher = torch.nn.functional.kl_div(
+                mixture_log_probs, teacher_log_probs, reduction="none", log_target=True
+            ).sum(dim=-1)
+            jsd = beta * kl_teacher + (1.0 - beta) * kl_student
+            entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+            confidence = torch.exp(-config.entropy_weight_beta * entropy)
+            token_mask = micro_batch.batch["response_mask"][:, :response_length].float()
+            confidence_mean = (confidence * token_mask).sum(dim=-1, keepdim=True) / token_mask.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0)
+            confidence = confidence / confidence_mean.clamp_min(1e-6)
+            sample_weight = micro_batch.batch["distill_weight"].float().unsqueeze(-1)
+            weights = token_mask * confidence * sample_weight
+            loss_numerator = (jsd * weights).sum()
+            scaled_loss = (
+                loss_numerator
+                * self.world_size
+                / total_response_tokens.clamp_min(1.0)
+                * grad_weight
+            )
+            scaled_loss.backward()
+
+            target_log_probs = teacher_log_probs.gather(
+                -1, micro_batch.batch["responses"][:, :response_length].unsqueeze(-1)
+            ).squeeze(-1)
+            local_loss = loss_numerator / token_mask.sum().clamp_min(1.0)
+            metric_values["opsd/distill_jsd"].append(float(local_loss.detach()))
+            metric_values["opsd/teacher_entropy"].append(
+                float((entropy * token_mask).sum() / token_mask.sum().clamp_min(1))
+            )
+            metric_values["opsd/teacher_sequence_score"].append(
+                float((target_log_probs * token_mask).sum() / token_mask.sum().clamp_min(1))
+            )
+
+        if self._use_teacher_param_offload:
+            offload_fsdp_model(self.teacher_fsdp_module)
+        metrics = {key: float(np.mean(values)) for key, values in metric_values.items()}
+        return DataProto(non_tensor_batch={key: np.array([value]) for key, value in metrics.items()}).to("cpu")
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_sequences_with_teacher(self, prompts: DataProto):
+        """Generate while the shared vLLM engine contains EMA-teacher weights."""
+        assert self._has_teacher and hasattr(self, "teacher_rollout_sharding_manager")
+        prompts.meta_info.update(
+            {
+                "eos_token_id": self.generation_config.eos_token_id
+                if self.generation_config is not None
+                else self.tokenizer.eos_token_id,
+                "pad_token_id": self.generation_config.pad_token_id
+                if self.generation_config is not None
+                else self.tokenizer.pad_token_id,
+            }
+        )
+        prompts = self.teacher_rollout_sharding_manager.preprocess_data(prompts)
+        output = self.rollout.generate_sequences(prompts=prompts)
+        output = self.teacher_rollout_sharding_manager.postprocess_data(output)
+        return output.to("cpu")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):

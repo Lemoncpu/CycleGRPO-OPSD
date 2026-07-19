@@ -46,6 +46,12 @@ from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import FunctionRewardManager
+from ..workers.opsd import (
+    distillation_weight,
+    format_privileged_prompt,
+    regenerate_weight,
+    teacher_caption_is_safe,
+)
 from .config import PPOConfig
 from .core_algos import (
     AdvantageEstimator,
@@ -673,7 +679,12 @@ class RayPPOTrainer:
                 non_cycle_batch_ret = non_cycle_batch[: non_cycle_groups * n] if non_cycle_groups > 0 else None
                 return cycle_batch_ret, non_cycle_batch_ret
 
-    def _make_seg_batch_data_for_caption(self, batch: DataProto) -> DataProto:
+    def _make_seg_batch_data_for_caption(
+        self,
+        batch: DataProto,
+        rollout_count: Optional[int] = None,
+        rollout_overrides: Optional[dict[str, Any]] = None,
+    ) -> DataProto:
 
         all_seg_problems = []
         gen_seg_batch_list = []
@@ -718,9 +729,19 @@ class RayPPOTrainer:
                 gen_seg_batch_dict[k] = np.array(values, dtype=object)
 
         gen_seg_batch: DataProto = DataProto.from_single_dict(gen_seg_batch_dict, meta_info=batch.meta_info)
-        gen_seg_batch.non_tensor_batch["uid"] = np.array(
+        caption_uids = np.array(
             [str(uuid.uuid4()) for _ in range(len(gen_seg_batch.batch))], dtype=object
         )
+        gen_seg_batch.non_tensor_batch["uid"] = caption_uids
+        batch.non_tensor_batch["caption_uid"] = caption_uids.copy()
+
+        caption_counters = defaultdict(int)
+        caption_indices = []
+        for sample_uid in batch.non_tensor_batch["uid"]:
+            key = str(sample_uid)
+            caption_indices.append(caption_counters[key])
+            caption_counters[key] += 1
+        batch.non_tensor_batch["caption_index"] = np.array(caption_indices, dtype=object)
 
         # prepare gen_batch for generation of segmentation training
         task_dict = {k.replace(f'seg_', ''): gen_seg_batch.batch.pop(k) for k in [f'seg_input_ids', f'seg_attention_mask', f'seg_position_ids']}
@@ -737,7 +758,10 @@ class RayPPOTrainer:
         # generate a batch using ref (pretrained) model
         # generate_sequences_with_ref automatically swaps weights to ref model and back to actor
         ori_rollout_n = self.config.worker.rollout.n
-        self.config.worker.rollout.n = 6
+        self.config.worker.rollout.n = rollout_count or self.config.worker.opsd.localization_rollouts
+        gen_batch.meta_info["n"] = self.config.worker.rollout.n
+        if rollout_overrides:
+            gen_batch.meta_info.update(rollout_overrides)
         
         # gen_batch_output = self.actor_rollout_ref_wg.generate_sequences_with_ref(gen_batch)
         gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
@@ -751,7 +775,22 @@ class RayPPOTrainer:
         
         # Add uid to gen_batch_output: repeat each uid n_samples times to match the expanded batch size
         gen_batch_output.non_tensor_batch['uid'] = np.repeat(gen_seg_batch.non_tensor_batch["uid"], n_samples)
+        gen_batch_output.non_tensor_batch['caption_uid'] = np.repeat(caption_uids, n_samples)
+        gen_batch_output.non_tensor_batch['sample_uid'] = np.repeat(batch.non_tensor_batch["uid"], n_samples)
+        gen_batch_output.non_tensor_batch['caption_index'] = np.repeat(
+            batch.non_tensor_batch["caption_index"], n_samples
+        )
+        gen_batch_output.non_tensor_batch['localization_index'] = np.tile(
+            np.arange(n_samples), n_prompts
+        ).astype(object)
+        gen_batch_output.non_tensor_batch['caption_text'] = np.repeat(
+            np.array(all_seg_problems, dtype=object), n_samples
+        )
         gen_batch_output.non_tensor_batch['source'] = np.repeat(gen_seg_batch.non_tensor_batch["source"], n_samples)
+        if "masks" in batch.non_tensor_batch:
+            gen_batch_output.non_tensor_batch['raw_gt_mask'] = np.repeat(
+                batch.non_tensor_batch["masks"], n_samples
+            )
         
         if 'mask_token_accuracy' in gen_batch_output.non_tensor_batch:
             flat_accuracy = np.array(gen_batch_output.non_tensor_batch['mask_token_accuracy']).astype(float)
@@ -779,6 +818,296 @@ class RayPPOTrainer:
         # gen_batch_output.batch.keys(): ['prompts', 'responses', 'input_ids', 'attention_mask', 'response_mask', 'position_ids']
         # gen_batch_output.non_tensor_batch.keys(): ['multi_modal_data', 'mask_token_accuracy', 'format_correct', 'iou_scores']
         return batch, gen_batch_output
+
+    def _merge_pixel_iou_metadata(self, caption_batch: DataProto, segmentation_batch: DataProto) -> None:
+        caption_uids = segmentation_batch.non_tensor_batch["caption_uid"]
+        contexts = segmentation_batch.non_tensor_batch["privileged_context"]
+        context_by_uid = {}
+        for uid, context in zip(caption_uids, contexts):
+            if context is not None:
+                context_by_uid.setdefault(str(uid), context)
+
+        caption_contexts = [context_by_uid[str(uid)] for uid in caption_batch.non_tensor_batch["caption_uid"]]
+        caption_batch.non_tensor_batch["privileged_context"] = np.array(caption_contexts, dtype=object)
+        caption_batch.non_tensor_batch["R_Ci"] = np.array(
+            [context["R_Ci"] for context in caption_contexts], dtype=object
+        )
+        caption_batch.non_tensor_batch["route"] = np.array(
+            [context["route"] for context in caption_contexts], dtype=object
+        )
+        for key in (
+            "representative_mask",
+            "best_mask",
+            "iou_mean",
+            "iou_std",
+            "iou_min",
+            "iou_max",
+        ):
+            caption_batch.non_tensor_batch[key] = np.array(
+                [context.get(key) for context in caption_contexts], dtype=object
+            )
+        caption_batch.non_tensor_batch["iou_scores"] = caption_batch.non_tensor_batch["R_Ci"].copy()
+        segmentation_batch.non_tensor_batch["iou_scores"] = segmentation_batch.non_tensor_batch["R_Ci"].copy()
+
+    def _build_opsd_prompt_batch(self, caption_batch: DataProto, indices: list[int], mode: str) -> DataProto:
+        records = []
+        dataset = self.train_dataloader.dataset
+        for index in indices:
+            context = caption_batch.non_tensor_batch["privileged_context"][index]
+            prompt_text = format_privileged_prompt(context, mode=mode)
+            records.append(
+                dataset.preprocess_opsd_prompt(
+                    prompt_text,
+                    caption_batch.non_tensor_batch["multi_modal_data"][index],
+                )
+            )
+        tensors = {
+            key: torch.stack([record[key] for record in records])
+            for key in ("input_ids", "attention_mask", "position_ids")
+        }
+        non_tensors = {
+            "raw_prompt_ids": np.array([record["raw_prompt_ids"] for record in records], dtype=object),
+            "multi_modal_data": np.array([record["multi_modal_data"] for record in records], dtype=object),
+            "parent_index": np.array(indices, dtype=object),
+        }
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(caption_batch.meta_info))
+
+    def _build_supervised_batch(
+        self,
+        caption_batch: DataProto,
+        selected: list[tuple[int, torch.Tensor, torch.Tensor, float]],
+    ) -> Optional[DataProto]:
+        if not selected:
+            return None
+        prompt_rows = [item[0] for item in selected]
+        prompts = caption_batch[prompt_rows]
+        responses = torch.stack([item[1] for item in selected])
+        response_masks = torch.stack([item[2] for item in selected])
+        input_ids = torch.cat([prompts.batch["prompts"], responses], dim=-1)
+        attention_mask = torch.cat(
+            [
+                prompts.batch["attention_mask"][..., : prompts.batch["prompts"].shape[-1]],
+                response_masks,
+            ],
+            dim=-1,
+        )
+        prompt_position_ids = prompts.batch["position_ids"][..., : prompts.batch["prompts"].shape[-1]]
+        response_length = responses.shape[-1]
+        delta = torch.arange(1, response_length + 1).view(1, -1).expand(len(selected), -1)
+        if prompt_position_ids.ndim == 3:
+            delta = delta.view(len(selected), 1, -1).expand(len(selected), prompt_position_ids.size(1), -1)
+        response_position_ids = prompt_position_ids[..., -1:] + delta
+        position_ids = torch.cat([prompt_position_ids, response_position_ids], dim=-1)
+        tensors = {
+            "prompts": prompts.batch["prompts"],
+            "responses": responses,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "response_mask": response_masks,
+            "position_ids": position_ids,
+            "sample_weight": torch.tensor([item[3] for item in selected], dtype=torch.float32),
+        }
+        non_tensors = {
+            "multi_modal_data": prompts.non_tensor_batch["multi_modal_data"],
+            "uid": prompts.non_tensor_batch["uid"],
+        }
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(caption_batch.meta_info))
+
+    def _generate_regenerate_supervision(
+        self, caption_batch: DataProto
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        low_indices = [
+            index
+            for index, route in enumerate(caption_batch.non_tensor_batch["route"])
+            if route == "regenerate"
+        ]
+        regen_metrics = {
+            "opsd/regenerate_safe_rate": 0.0,
+            "opsd/regenerate_improvement_rate": 0.0,
+            "opsd/teacher_target_acceptance_rate": 0.0,
+            "opsd/regenerate_mean_improvement": 0.0,
+        }
+        if not low_indices:
+            return None, regen_metrics
+        config = self.config.worker.opsd.regenerate
+        teacher_prompts = self._build_opsd_prompt_batch(caption_batch, low_indices, mode="regenerate")
+        teacher_prompts.meta_info.update(
+            {
+                "n": config.n,
+                "temperature": config.temperature,
+                "top_p": config.top_p,
+                "max_tokens": config.max_new_tokens,
+                "task": "opsd_regenerate",
+            }
+        )
+        teacher_prompts, teacher_prompt_pad = pad_dataproto_to_divisor(
+            teacher_prompts, self.actor_rollout_ref_wg.world_size
+        )
+        self.actor_rollout_ref_wg.prepare_teacher_rollout_engine()
+        teacher_output = self.actor_rollout_ref_wg.generate_sequences_with_teacher(teacher_prompts)
+        self.actor_rollout_ref_wg.release_teacher_rollout_engine()
+        teacher_output = unpad_dataproto(teacher_output, teacher_prompt_pad * config.n)
+
+        parent_indices = np.repeat(np.array(low_indices, dtype=object), config.n)
+        decoded = []
+        contains_sanitized_token = []
+        lengths = torch.sum(teacher_output.batch["response_mask"], dim=-1)
+        eos_token_ids = self.tokenizer.eos_token_id
+        if not isinstance(eos_token_ids, (list, tuple, set)):
+            eos_token_ids = [eos_token_ids]
+        for index in range(len(teacher_output)):
+            valid_ids = teacher_output.batch["responses"][index][: int(lengths[index].item())]
+            body_ids = valid_ids
+            if len(body_ids) > 0 and int(body_ids[-1]) in eos_token_ids:
+                body_ids = body_ids[:-1]
+            contains_sanitized_token.append(
+                bool(torch.any(body_ids == self.tokenizer.pad_token_id).item())
+            )
+            decoded.append(
+                re.sub(
+                    r"<\|(?:im_end|endoftext)\|>",
+                    "",
+                    self.tokenizer.decode(
+                        valid_ids,
+                        skip_special_tokens=False,
+                    ),
+                ).strip()
+            )
+        safe_indices = [
+            index
+            for index, text in enumerate(decoded)
+            if teacher_caption_is_safe(text) and not contains_sanitized_token[index]
+        ]
+        regen_metrics["opsd/regenerate_safe_rate"] = len(safe_indices) / max(len(decoded), 1)
+        if not safe_indices:
+            return None, regen_metrics
+        teacher_output = teacher_output[safe_indices]
+        parent_indices = parent_indices[safe_indices]
+        decoded = [decoded[index] for index in safe_indices]
+
+        def repeat_parent_field(name, default=None):
+            source = caption_batch.non_tensor_batch.get(name)
+            if source is None:
+                return np.array([default for _ in parent_indices], dtype=object)
+            return np.array([source[int(index)] for index in parent_indices], dtype=object)
+
+        teacher_output.non_tensor_batch["uid"] = repeat_parent_field("uid")
+        teacher_output.non_tensor_batch["source"] = repeat_parent_field("source")
+        teacher_output.non_tensor_batch["seg_ground_truth"] = repeat_parent_field("seg_ground_truth")
+        teacher_output.non_tensor_batch["cap_ground_truth"] = repeat_parent_field("cap_ground_truth")
+        teacher_output.non_tensor_batch["masks"] = repeat_parent_field("masks")
+        teacher_output.non_tensor_batch["multi_modal_data"] = repeat_parent_field("multi_modal_data")
+        teacher_output.non_tensor_batch["seg_multi_modal_data"] = repeat_parent_field("seg_multi_modal_data")
+
+        validation_input, validation_pad = pad_dataproto_to_divisor(
+            teacher_output, self.actor_rollout_ref_wg.world_size
+        )
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        validation_cap, validation_seg = self._make_seg_batch_data_for_caption(
+            validation_input,
+            rollout_count=config.validation_rollouts,
+            rollout_overrides={"temperature": 0.0, "top_p": 1.0},
+        )
+        self.actor_rollout_ref_wg.release_rollout_engine()
+        self.actor_rollout_ref_wg.prepare_mask_decoder()
+        validation_seg = self.actor_rollout_ref_wg.compute_pixel_mask_ious(validation_seg)
+        self.actor_rollout_ref_wg.release_mask_decoder()
+        validation_cap = unpad_dataproto(validation_cap, validation_pad)
+        validation_seg = unpad_dataproto(
+            validation_seg, validation_pad * config.validation_rollouts
+        )
+        self._merge_pixel_iou_metadata(validation_cap, validation_seg)
+
+        candidates_by_parent = defaultdict(list)
+        for candidate_index, parent_index in enumerate(parent_indices):
+            parent_index = int(parent_index)
+            original_score = float(caption_batch.non_tensor_batch["R_Ci"][parent_index])
+            teacher_score = float(validation_cap.non_tensor_batch["R_Ci"][candidate_index])
+            improvement = teacher_score - original_score
+            if improvement < config.min_improvement:
+                continue
+            weight = regenerate_weight(original_score, teacher_score)
+            response = validation_cap.batch["responses"][candidate_index][: config.max_new_tokens]
+            response_mask = validation_cap.batch["response_mask"][candidate_index][: config.max_new_tokens]
+            candidates_by_parent[parent_index].append(
+                (teacher_score, decoded[candidate_index], response, response_mask, weight)
+            )
+
+        per_sample = defaultdict(list)
+        for parent_index, candidates in candidates_by_parent.items():
+            best = max(candidates, key=lambda item: item[0])
+            sample_uid = str(caption_batch.non_tensor_batch["uid"][parent_index])
+            per_sample[sample_uid].append((parent_index, *best))
+
+        selected = []
+        selected_improvements = []
+        for candidates in per_sample.values():
+            seen = set()
+            for parent_index, score, text, response, response_mask, weight in sorted(
+                candidates, key=lambda item: item[1], reverse=True
+            ):
+                normalized = " ".join(text.lower().split())
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                selected.append((parent_index, response, response_mask, weight))
+                selected_improvements.append(score - float(caption_batch.non_tensor_batch["R_Ci"][parent_index]))
+                if len(seen) >= config.max_targets_per_prompt:
+                    break
+        improved_candidates = sum(len(candidates) for candidates in candidates_by_parent.values())
+        regen_metrics["opsd/regenerate_improvement_rate"] = improved_candidates / max(len(decoded), 1)
+        regen_metrics["opsd/teacher_target_acceptance_rate"] = len(selected) / max(len(low_indices), 1)
+        if selected_improvements:
+            regen_metrics["opsd/regenerate_mean_improvement"] = float(np.mean(selected_improvements))
+        return self._build_supervised_batch(caption_batch, selected), regen_metrics
+
+    def _build_distillation_batch(self, caption_batch: DataProto) -> Optional[DataProto]:
+        mid_indices = [
+            index
+            for index, route in enumerate(caption_batch.non_tensor_batch["route"])
+            if route == "on_policy_distill"
+        ]
+        if not mid_indices:
+            return None
+        student = caption_batch[mid_indices]
+        teacher_prompts = self._build_opsd_prompt_batch(caption_batch, mid_indices, mode="distill")
+        responses = student.batch["responses"]
+        response_mask = student.batch["response_mask"]
+        teacher_input_ids = torch.cat([teacher_prompts.batch["input_ids"], responses], dim=-1)
+        teacher_attention_mask = torch.cat([teacher_prompts.batch["attention_mask"], response_mask], dim=-1)
+        prompt_position_ids = teacher_prompts.batch["position_ids"]
+        delta = torch.arange(1, responses.shape[-1] + 1).view(1, -1).expand(len(student), -1)
+        if prompt_position_ids.ndim == 3:
+            delta = delta.view(len(student), 1, -1).expand(len(student), prompt_position_ids.size(1), -1)
+        teacher_position_ids = torch.cat(
+            [prompt_position_ids, prompt_position_ids[..., -1:] + delta], dim=-1
+        )
+        routing = self.config.worker.opsd.routing
+        distill_config = self.config.worker.opsd.distillation
+        scores = torch.tensor(
+            [float(caption_batch.non_tensor_batch["R_Ci"][index]) for index in mid_indices],
+            dtype=torch.float32,
+        )
+        weights = torch.tensor(
+            [
+                distillation_weight(
+                    score,
+                    routing.low_threshold,
+                    routing.high_threshold,
+                    distill_config.min_sample_weight,
+                )
+                for score in scores.tolist()
+            ],
+            dtype=torch.float32,
+        )
+        student.batch["teacher_input_ids"] = teacher_input_ids
+        student.batch["teacher_attention_mask"] = teacher_attention_mask
+        student.batch["teacher_position_ids"] = teacher_position_ids
+        student.batch["distill_weight"] = weights
+        student.non_tensor_batch["teacher_multi_modal_data"] = teacher_prompts.non_tensor_batch[
+            "multi_modal_data"
+        ]
+        return student
 
     def fit(self):
         """
@@ -891,17 +1220,51 @@ class RayPPOTrainer:
 
                 cycle_cap_batch = None
                 cycle_seg_batch = None
+                regenerate_batch = None
+                distillation_batch = None
                 seg_batch = None
                 if cycle_batch is not None and (
                     self.config.worker.actor.optimize_captioner or self.config.worker.actor.optimize_segmenter
                 ):
                     # build both cycle caption and cycle segmentation batches once
                     with timer("gen", timing_raw):
-                        cycle_batch.meta_info["n"] = 6
+                        cycle_batch.meta_info["n"] = self.config.worker.opsd.localization_rollouts
                         self.actor_rollout_ref_wg.prepare_rollout_engine()
                         cycle_cap_batch, cycle_seg_batch = self._make_seg_batch_data_for_caption(cycle_batch)
                         cycle_cap_batch.meta_info.pop("n", None)
                         self.actor_rollout_ref_wg.release_rollout_engine()
+                        if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:
+                            self.actor_rollout_ref_wg.prepare_mask_decoder()
+                            cycle_seg_batch = self.actor_rollout_ref_wg.compute_pixel_mask_ious(cycle_seg_batch)
+                            self.actor_rollout_ref_wg.release_mask_decoder()
+                            self._merge_pixel_iou_metadata(cycle_cap_batch, cycle_seg_batch)
+                            route_values = list(cycle_cap_batch.non_tensor_batch["route"])
+                            for route_name in ("regenerate", "on_policy_distill", "grpo"):
+                                metrics[f"opsd/route_{route_name}_count"] = route_values.count(route_name)
+                                metrics[f"opsd/route_{route_name}_rate"] = route_values.count(route_name) / max(
+                                    len(route_values), 1
+                                )
+                            pixel_values = cycle_seg_batch.non_tensor_batch["pixel_iou"].astype(float)
+                            caption_scores = cycle_cap_batch.non_tensor_batch["R_Ci"].astype(float)
+                            metrics.update(
+                                {
+                                    "opsd/pixel_iou_mean": float(np.mean(pixel_values)),
+                                    "opsd/pixel_iou_std": float(np.std(pixel_values)),
+                                    "opsd/pixel_iou_min": float(np.min(pixel_values)),
+                                    "opsd/pixel_iou_max": float(np.max(pixel_values)),
+                                    "opsd/R_Ci_mean": float(np.mean(caption_scores)),
+                                    "opsd/R_Ci_std": float(np.std(caption_scores)),
+                                }
+                            )
+                            references = list(cycle_seg_batch.non_tensor_batch["iou_reference"])
+                            metrics["opsd/raw_gt_reference_rate"] = references.count("raw_gt") / max(
+                                len(references), 1
+                            )
+                            distillation_batch = self._build_distillation_batch(cycle_cap_batch)
+                            regenerate_batch, regenerate_metrics = self._generate_regenerate_supervision(
+                                cycle_cap_batch
+                            )
+                            metrics.update(regenerate_metrics)
 
                 if cycle_cap_batch is not None and self.config.worker.actor.optimize_captioner:
 
@@ -951,6 +1314,11 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                         )
+                        if "route" in cycle_cap_batch.non_tensor_batch:
+                            cycle_cap_batch.batch["policy_loss_mask"] = torch.tensor(
+                                [route == "grpo" for route in cycle_cap_batch.non_tensor_batch["route"]],
+                                dtype=cycle_cap_batch.batch["response_mask"].dtype,
+                            )
 
                     # update critic
                     if self.use_critic:
@@ -1033,11 +1401,27 @@ class RayPPOTrainer:
 
                 # Concatenate non_cycle_batch and cycle_cap_batch into cap_batch
                 if non_cycle_batch is not None and cycle_cap_batch is not None:
+                    if "policy_loss_mask" in cycle_cap_batch.batch:
+                        non_cycle_batch.batch["policy_loss_mask"] = torch.ones(
+                            len(non_cycle_batch), dtype=non_cycle_batch.batch["response_mask"].dtype
+                        )
                     # Remove iou_scores and correct_mask from batch before concat
-                    if 'iou_scores' in cycle_cap_batch.non_tensor_batch:
-                        del cycle_cap_batch.non_tensor_batch['iou_scores']
-                    if 'correct_mask' in cycle_cap_batch.non_tensor_batch:
-                        del cycle_cap_batch.non_tensor_batch['correct_mask']
+                    for key in (
+                        "iou_scores",
+                        "correct_mask",
+                        "caption_uid",
+                        "caption_index",
+                        "privileged_context",
+                        "R_Ci",
+                        "route",
+                        "representative_mask",
+                        "best_mask",
+                        "iou_mean",
+                        "iou_std",
+                        "iou_min",
+                        "iou_max",
+                    ):
+                        cycle_cap_batch.non_tensor_batch.pop(key, None)
                     cap_batch = DataProto.concat([non_cycle_batch, cycle_cap_batch])
                 elif non_cycle_batch is not None:
                     cap_batch = non_cycle_batch
@@ -1052,9 +1436,8 @@ class RayPPOTrainer:
                     seg_batch_size = len(seg_batch) if seg_batch is not None else 0
                     total_size = cap_batch_size + seg_batch_size
                     
-                    # Caption 和 Segmentation 各占 0.5
-                    cap_grad_weight = 0.5
-                    seg_grad_weight = 0.5
+                    cap_grad_weight = self.config.worker.opsd.caption_loss_weight
+                    seg_grad_weight = self.config.worker.opsd.localization_loss_weight
 
                     if self.config.trainer.critic_warmup <= self.global_step:
                         self.actor_rollout_ref_wg.clear_multi_modal_cache()
@@ -1075,6 +1458,61 @@ class RayPPOTrainer:
                                 seg_batch.meta_info['global_batch_size_per_device'] = len(seg_batch) // self.actor_rollout_ref_wg.world_size
                                 seg_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(seg_batch)
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
+
+                            if regenerate_batch is not None and len(regenerate_batch) > 0:
+                                regen_count = len(regenerate_batch)
+                                regenerate_batch, regen_pad = pad_dataproto_to_divisor(
+                                    regenerate_batch,
+                                    self.actor_rollout_ref_wg.world_size
+                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                )
+                                if regen_pad:
+                                    regenerate_batch.batch["sample_weight"][-regen_pad:] = 0.0
+                                self._balance_batch(regenerate_batch, metrics=metrics, logging_prefix="regen_seqlen")
+                                regenerate_batch.meta_info["global_token_num"] = torch.sum(
+                                    regenerate_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                regenerate_batch.meta_info["grad_weight"] = (
+                                    self.config.worker.opsd.caption_loss_weight
+                                    * regen_count
+                                    / max(len(cycle_batch), 1)
+                                )
+                                regen_output = self.actor_rollout_ref_wg.accumulate_supervised_gradients(
+                                    regenerate_batch
+                                )
+                                actor_metrics.update(
+                                    {f"regen_{k}": v for k, v in reduce_metrics(regen_output.non_tensor_batch).items()}
+                                )
+
+                            if distillation_batch is not None and len(distillation_batch) > 0:
+                                distill_count = len(distillation_batch)
+                                distillation_batch, distill_pad = pad_dataproto_to_divisor(
+                                    distillation_batch,
+                                    self.actor_rollout_ref_wg.world_size
+                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                )
+                                if distill_pad:
+                                    distillation_batch.batch["distill_weight"][-distill_pad:] = 0.0
+                                self._balance_batch(
+                                    distillation_batch, metrics=metrics, logging_prefix="distill_seqlen"
+                                )
+                                distillation_batch.meta_info["global_token_num"] = torch.sum(
+                                    distillation_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                distillation_batch.meta_info["grad_weight"] = (
+                                    self.config.worker.opsd.caption_loss_weight
+                                    * distill_count
+                                    / max(len(cycle_batch), 1)
+                                )
+                                distill_output = self.actor_rollout_ref_wg.accumulate_distillation_gradients(
+                                    distillation_batch
+                                )
+                                actor_metrics.update(
+                                    {
+                                        f"distill_{k}": v
+                                        for k, v in reduce_metrics(distill_output.non_tensor_batch).items()
+                                    }
+                                )
                             
                             # Step 3: Perform optimizer step with accumulated gradients
                             opt_output = self.actor_rollout_ref_wg.step_actor_optimizer()

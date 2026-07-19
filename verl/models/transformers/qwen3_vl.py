@@ -252,10 +252,13 @@ def qwen3_vl_model_forward(
     self: "Qwen3VLForConditionalGeneration",
     input_ids: torch.LongTensor,
     labels: Optional[torch.LongTensor] = None,
+    logits_to_keep: int = 0,
     **kwargs,
 ) -> "Qwen3VLCausalLMOutputWithPast":
     outputs = self.model(input_ids=input_ids, **kwargs)
     hidden_states = outputs[0]
+    if logits_to_keep > 0:
+        hidden_states = hidden_states[:, -logits_to_keep:, :]
     logits = self.lm_head(hidden_states)
 
     return Qwen3VLCausalLMOutputWithPast(logits=logits)
