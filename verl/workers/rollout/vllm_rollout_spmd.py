@@ -31,6 +31,44 @@ from .base import BaseRollout
 from .config import RolloutConfig
 
 
+_QWEN3_VL_TEXT_CONFIG_FIELDS = (
+    "vocab_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "intermediate_size",
+    "hidden_act",
+    "rms_norm_eps",
+    "max_position_embeddings",
+    "rope_theta",
+    "rope_scaling",
+    "attention_bias",
+    "attention_dropout",
+    "use_cache",
+)
+
+
+def _install_qwen3_vl_vllm_compatibility() -> None:
+    """Expose Qwen3-VL text settings expected by vLLM's generic backend."""
+    try:
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
+    except ImportError:
+        return
+
+    for field in _QWEN3_VL_TEXT_CONFIG_FIELDS:
+        if hasattr(Qwen3VLConfig, field):
+            continue
+
+        def from_text_config(config, name=field):
+            return getattr(config.text_config, name)
+
+        setattr(Qwen3VLConfig, field, property(from_text_config))
+
+
+_install_qwen3_vl_vllm_compatibility()
+
+
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
     # repeat the elements, supports both tensor and numpy array
     if isinstance(value, torch.Tensor):

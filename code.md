@@ -131,6 +131,9 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 `vllm_rollout_spmd.py` 负责：
 
 - 把 raw prompt 和图像/视频整理成 vLLM 输入。
+- 为未原生识别 Qwen3-VL 的旧版 vLLM generic Transformers backend 暴露
+  `Qwen3VLConfig.text_config` 中的语言模型字段，避免要求修改 checkpoint 的
+  `config.json`；新版 vLLM 有原生实现时该兼容层无副作用。
 - 采样并 pad response，构造完整 `input_ids`、`attention_mask`、`response_mask` 和扩展后的 position ids。
 - 删除模型误生成的 vision 特殊 token，防止后续前向出现视觉 token/feature 数量不匹配。
 
@@ -443,3 +446,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新奖励 source 表。
 - 行为：仅当 reward batch 包含 `dam_captioning` 或 `tg_captioning` 时才创建 OpenAI-compatible judge client，且同一 reward actor 只创建一次。纯 `refcoco_cycle` 训练不再依赖 HTTP/SOCKS proxy、judge endpoint 或 `socksio`。
 - 验证：`python3 -m py_compile` 和 `git diff --check`；服务器在纯 RefCOCO 数据加载期间复现了导入阶段创建 judge client 后缺失 `socksio` 的失败。未在本机执行 GPU/Ray 训练。
+
+### 2026-07-20 - 在 rollout 侧兼容旧版 vLLM 的 Qwen3-VL 配置访问
+
+- 代码：修改 `verl/workers/rollout/vllm_rollout_spmd.py`。
+- 文档：更新第 3.3 节 rollout 职责。
+- 行为：在构建 vLLM LLM 前，为 `Qwen3VLConfig` 缺失的顶层语言模型字段提供从 `text_config` 读取的 property。旧版 vLLM generic Transformers fallback 可访问 `vocab_size`、层数和 attention 配置，而无需写入模型 checkpoint 配置；原生支持 Qwen3-VL 的新版 vLLM 不受影响。
+- 验证：`python3 -m py_compile` 和 `git diff --check`；服务器使用 vLLM 0.8.3 时依次复现缺失顶层 `vocab_size` 和 `num_hidden_layers`，字段均存在于 Qwen3-VL `text_config`。未在本机运行 vLLM/GPU smoke test。
