@@ -63,7 +63,10 @@ def _install_qwen3_vl_vllm_compatibility() -> None:
         def from_text_config(config, name=field):
             return getattr(config.text_config, name)
 
-        setattr(Qwen3VLConfig, field, property(from_text_config))
+        def to_text_config(config, value, name=field):
+            setattr(config.text_config, name, value)
+
+        setattr(Qwen3VLConfig, field, property(from_text_config, to_text_config))
 
 
 _install_qwen3_vl_vllm_compatibility()

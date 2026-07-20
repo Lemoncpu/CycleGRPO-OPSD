@@ -451,5 +451,5 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - 代码：修改 `verl/workers/rollout/vllm_rollout_spmd.py`。
 - 文档：更新第 3.3 节 rollout 职责。
-- 行为：在构建 vLLM LLM 前，为 `Qwen3VLConfig` 缺失的顶层语言模型字段提供从 `text_config` 读取的 property。旧版 vLLM generic Transformers fallback 可访问 `vocab_size`、层数和 attention 配置，而无需写入模型 checkpoint 配置；原生支持 Qwen3-VL 的新版 vLLM 不受影响。
-- 验证：`python3 -m py_compile` 和 `git diff --check`；服务器使用 vLLM 0.8.3 时依次复现缺失顶层 `vocab_size` 和 `num_hidden_layers`，字段均存在于 Qwen3-VL `text_config`。未在本机运行 vLLM/GPU smoke test。
+- 行为：在构建 vLLM LLM 前，为 `Qwen3VLConfig` 缺失的顶层语言模型字段提供从 `text_config` 读取/写入的 property。旧版 vLLM generic Transformers fallback 可访问 `vocab_size`、层数和 attention 配置；即使 checkpoint `config.json` 曾手工写入这些顶层字段，Transformers 构造配置时也会回写到 `text_config` 而不会报只读属性错误。原生支持 Qwen3-VL 的新版 vLLM 不受影响。
+- 验证：`python3 -m py_compile` 和 `git diff --check`；服务器使用 vLLM 0.8.3 时依次复现缺失顶层 `vocab_size` 和 `num_hidden_layers`，以及手工写入 `vocab_size` 后的只读属性错误，字段均存在于 Qwen3-VL `text_config`。未在本机运行 vLLM/GPU smoke test。
