@@ -40,7 +40,9 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 
 ### 2.2 当前公开代码的有效配置
 
-主入口是 `projects/rl/qwen3vl_4b_mt.sh`，它覆盖 `projects/rl/config.yaml` 的若干默认值：
+通用主入口是 `projects/rl/qwen3vl_4b_mt.sh`；火山引擎 RefCOCO 10k 单节点部署入口是
+`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。二者都覆盖 `projects/rl/config.yaml`
+的若干默认值：
 
 | 项 | 当前主入口 | 说明 |
 |---|---:|---|
@@ -58,6 +60,13 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | 关闭 | `val_freq=-1`、`val_before_train=false` |
 | 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
+
+火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
+环境、RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。平台会注入
+指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
+2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
+Ray。训练 stdout、Ray、W&B、teacher diagnosis 和 checkpoint 均写到仓库内
+`logs/refcoco10k_opsd/`。它不修改论文算法或训练超参数，只固定当前服务器的数据与运行环境。
 
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
@@ -79,7 +88,7 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 
 ### 3.1 启动与配置合并
 
-1. `projects/rl/qwen3vl_4b_mt.sh` 调用 `python3 -m verl.trainer.main`。
+1. `projects/rl/qwen3vl_4b_mt.sh` 或服务器入口 `qwen3vl_4b_refcoco10k_volcengine.sh` 调用 `python3 -m verl.trainer.main`；服务器入口会先清除不兼容的外部 `RAY_ADDRESS`。
 2. `verl/trainer/main.py::main` 按“dataclass 默认值 -> YAML -> CLI 覆盖”合并配置，并初始化 Ray。
 3. `Runner.run` 加载 tokenizer/processor，创建共享 GPU resource pool、`FSDPWorker`、batch reward manager 和 dataloader。
 4. `RayPPOTrainer.init_workers` 建立 actor、reference policy、可选 critic、vLLM rollout engine、FSDP/vLLM 权重同步器。
@@ -290,6 +299,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 RefCOCO 10k OPSD 入口；校验服务器路径/GPU，隔离外部 Ray 集群并集中保存运行日志与 checkpoint |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -373,6 +383,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度再计算完整词表 JSD；其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
+15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -453,3 +464,17 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.3 节 rollout 职责。
 - 行为：在构建 vLLM LLM 前，为 `Qwen3VLConfig` 缺失的顶层语言模型字段提供从 `text_config` 读取/写入的 property。旧版 vLLM generic Transformers fallback 可访问 `vocab_size`、层数和 attention 配置；即使 checkpoint `config.json` 曾手工写入这些顶层字段，Transformers 构造配置时也会回写到 `text_config` 而不会报只读属性错误。原生支持 Qwen3-VL 的新版 vLLM 不受影响。
 - 验证：`python3 -m py_compile` 和 `git diff --check`；服务器使用 vLLM 0.8.3 时依次复现缺失顶层 `vocab_size` 和 `num_hidden_layers`，以及手工写入 `vocab_size` 后的只读属性错误，字段均存在于 Qwen3-VL `text_config`。未在本机运行 vLLM/GPU smoke test。
+
+### 2026-07-22 - 明确 AGENTS.md 的变更日志维护要求
+
+- 代码：未修改训练、评测或数据处理代码；修改根目录 `AGENTS.md`。
+- 文档：明确每次代码相关修改前必须阅读完整 `code.md` 及其最新变更日志，修改完成后必须基于既有历史追加新的日志条目；保留现有模块清单和代码架构说明。
+- 行为：后续代码、配置、数据转换、训练和评测逻辑的变更流程统一受 `code.md` 记录约束，避免遗漏行为影响和验证结果。
+- 验证：已检查 `code.md` 第 5 节模块清单、第 8 节变更日志、`Agent.md` 维护规则及更新后的 `AGENTS.md`；本次未运行代码测试，因为没有运行时代码变更。
+
+### 2026-07-22 - 增加火山引擎 RefCOCO 10k 八卡训练入口
+
+- 代码：新增 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、3.1、5.3、6 节的服务器入口、绝对路径、日志位置和 Ray 版本隔离要求。
+- 行为：新增当前服务器可直接运行的单节点 8 卡入口，默认读取 RefCOCO 10k parquet 和 Qwen3-VL-4B-SAMTok 权重；使用项目 Python 3.10 环境，清除平台 Python 3.12 / Ray 2.53 的注入地址，让 trainer 创建 Ray 2.56 本地集群；全部运行日志和 checkpoint 写入仓库 `logs/refcoco10k_opsd/`。训练仍保持 `G=6`、`K=6`、batch 128、1 epoch 和 OPSD 三路由，不改变论文/当前算法路径。
+- 验证：执行 shell 语法检查、路径与参数静态核对和 `git diff --check`；本机没有服务器挂载路径、CUDA、Ray/vLLM 环境及 8 张 GPU，未执行服务器训练 smoke test。
