@@ -66,7 +66,11 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。训练 stdout、Ray、W&B、teacher diagnosis 和 checkpoint 均写到仓库内
-`logs/refcoco10k_opsd/`。它不修改论文算法或训练超参数，只固定当前服务器的数据与运行环境。
+`logs/refcoco10k_opsd/`。由于 Ray 会在临时目录后继续拼接 session 和 Unix socket
+文件名，入口使用短路径 `/tmp/cgrpo-<uid>` 作为 `RAY_TMPDIR`，并将该路径符号链接到
+上述仓库日志根目录；这样 Ray 看到的 socket 路径不超过 Linux `AF_UNIX` 的 107 字节
+限制，实际 `ray/session_*` 文件仍保存在仓库内。它不修改论文算法或训练超参数，只固定
+当前服务器的数据与运行环境。
 
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
@@ -299,7 +303,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 RefCOCO 10k OPSD 入口；校验服务器路径/GPU，隔离外部 Ray 集群并集中保存运行日志与 checkpoint |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 RefCOCO 10k OPSD 入口；校验服务器路径/GPU，隔离外部 Ray 集群，以短 `/tmp` 符号链接规避 Unix socket 路径上限，并集中保存运行日志与 checkpoint |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -383,7 +387,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度再计算完整词表 JSD；其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
-15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。
+15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 也不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；服务器入口通过短 `/tmp/cgrpo-<uid>` 链接保留仓库内日志。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -478,3 +482,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、3.1、5.3、6 节的服务器入口、绝对路径、日志位置和 Ray 版本隔离要求。
 - 行为：新增当前服务器可直接运行的单节点 8 卡入口，默认读取 RefCOCO 10k parquet 和 Qwen3-VL-4B-SAMTok 权重；使用项目 Python 3.10 环境，清除平台 Python 3.12 / Ray 2.53 的注入地址，让 trainer 创建 Ray 2.56 本地集群；全部运行日志和 checkpoint 写入仓库 `logs/refcoco10k_opsd/`。训练仍保持 `G=6`、`K=6`、batch 128、1 epoch 和 OPSD 三路由，不改变论文/当前算法路径。
 - 验证：执行 shell 语法检查、路径与参数静态核对和 `git diff --check`；本机没有服务器挂载路径、CUDA、Ray/vLLM 环境及 8 张 GPU，未执行服务器训练 smoke test。
+
+### 2026-07-23 - 修复火山引擎 Ray Unix socket 路径过长
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、5.3、6 节的 Ray 临时目录、日志落盘位置和 Unix socket 路径限制。
+- 行为：不再把长仓库路径直接设为 `RAY_TMPDIR`；入口默认创建并复用 `/tmp/cgrpo-<uid>` 到仓库 `logs/refcoco10k_opsd/` 的符号链接，使 Ray 的 `plasma_store` socket 路径保持在 107 字节以内，同时实际 Ray session 日志仍保存在仓库。入口会拒绝过长、非绝对、非符号链接或指向其他目录的短路径，避免日志误写。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、短路径符号链接静态核对和 `git diff --check`；修复针对服务器已复现的 `validate_socket_filename failed`，本机没有服务器挂载路径、Ray/CUDA 环境及 8 张 GPU，未执行训练 smoke test。

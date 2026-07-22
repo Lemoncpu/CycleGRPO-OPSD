@@ -23,6 +23,7 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_ROOT}/checkpoints}"
 CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_LOG="${RUN_LOG:-${RUN_ROOT}/train_${RUN_STAMP}.log}"
+RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/tmp/cgrpo-${UID:-$(id -u)}}"
 
 if [[ ! -d "${REPO_DIR}" ]]; then
     echo "Repository directory not found: ${REPO_DIR}" >&2
@@ -77,6 +78,30 @@ mkdir -p \
     "${CACHE_DIR}/hf_datasets" \
     "${CACHE_DIR}/modelscope"
 
+if [[ "${RAY_SHORT_ROOT}" != /* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+    echo "RAY_SHORT_ROOT must be an absolute path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
+    exit 1
+fi
+
+# Ray appends session and socket names to RAY_TMPDIR. Use a short pathname to
+# stay below Linux's 107-byte AF_UNIX limit while keeping the files in RUN_ROOT.
+if [[ -L "${RAY_SHORT_ROOT}" ]]; then
+    RAY_LINK_TARGET="$(readlink -f "${RAY_SHORT_ROOT}")"
+    EXPECTED_RAY_TARGET="$(readlink -f "${RUN_ROOT}")"
+    if [[ "${RAY_LINK_TARGET}" != "${EXPECTED_RAY_TARGET}" ]]; then
+        echo "Ray temp link points to an unexpected directory: ${RAY_SHORT_ROOT} -> ${RAY_LINK_TARGET}" >&2
+        echo "Expected target: ${EXPECTED_RAY_TARGET}" >&2
+        echo "Set RAY_SHORT_ROOT to another short, unused path." >&2
+        exit 1
+    fi
+elif [[ -e "${RAY_SHORT_ROOT}" ]]; then
+    echo "Ray temp path exists and is not a symlink: ${RAY_SHORT_ROOT}" >&2
+    echo "Set RAY_SHORT_ROOT to another short, unused path." >&2
+    exit 1
+else
+    ln -s "${RUN_ROOT}" "${RAY_SHORT_ROOT}"
+fi
+
 echo "CycleGRPO training output: ${RUN_LOG}"
 exec >>"${RUN_LOG}" 2>&1
 
@@ -95,7 +120,7 @@ export MODELSCOPE_CACHE="${CACHE_DIR}/modelscope"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_DIR="${RUN_ROOT}/wandb"
-export RAY_TMPDIR="${RUN_ROOT}/ray"
+export RAY_TMPDIR="${RAY_SHORT_ROOT}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
@@ -106,6 +131,8 @@ echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
+echo "Ray temp root: ${RAY_TMPDIR} -> ${RUN_ROOT}"
+echo "Ray session logs: ${RUN_ROOT}/ray"
 echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
 "${PYTHON_BIN}" --version
 "${PYTHON_BIN}" -c 'import ray, torch, vllm; print(f"Ray: {ray.__version__}"); print(f"PyTorch: {torch.__version__}"); print(f"vLLM: {vllm.__version__}"); print(f"CUDA devices: {torch.cuda.device_count()}")'
