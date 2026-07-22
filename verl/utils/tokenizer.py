@@ -15,7 +15,14 @@
 
 from typing import Optional
 
-from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizer, ProcessorMixin
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedTokenizer, ProcessorMixin
+
+
+def _load_qwen3_vl_processor(model_path: str, **kwargs) -> ProcessorMixin:
+    """Load Qwen3-VL's composite processor when AutoProcessor misses its metadata."""
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+    return Qwen3VLProcessor.from_pretrained(model_path, **kwargs)
 
 
 def get_tokenizer(model_path: str, override_chat_template: Optional[str] = None, **kwargs) -> PreTrainedTokenizer:
@@ -40,12 +47,21 @@ def get_tokenizer(model_path: str, override_chat_template: Optional[str] = None,
 def get_processor(model_path: str, override_chat_template: Optional[str] = None, **kwargs) -> Optional[ProcessorMixin]:
     """Create a huggingface pretrained processor."""
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
-    if override_chat_template is not None:
-        processor.chat_template = override_chat_template
 
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/auto/processing_auto.py#L386
-    if processor is not None and "Processor" not in processor.__class__.__name__:
-        processor = None
+    if processor is not None and not isinstance(processor, ProcessorMixin):
+        model_config = AutoConfig.from_pretrained(model_path, **kwargs)
+        if getattr(model_config, "model_type", None) == "qwen3_vl":
+            print(
+                f"AutoProcessor returned {processor.__class__.__name__} for Qwen3-VL. "
+                "Loading Qwen3VLProcessor explicitly."
+            )
+            processor = _load_qwen3_vl_processor(model_path, **kwargs)
+        else:
+            processor = None
+
+    if processor is not None and override_chat_template is not None:
+        processor.chat_template = override_chat_template
 
     return processor
