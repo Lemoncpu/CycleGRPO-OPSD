@@ -1,0 +1,8 @@
+# RefCOCO -> CycleGRPO Parquet conversion.
+# Install a CUDA-compatible torch/torchvision pair before this profile.
+-r base.txt
+datasets
+pyarrow>=15.0.0
+pycocotools
+iopath>=0.1.10
+torchvision

@@ -62,15 +62,16 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
-环境、RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。平台会注入
+环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
-Ray。训练 stdout、Ray、W&B、teacher diagnosis 和 checkpoint 均写到仓库内
-`logs/refcoco10k_opsd/`。由于 Ray 会在临时目录后继续拼接 session 和 Unix socket
-文件名，入口使用短路径 `/tmp/cgrpo-<uid>` 作为 `RAY_TMPDIR`，并将该路径符号链接到
-上述仓库日志根目录；这样 Ray 看到的 socket 路径不超过 Linux `AF_UNIX` 的 107 字节
-限制，实际 `ray/session_*` 文件仍保存在仓库内。它不修改论文算法或训练超参数，只固定
-当前服务器的数据与运行环境。
+Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+`logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
+`/tmp/cgrpo-ray-<uid>`。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
+字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
+符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
+前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
+只固定当前服务器的数据与运行环境。
 
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
@@ -305,7 +306,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 RefCOCO 10k OPSD 入口；校验服务器路径/GPU，隔离外部 Ray 集群，以短 `/tmp` 符号链接规避 Unix socket 路径上限，并集中保存运行日志与 checkpoint |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 RefCOCO 10k OPSD 入口；校验服务器路径/GPU 与 parquet 图像路径，隔离外部 Ray 集群，使用本地短 `/tmp` 目录承载 Ray session/object spill，并将训练日志与 checkpoint 持久化 |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -389,8 +390,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度再计算完整词表 JSD；其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
-15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 也不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；服务器入口通过短 `/tmp/cgrpo-<uid>` 链接保留仓库内日志。
-16. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
+15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。入口固定使用短的真实本地 `/tmp/cgrpo-ray-<uid>` 目录，并在启动时检查临时盘利用率。
+16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
+17. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -499,3 +501,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.1、5.1、5.2、6 节的 processor 加载调用链、模块清单和 checkpoint 元数据约束。
 - 行为：当 `AutoProcessor` 对 `model_type=qwen3_vl` checkpoint 只返回 tokenizer、image processor 等非 `ProcessorMixin` 对象时，显式加载 `Qwen3VLProcessor`，避免 RefCOCO 多模态数据过滤阶段因 `processor=None` 调用 `apply_chat_template` 失败；非 Qwen3-VL 模型和已正确加载的复合 processor 保持原行为。自定义 chat template 现在在最终 processor 确定后应用。
 - 验证：针对 Qwen3-VL 回退、非 Qwen 保持 `None`、正常复合 processor 不回退三个分支新增无下载 mock 单测；`python -m py_compile verl/utils/tokenizer.py tests/test_tokenizer.py` 和 `git diff --check` 通过。本机运行时缺少 Transformers/pytest，因此未实际执行单测；本机也无服务器 checkpoint、Ray/CUDA 和 8 卡环境，未执行完整训练 smoke test。
+
+### 2026-07-27 - 修复火山引擎 RefCOCO 路径与 Ray 满盘启动失败
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、5.3、6 节的默认 parquet、Ray 临时目录与图像路径数据契约。
+- 行为：入口默认使用 `*_workspace_paths.parquet`；在初始化 GPU worker 前扫描 train/val parquet 的 `images` 列并验证每个文件存在。Ray session、object store 和 spill 文件改为真实本地 `/tmp/cgrpo-ray-<uid>` 目录，不再链接到 `RUN_ROOT`；启动前拒绝符号链接或利用率不低于 95% 的 Ray 临时盘。训练日志、W&B、teacher diagnosis 与 checkpoint 继续写入 `RUN_ROOT`。
+- 验证：服务器实际修复后的 parquet 已写入并验证 10,000 个图像路径；`df -hT` 确认 workspace 挂载使用率 98%，`/tmp` 使用率 1%。本机执行 shell 语法检查和 `git diff --check`；本机没有火山引擎挂载、Ray/vLLM 与 8 张 GPU，未运行训练 smoke test。

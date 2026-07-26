@@ -1,0 +1,4 @@
+# Dependencies used only by historical/experimental utilities, not RefCOCO RL.
+liger-kernel
+mathruler
+pylatexenc

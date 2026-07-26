@@ -1,0 +1,16 @@
+# Core Ray/FSDP CycleGRPO training, excluding CUDA extension and rollout engine.
+# Install a CUDA-compatible torch/torchvision pair before this profile.
+-r base.txt
+accelerate
+codetiming
+datasets
+iopath>=0.1.10
+openai
+peft
+pyarrow>=15.0.0
+pycocotools
+pycocoevalcap
+ray[default]
+tensordict
+torchdata
+torchvision

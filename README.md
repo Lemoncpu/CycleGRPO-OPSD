@@ -47,11 +47,38 @@ evaluation/
 ## Setup
 
 ```bash
-pip install -r requirements.txt
-pip install -e .          # editable install of the verl package
+# Installs only shared, non-CUDA packages. This is also what `pip install -e .` uses.
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-Requires CUDA GPUs, PyTorch, and vLLM (SPMD mode). See `requirements.txt`.
+Install the CUDA-compatible `torch`/`torchvision` pair for the server before a GPU
+profile. Then install only the profile needed for the task:
+
+```bash
+# Build the RefCOCO Parquet used by CycleGRPO.
+python -m pip install -r requirements/refcoco-data.txt
+
+# Ray/FSDP trainer and RefCOCO reward path (without vLLM or FlashAttention).
+python -m pip install -r requirements/rl-train.txt
+
+# CUDA extension required by the FSDP actor; compile it against the installed torch.
+python -m pip install --no-build-isolation -r requirements/cuda-kernels.txt
+
+# Native Qwen3-VL rollout. Requires a torch/CUDA runtime supported by vLLM 0.11.0.
+python -m pip install -r requirements/rollout-qwen3vl.txt
+
+# Optional profiles.
+python -m pip install -r requirements/tracking.txt   # W&B
+python -m pip install -r requirements/eval.txt       # evaluation/external judge
+python -m pip install -r requirements/legacy.txt     # historical utilities
+```
+
+The `projects/rl/qwen3vl_4b_mt.sh` online RL entrypoint requires all of
+`rl-train`, `cuda-kernels`, and `rollout-qwen3vl`. vLLM 0.8.x cannot run its
+Qwen3-VL rollout path. Splitting profiles makes data conversion and non-rollout
+utilities installable on constrained servers; it does not make an incompatible
+vLLM/Torch/CUDA combination usable.
 
 ## Data & checkpoints
 

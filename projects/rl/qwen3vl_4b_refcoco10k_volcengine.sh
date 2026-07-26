@@ -7,7 +7,7 @@ BASE_DIR="${BASE_DIR:-/mnt/cxzx/workspace/data_transfer/houzhiyan}"
 REPO_DIR="${REPO_DIR:-${BASE_DIR}/CycleGRPO-OPSD}"
 ENV_DIR="${ENV_DIR:-${BASE_DIR}/envs/cyclegrpo}"
 MODEL_PATH="${MODEL_PATH:-${BASE_DIR}/Qwen3-VL-4B-SAMTok}"
-TRAIN_DATA="${TRAIN_DATA:-${BASE_DIR}/refcoco-train2014-assets/refcoco_train_10k_seed20260722.parquet}"
+TRAIN_DATA="${TRAIN_DATA:-${BASE_DIR}/refcoco-train2014-assets/refcoco_train_10k_seed20260722_workspace_paths.parquet}"
 VAL_DATA="${VAL_DATA:-${TRAIN_DATA}}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -23,7 +23,9 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_ROOT}/checkpoints}"
 CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_LOG="${RUN_LOG:-${RUN_ROOT}/train_${RUN_STAMP}.log}"
-RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/tmp/cgrpo-${UID:-$(id -u)}}"
+# Keep Ray's object store and spill files on the local tmpfs.  RUN_ROOT is on
+# the persistent workspace mount, which can be nearly full independently.
+RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/tmp/cgrpo-ray-${UID:-$(id -u)}}"
 
 if [[ ! -d "${REPO_DIR}" ]]; then
     echo "Repository directory not found: ${REPO_DIR}" >&2
@@ -78,28 +80,63 @@ mkdir -p \
     "${CACHE_DIR}/hf_datasets" \
     "${CACHE_DIR}/modelscope"
 
-if [[ "${RAY_SHORT_ROOT}" != /* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+if [[ "${RAY_SHORT_ROOT}" != /tmp/* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+    echo "RAY_SHORT_ROOT must be a /tmp path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
+    exit 1
+fi
+
+if [[ -L "${RAY_SHORT_ROOT}" ]]; then
+    echo "RAY_SHORT_ROOT must be a real local directory, not a symlink: ${RAY_SHORT_ROOT}" >&2
+    echo "Use a new short /tmp path; old launchers linked this path to RUN_ROOT." >&2
+    exit 1
+fi
+mkdir -p "${RAY_SHORT_ROOT}"
+
+if [[ ! -d "${RAY_SHORT_ROOT}" ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
     echo "RAY_SHORT_ROOT must be an absolute path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
     exit 1
 fi
 
-# Ray appends session and socket names to RAY_TMPDIR. Use a short pathname to
-# stay below Linux's 107-byte AF_UNIX limit while keeping the files in RUN_ROOT.
-if [[ -L "${RAY_SHORT_ROOT}" ]]; then
-    RAY_LINK_TARGET="$(readlink -f "${RAY_SHORT_ROOT}")"
-    EXPECTED_RAY_TARGET="$(readlink -f "${RUN_ROOT}")"
-    if [[ "${RAY_LINK_TARGET}" != "${EXPECTED_RAY_TARGET}" ]]; then
-        echo "Ray temp link points to an unexpected directory: ${RAY_SHORT_ROOT} -> ${RAY_LINK_TARGET}" >&2
-        echo "Expected target: ${EXPECTED_RAY_TARGET}" >&2
-        echo "Set RAY_SHORT_ROOT to another short, unused path." >&2
-        exit 1
-    fi
-elif [[ -e "${RAY_SHORT_ROOT}" ]]; then
-    echo "Ray temp path exists and is not a symlink: ${RAY_SHORT_ROOT}" >&2
-    echo "Set RAY_SHORT_ROOT to another short, unused path." >&2
+RAY_TMP_USE_PERCENT="$(df -P "${RAY_SHORT_ROOT}" | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+if [[ ! "${RAY_TMP_USE_PERCENT}" =~ ^[0-9]+$ ]] || (( RAY_TMP_USE_PERCENT >= 95 )); then
+    echo "Ray temporary filesystem must be below 95% utilization: ${RAY_SHORT_ROOT}" >&2
+    df -h "${RAY_SHORT_ROOT}" >&2
     exit 1
-else
-    ln -s "${RUN_ROOT}" "${RAY_SHORT_ROOT}"
+fi
+
+validate_dataset_images() {
+    local dataset_path="$1"
+    "${PYTHON_BIN}" - "${dataset_path}" <<'PY'
+import os
+import sys
+
+import pyarrow.parquet as pq
+
+dataset_path = sys.argv[1]
+parquet = pq.ParquetFile(dataset_path)
+if "images" not in parquet.schema_arrow.names:
+    raise RuntimeError(f"{dataset_path} has no 'images' column")
+
+checked = 0
+for batch in parquet.iter_batches(columns=["images"], batch_size=2048):
+    for paths in batch.column(0).to_pylist():
+        if not isinstance(paths, list) or not paths:
+            raise RuntimeError(f"Invalid images entry: {paths!r}")
+        for image_path in paths:
+            checked += 1
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(
+                    f"Dataset image does not exist: {image_path}\n"
+                    "Re-export the parquet for this server or repair its images paths."
+                )
+
+print(f"Verified {checked} image paths in {dataset_path}")
+PY
+}
+
+validate_dataset_images "${TRAIN_DATA}"
+if [[ "${VAL_DATA}" != "${TRAIN_DATA}" ]]; then
+    validate_dataset_images "${VAL_DATA}"
 fi
 
 echo "CycleGRPO training output: ${RUN_LOG}"
@@ -131,8 +168,8 @@ echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
-echo "Ray temp root: ${RAY_TMPDIR} -> ${RUN_ROOT}"
-echo "Ray session logs: ${RUN_ROOT}/ray"
+echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
+echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
 echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
 "${PYTHON_BIN}" --version
 "${PYTHON_BIN}" -c 'import ray, torch, vllm; print(f"Ray: {ray.__version__}"); print(f"PyTorch: {torch.__version__}"); print(f"vLLM: {vllm.__version__}"); print(f"CUDA devices: {torch.cuda.device_count()}")'

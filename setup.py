@@ -26,14 +26,30 @@ def get_version() -> str:
         return version
 
 
-def get_requires() -> list[str]:
-    with open("requirements.txt", encoding="utf-8") as f:
-        file_content = f.read()
-        lines = [line.strip() for line in file_content.strip().split("\n") if not line.startswith("#")]
-        return lines
+def get_requires(path: str) -> list[str]:
+    """Read a requirements file, resolving local ``-r`` includes."""
+    requirements: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-r ") or line.startswith("--requirement "):
+                _, included_path = line.split(maxsplit=1)
+                requirements.extend(get_requires(os.path.join(os.path.dirname(path), included_path)))
+            else:
+                requirements.append(line)
+    return requirements
 
 
 extra_require = {
+    "refcoco-data": get_requires("requirements/refcoco-data.txt"),
+    "rl-train": get_requires("requirements/rl-train.txt"),
+    "cuda-kernels": get_requires("requirements/cuda-kernels.txt"),
+    "rollout-qwen3vl": get_requires("requirements/rollout-qwen3vl.txt"),
+    "tracking": get_requires("requirements/tracking.txt"),
+    "eval": get_requires("requirements/eval.txt"),
+    "legacy": get_requires("requirements/legacy.txt"),
     "dev": ["pre-commit", "ruff"],
 }
 
@@ -52,7 +68,7 @@ def main():
         package_dir={"": "."},
         packages=find_packages(where="."),
         python_requires=">=3.9.0",
-        install_requires=get_requires(),
+        install_requires=get_requires("requirements/base.txt"),
         extras_require=extra_require,
     )
 
