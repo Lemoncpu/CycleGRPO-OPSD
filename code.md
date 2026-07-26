@@ -151,6 +151,11 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 - 采样并 pad response，构造完整 `input_ids`、`attention_mask`、`response_mask` 和扩展后的 position ids。
 - 删除模型误生成的 vision 特殊 token，防止后续前向出现视觉 token/feature 数量不匹配。
 
+`BatchFunctionRewardManager` 只会把 cycle 元数据中的 `iou_scores` 传给已注册的
+image/video cycle source。`refcoco_cycle` 与 DenseWorld 一样需要此字段，供 caption
+reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compute_score` 在
+计算 `10 * iou_scores` 时收到 `None` 并在首个 batch 退出。
+
 ### 3.4 Phase 2：localization rollout
 
 `RayPPOTrainer._make_seg_batch_data_for_caption` 是 CycleGRPO 的核心桥梁：
@@ -508,3 +513,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、5.3、6 节的默认 parquet、Ray 临时目录与图像路径数据契约。
 - 行为：入口默认使用 `*_workspace_paths.parquet`；在初始化 GPU worker 前扫描 train/val parquet 的 `images` 列并验证每个文件存在。Ray session、object store 和 spill 文件改为真实本地 `/tmp/cgrpo-ray-<uid>` 目录，不再链接到 `RUN_ROOT`；启动前拒绝符号链接或利用率不低于 95% 的 Ray 临时盘。训练日志、W&B、teacher diagnosis 与 checkpoint 继续写入 `RUN_ROOT`。
 - 验证：服务器实际修复后的 parquet 已写入并验证 10,000 个图像路径；`df -hT` 确认 workspace 挂载使用率 98%，`/tmp` 使用率 1%。本机执行 shell 语法检查和 `git diff --check`；本机没有火山引擎挂载、Ray/vLLM 与 8 张 GPU，未运行训练 smoke test。
+
+### 2026-07-27 - 修复 RefCOCO cycle 奖励的 IoU 传递
+
+- 代码：修改 `verl/workers/reward/function.py`。
+- 文档：更新第 3.3 节的 batch reward 元数据契约。
+- 行为：将 `refcoco_cycle` 加入 batch reward manager 的 IoU source 白名单，因此 caption 和 segmentation reward 都会接收 trainer 计算的 `R_Ci`；caption metrics 也记录 `correct_mask`。此前 RefCOCO 在模型完成首个 rollout 后将 `iou_scores=None` 传给 `text2mask.compute_score`，触发 `int * NoneType`。
+- 验证：服务器实际训练日志在首个 batch 复现该异常；本机执行该模块语法检查、奖励 source 白名单静态断言和 `git diff --check`。本机没有 Ray/vLLM、模型、数据或 8 张 GPU，未执行端到端训练。
