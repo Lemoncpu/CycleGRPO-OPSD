@@ -520,3 +520,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.3 节的 batch reward 元数据契约。
 - 行为：将 `refcoco_cycle` 加入 batch reward manager 的 IoU source 白名单，因此 caption 和 segmentation reward 都会接收 trainer 计算的 `R_Ci`；caption metrics 也记录 `correct_mask`。此前 RefCOCO 在模型完成首个 rollout 后将 `iou_scores=None` 传给 `text2mask.compute_score`，触发 `int * NoneType`。
 - 验证：服务器实际训练日志在首个 batch 复现该异常；本机执行该模块语法检查、奖励 source 白名单静态断言和 `git diff --check`。本机没有 Ray/vLLM、模型、数据或 8 张 GPU，未执行端到端训练。
+
+### 2026-07-27 - 修复 OPSD distillation 的缺失导入
+
+- 代码：修改 `verl/workers/fsdp_workers.py`。
+- 文档：更新第 3.6 节的 OPSD 策略更新调用链。
+- 行为：显式导入 `collections.defaultdict`，使 `accumulate_distillation_gradients` 能创建跨 micro-batch 的 metric 容器。此前 RefCOCO 首步已完成 rollout、IoU reward 和 policy update，但在中路由 distillation 梯度累积时因 `NameError` 退出。
+- 验证：服务器日志定位到 `fsdp_workers.py:1696` 的未定义 `defaultdict`；本机执行模块语法检查、导入静态断言和 `git diff --check`。本机没有 Ray/vLLM、模型、数据或 8 张 GPU，未执行端到端训练。

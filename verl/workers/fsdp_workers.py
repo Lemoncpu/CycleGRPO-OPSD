@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+from collections import defaultdict
 from typing import Literal, Optional, Union, cast, Tuple, List
 
 import os
