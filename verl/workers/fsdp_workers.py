@@ -899,13 +899,19 @@ class FSDPWorker(Worker):
         if self._has_teacher:
             teacher_path = os.path.join(path, "ema_teacher")
             os.makedirs(teacher_path, exist_ok=True)
-            teacher_state = get_model_state_dict(
-                self.teacher_fsdp_module, options=StateDictOptions(cpu_offload=True)
-            )
-            torch.save(
-                teacher_state,
-                os.path.join(teacher_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"),
-            )
+            if self._use_teacher_param_offload:
+                load_fsdp_model(self.teacher_fsdp_module)
+            try:
+                teacher_state = get_model_state_dict(
+                    self.teacher_fsdp_module, options=StateDictOptions(cpu_offload=True)
+                )
+                torch.save(
+                    teacher_state,
+                    os.path.join(teacher_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"),
+                )
+            finally:
+                if self._use_teacher_param_offload:
+                    offload_fsdp_model(self.teacher_fsdp_module)
         dist.barrier()
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
