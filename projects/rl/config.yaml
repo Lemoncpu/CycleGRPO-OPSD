@@ -73,6 +73,7 @@ worker:
       temperature: 1.0
       entropy_weight_beta: 1.0
       min_sample_weight: 0.1
+      token_chunk_size: 256
     teacher_analysis:
       enabled: true
       max_samples_per_step: 2

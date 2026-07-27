@@ -218,7 +218,7 @@ localization:
 
 low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，过滤所有特殊 token/诊断泄漏，以当前 actor 做一次 greedy 重建，选每个低分轨迹的最佳改进 caption；相对原 `R_Ci` 提升至少 `0.05` 才采用，同 prompt 去重后最多两个 target。student 始终在原始 prompt 上做加权 CE，权重为 `(R_teacher-R_Ci)/(1-R_Ci+eps)`。
 
-mid route 不重采样 caption。EMA teacher 在包含原图、目标/典型/最佳 mask token、IoU 向量及空间差异摘要的 privileged prompt 上 teacher-force 同一 student 轨迹；student 仍使用原 prompt。两者在完整词表上计算 `beta=0.5` generalized JSD，以归一化的 `exp(-H_teacher)` 强调 teacher 有把握的 token，样本权重为 `clamp((0.85-R_Ci)/0.35,0.1,1)`。
+mid route 不重采样 caption。EMA teacher 在包含原图、目标/典型/最佳 mask token、IoU 向量及空间差异摘要的 privileged prompt 上 teacher-force 同一 student 轨迹；student 仍使用原 prompt。两者在完整词表上计算 `beta=0.5` generalized JSD，以归一化的 `exp(-H_teacher)` 强调 teacher 有把握的 token，样本权重为 `clamp((0.85-R_Ci)/0.35,0.1,1)`。为控制 Qwen3-VL 大词表的峰值显存，`workers/opsd/distillation.py` 按 response token 块计算 teacher 熵、token score 和 JSD；每块的 student JSD softmax/probability 中间量使用 activation checkpoint 在反向时重算。该分块只改变计算/内存调度，不改变完整词表 JSD、置信度归一化、样本权重或梯度公式；`worker.opsd.distillation.token_chunk_size=256` 可在更低峰值显存和更多 softmax 重算之间取舍。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -291,6 +291,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
 | `workers/opsd/config.py` | pixel IoU、路由、EMA teacher、regenerate 与 distillation 配置及边界校验 |
+| `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重和 distillation metrics |
 | `workers/opsd/mask_iou.py` | 严格 token 解析、原始 GT 转换、批量 mask 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、privileged context、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
@@ -392,7 +393,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 9. **路径尚未参数化完整。** 主训练、评测和 ETL 都有 `<PATH_TO_*>` 或本地路径，生产运行前必须审计。
 10. **测试覆盖有限。** 多数验证依赖 GPU、checkpoint 和数据集；小改动至少运行语法检查/导入检查，训练路径改动还应做最小单 batch smoke test。
 11. **OPSD dataclass 默认关闭，项目 YAML 显式开启。** 原始 SAMTok 消融设 `worker.opsd.enabled=false`；仅真实 IoU 的 CycleGRPO 设 `opsd.enabled=true`、`routing.enabled=false`、`ema_teacher.enabled=false`；完整版本保持主 YAML 默认。
-12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度再计算完整词表 JSD；其他 sequence-parallel 配置会在启动时显式报错。
+12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度；完整词表 JSD 以 response-token chunk 加 checkpoint 计算，`distillation.token_chunk_size` 只在 CUDA 峰值显存与 softmax 重算时间间取舍。其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
 15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。入口固定使用短的真实本地 `/tmp/cgrpo-ray-<uid>` 目录，并在启动时检查临时盘利用率。
@@ -534,3 +535,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.6 节的 EMA checkpoint 调用边界。
 - 行为：保存 EMA teacher shard 前，若 teacher 参数已 offload 到 CPU，则先将 FSDP 模型移回对应 CUDA compute device；`get_model_state_dict(..., cpu_offload=True)` 和落盘完成后始终重新 offload。此前第 5 个 global step 保存 `global_step_5` 时，FSDP 在 CPU 参数上 unshard，触发 `Expects tensor to be on the compute device cuda:0, was on cpu` 并使全部 Ray worker 退出。
 - 验证：服务器 traceback 定位到 `save_checkpoint()` 的 `get_model_state_dict(self.teacher_fsdp_module)`；本机执行模块语法检查、保存路径静态断言和 `git diff --check`。本机没有 Ray/vLLM、FSDP、模型、数据或 8 张 GPU，未执行 checkpoint round-trip。
+
+### 2026-07-28 - 分块计算 OPSD distillation JSD 以降低峰值显存
+
+- 代码：新增 `verl/workers/opsd/distillation.py`；修改 `verl/workers/opsd/__init__.py`、`config.py`、`verl/workers/fsdp_workers.py`、`projects/rl/config.yaml` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 3.6 节的 mid-route JSD 计算/显存边界、第 5.2 节 OPSD 模块清单和第 6 节关键注意事项。
+- 行为：mid-route 保持原 generalized-JSD、teacher entropy confidence、mask 与样本权重；teacher 统计与 JSD 改为 response-token chunk，JSD 块用 non-reentrant activation checkpoint，避免整段 response 同时持有多份 float32 student/teacher softmax、probability 和 mixture logits。默认 `token_chunk_size=256`，可按显存调小；更小值仅增加 softmax 重算，不改变算法。
+- 验证：新增 CPU 单元测试，逐项比较 dense 与 chunked loss、student gradient 和三个 metrics；修改文件执行 `py_compile` 与 `git diff --check`。本机缺少 PyTorch/FSDP、CUDA、模型与 8 卡环境，未执行 FSDP/vLLM smoke training；需在服务器环境运行 `python -m unittest tests/test_opsd_core.py` 后从 checkpoint 恢复训练。

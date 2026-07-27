@@ -1,4 +1,5 @@
 from .config import OPSDConfig
+from .distillation import chunked_weighted_jsd_loss
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
     coerce_raw_mask,
@@ -30,6 +31,7 @@ __all__ = [
     "REGENERATE_ROUTE",
     "aggregate_caption_rollouts",
     "build_privileged_context",
+    "chunked_weighted_jsd_loss",
     "classify_route",
     "coerce_raw_mask",
     "distillation_weight",

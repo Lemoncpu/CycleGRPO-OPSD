@@ -3,6 +3,7 @@ import unittest
 import torch
 from PIL import Image
 
+from verl.workers.opsd.distillation import chunked_weighted_jsd_loss
 from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
@@ -122,6 +123,76 @@ class OPSDCoreTest(unittest.TestCase):
             teacher_caption_is_safe("<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>")
         )
         self.assertFalse(teacher_caption_is_safe("A cup. <|im_start|>system"))
+
+    def test_chunked_jsd_matches_dense_loss_and_gradient(self):
+        torch.manual_seed(7)
+        student_logits = torch.randn(2, 5, 11, requires_grad=True)
+        teacher_logits = torch.randn(2, 5, 11)
+        target_ids = torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]])
+        response_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]])
+        sample_weight = torch.tensor([0.75, 0.25])
+        beta = 0.5
+        temperature = 0.8
+        entropy_weight_beta = 1.2
+
+        student_log_probs = torch.log_softmax(student_logits.float() / temperature, dim=-1)
+        teacher_log_probs = torch.log_softmax(teacher_logits.float() / temperature, dim=-1)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack(
+                [
+                    student_log_probs + torch.log(torch.tensor(1.0 - beta)),
+                    teacher_log_probs + torch.log(torch.tensor(beta)),
+                ]
+            ),
+            dim=0,
+        )
+        kl_student = (
+            student_log_probs.exp() * (student_log_probs - mixture_log_probs)
+        ).sum(dim=-1)
+        kl_teacher = (
+            teacher_log_probs.exp() * (teacher_log_probs - mixture_log_probs)
+        ).sum(dim=-1)
+        jsd = beta * kl_teacher + (1.0 - beta) * kl_student
+        entropy = -(teacher_log_probs.exp() * teacher_log_probs).sum(dim=-1)
+        token_mask = response_mask.float()
+        confidence = torch.exp(-entropy_weight_beta * entropy)
+        confidence = confidence / (
+            (confidence * token_mask).sum(dim=-1, keepdim=True)
+            / token_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ).clamp_min(1e-6)
+        weights = token_mask * confidence * sample_weight.unsqueeze(-1)
+        dense_loss = (jsd * weights).sum()
+        dense_metrics = {
+            "local_loss": dense_loss.detach() / token_mask.sum().clamp_min(1.0),
+            "teacher_entropy": (entropy * token_mask).sum() / token_mask.sum().clamp_min(1.0),
+            "teacher_sequence_score": (
+                teacher_log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1) * token_mask
+            ).sum()
+            / token_mask.sum().clamp_min(1.0),
+        }
+        dense_loss.backward()
+        dense_gradient = student_logits.grad.detach().clone()
+
+        chunked_student_logits = student_logits.detach().clone().requires_grad_(True)
+        chunked_loss, chunked_metrics = chunked_weighted_jsd_loss(
+            student_logits=chunked_student_logits,
+            teacher_logits=teacher_logits,
+            target_ids=target_ids,
+            response_mask=response_mask,
+            sample_weight=sample_weight,
+            beta=beta,
+            temperature=temperature,
+            entropy_weight_beta=entropy_weight_beta,
+            token_chunk_size=2,
+        )
+        chunked_loss.backward()
+
+        self.assertTrue(torch.allclose(chunked_loss, dense_loss.detach(), atol=1e-6, rtol=1e-6))
+        self.assertTrue(
+            torch.allclose(chunked_student_logits.grad, dense_gradient, atol=1e-6, rtol=1e-6)
+        )
+        for key, value in dense_metrics.items():
+            self.assertTrue(torch.allclose(chunked_metrics[key], value, atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

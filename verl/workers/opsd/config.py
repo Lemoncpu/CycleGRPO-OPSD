@@ -70,6 +70,7 @@ class DistillationConfig:
     temperature: float = 1.0
     entropy_weight_beta: float = 1.0
     min_sample_weight: float = 0.1
+    token_chunk_size: int = 256
 
     def post_init(self):
         if not 0.0 < self.beta < 1.0:
@@ -80,6 +81,8 @@ class DistillationConfig:
             raise ValueError("distillation.entropy_weight_beta must be non-negative.")
         if not 0.0 <= self.min_sample_weight <= 1.0:
             raise ValueError("distillation.min_sample_weight must be in [0, 1].")
+        if self.token_chunk_size <= 0:
+            raise ValueError("distillation.token_chunk_size must be positive.")
 
 
 @dataclass

@@ -19,7 +19,6 @@ from collections import defaultdict
 from typing import Literal, Optional, Union, cast, Tuple, List
 
 import os
-import math
 import re
 import hydra
 import copy
@@ -91,6 +90,7 @@ from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
 from .opsd import (
     build_privileged_context,
+    chunked_weighted_jsd_loss,
     coerce_raw_mask,
     compute_binary_iou,
     decode_mask_tokens,
@@ -1741,33 +1741,17 @@ class FSDPWorker(Worker):
                 teacher_logits = forward_logits(
                     self.teacher_fsdp_module, teacher_mm_inputs, "teacher_"
                 )
-            student_log_probs = torch.log_softmax(student_logits.float() / config.temperature, dim=-1)
-            teacher_log_probs = torch.log_softmax(teacher_logits.float() / config.temperature, dim=-1)
-            teacher_probs = teacher_log_probs.exp()
-            beta = config.beta
-            mixture_log_probs = torch.logsumexp(
-                torch.stack(
-                    [student_log_probs + math.log(1.0 - beta), teacher_log_probs + math.log(beta)]
-                ),
-                dim=0,
+            loss_numerator, distillation_metrics = chunked_weighted_jsd_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                target_ids=micro_batch.batch["responses"][:, :response_length],
+                response_mask=micro_batch.batch["response_mask"][:, :response_length],
+                sample_weight=micro_batch.batch["distill_weight"],
+                beta=config.beta,
+                temperature=config.temperature,
+                entropy_weight_beta=config.entropy_weight_beta,
+                token_chunk_size=config.token_chunk_size,
             )
-            kl_student = torch.nn.functional.kl_div(
-                mixture_log_probs, student_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-            kl_teacher = torch.nn.functional.kl_div(
-                mixture_log_probs, teacher_log_probs, reduction="none", log_target=True
-            ).sum(dim=-1)
-            jsd = beta * kl_teacher + (1.0 - beta) * kl_student
-            entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
-            confidence = torch.exp(-config.entropy_weight_beta * entropy)
-            token_mask = micro_batch.batch["response_mask"][:, :response_length].float()
-            confidence_mean = (confidence * token_mask).sum(dim=-1, keepdim=True) / token_mask.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1.0)
-            confidence = confidence / confidence_mean.clamp_min(1e-6)
-            sample_weight = micro_batch.batch["distill_weight"].float().unsqueeze(-1)
-            weights = token_mask * confidence * sample_weight
-            loss_numerator = (jsd * weights).sum()
             scaled_loss = (
                 loss_numerator
                 * self.world_size
@@ -1776,17 +1760,15 @@ class FSDPWorker(Worker):
             )
             scaled_loss.backward()
 
-            target_log_probs = teacher_log_probs.gather(
-                -1, micro_batch.batch["responses"][:, :response_length].unsqueeze(-1)
-            ).squeeze(-1)
-            local_loss = loss_numerator / token_mask.sum().clamp_min(1.0)
-            metric_values["opsd/distill_jsd"].append(float(local_loss.detach()))
+            metric_values["opsd/distill_jsd"].append(float(distillation_metrics["local_loss"]))
             metric_values["opsd/teacher_entropy"].append(
-                float((entropy * token_mask).sum() / token_mask.sum().clamp_min(1))
+                float(distillation_metrics["teacher_entropy"])
             )
             metric_values["opsd/teacher_sequence_score"].append(
-                float((target_log_probs * token_mask).sum() / token_mask.sum().clamp_min(1))
+                float(distillation_metrics["teacher_sequence_score"])
             )
+            # Release full-vocabulary outputs before preparing the next micro-batch.
+            del scaled_loss, loss_numerator, student_logits, teacher_logits
 
         if self._use_teacher_param_offload:
             offload_fsdp_model(self.teacher_fsdp_module)
