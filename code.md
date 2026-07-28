@@ -58,7 +58,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
-| 验证 | 关闭 | `val_freq=-1`、`val_before_train=false` |
+| 验证 | 关闭 | `val_freq=-1`、`val_before_train=false`；收尾也不会再额外运行 validation |
 | 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
@@ -542,3 +542,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.6 节的 mid-route JSD 计算/显存边界、第 5.2 节 OPSD 模块清单和第 6 节关键注意事项。
 - 行为：mid-route 保持原 generalized-JSD、teacher entropy confidence、mask 与样本权重；teacher 统计与 JSD 改为 response-token chunk，JSD 块用 non-reentrant activation checkpoint，避免整段 response 同时持有多份 float32 student/teacher softmax、probability 和 mixture logits。默认 `token_chunk_size=256`，可按显存调小；更小值仅增加 softmax 重算，不改变算法。
 - 验证：新增 CPU 单元测试，逐项比较 dense 与 chunked loss、student gradient 和三个 metrics；修改文件执行 `py_compile` 与 `git diff --check`。本机缺少 PyTorch/FSDP、CUDA、模型与 8 卡环境，未执行 FSDP/vLLM smoke training；需在服务器环境运行 `python -m unittest tests/test_opsd_core.py` 后从 checkpoint 恢复训练。
+
+### 2026-07-28 - 关闭验证时直接保存最终 checkpoint
+
+- 代码：修改 `verl/trainer/ray_trainer.py`。
+- 文档：更新第 2.2 节火山引擎入口的验证语义。
+- 行为：`trainer.val_freq<=0` 现在同时跳过训练结束后的 final validation；训练循环完成后仍会立即执行既有的最终 checkpoint 保存。此前 `val_freq=-1` 虽关闭周期验证，仍在 step 结束后对完整 val dataloader 运行 validation，使 `global_step_78` 在验证完成前无法落盘。
+- 验证：执行 `py_compile`、收尾分支静态检查和 `git diff --check`。本机没有 Ray/vLLM、模型、数据或 8 张 GPU，未执行恢复训练；服务器应从 `global_step_75` 恢复，确认生成 `global_step_78` 与 tracker 更新。

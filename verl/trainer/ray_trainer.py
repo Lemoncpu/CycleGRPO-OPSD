@@ -1652,11 +1652,11 @@ class RayPPOTrainer:
             self.logger.log(data=metrics, step=self.global_step)
             main_tqdm.update()
 
-        # perform validation after training
-        if self.val_reward_fn is not None:
+        # A non-positive frequency explicitly disables validation, including the
+        # final pass.  Always continue to the final checkpoint below.
+        if self.val_reward_fn is not None and self.config.trainer.val_freq > 0:
             if (
                 val_metrics is None
-                or self.config.trainer.val_freq <= 0
                 or self.global_step % self.config.trainer.val_freq != 0
             ):
                 val_metrics = self._validate()
