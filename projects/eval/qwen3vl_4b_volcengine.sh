@@ -30,12 +30,14 @@ export PATH="$ENV_DIR/bin:$PATH"
 PYTHON_BIN=${PYTHON_BIN:-$ENV_DIR/bin/python3}
 [[ -x "$PYTHON_BIN" ]] || { echo "Python not found: $PYTHON_BIN" >&2; exit 1; }
 [[ -d "$REPO_DIR" ]] || { echo "Repository not found: $REPO_DIR" >&2; exit 1; }
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 unset RAY_ADDRESS RAY_NAMESPACE
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=true WANDB_MODE=offline
 export HF_HOME=${HF_HOME:-$BASE_DIR/cache/huggingface}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$BASE_DIR/cache/hf_datasets}
 cd "$REPO_DIR"
 mkdir -p "$EVAL_ROOT"
+"$PYTHON_BIN" -c 'import projects; print("Project import root:", projects.__path__[0])'
 
 require_hf_model() {
     [[ -f "$HF_MODEL_PATH/config.json" ]] || { echo "HF export missing: run '$0 export' first." >&2; exit 1; }

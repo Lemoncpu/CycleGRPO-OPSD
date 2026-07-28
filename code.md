@@ -82,6 +82,10 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
 单独配置可用凭据。
 
+该入口以项目 Conda 的明确解释器运行，并将仓库根目录加入 `PYTHONPATH`。顶层
+`evaluation/*/*.py` 是按文件路径执行的脚本，Python 默认只会把其子目录加入 `sys.path`；若
+遗漏该设置，`from projects...` 会因找不到仓库顶层包而失败。
+
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
 ### 2.3 RefCOCO 20k 受控训练数据
@@ -575,3 +579,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、5.3、5.6、6 节的 checkpoint 导出、RefCOCO/GroundingSuite/DLC 评测路径和环境边界。
 - 行为：`trainer.export_hf_model_path` 触发 export-only worker，跳过 rollout vLLM、reference policy、EMA teacher、SAMTok、optimizer/scheduler/RNG/dataloader state，使用完整 FSDP world-size 恢复 actor model shard 并在 rank 0 导出 safetensors/processor。服务器入口为 RefCOCO、GroundingSuite 和 DLC 传递已配置路径并清除平台 Ray 地址；RefCOCO 以逐句 shard 可恢复输出汇总 cIoU/mIoU；GroundingSuite 推理后合并 JSONL 并运行 mask GIoU metric；DLC action 仅生成 prediction JSON，不调用外部 judge。
 - 验证：执行新增/修改 Python 的 `py_compile`、三个 shell 的 `bash -n`、配置/路径静态检查和 `git diff --check`。本机缺少 PyTorch/Ray/FSDP、CUDA、服务器数据和 8 张 GPU，未实际导出或运行 benchmark；服务器先运行 export，再分别运行三个 evaluation action。
+
+### 2026-07-28 - 修复文件路径评测脚本的项目导入根目录
+
+- 代码：修改 `projects/eval/qwen3vl_4b_volcengine.sh`。
+- 文档：更新第 2.2 节评测入口的 Python 模块路径约定。
+- 行为：入口显式导出 `PYTHONPATH=$REPO_DIR`，并在启动任一 action 前验证 `import projects`；DLC、RefCOCO 和 GroundingSuite 以文件路径运行时都可导入 `projects.transformers.vq_sam2`。此前环境解释器即使正确，`sys.path[0]` 仍是 `evaluation/<benchmark>` 子目录，导致 `ModuleNotFoundError: projects`。
+- 验证：执行 shell 语法检查、`PYTHONPATH` 导入静态检查和 `git diff --check`；本机没有完整 PyTorch/Ray/CUDA 环境，未运行模型推理。
