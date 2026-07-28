@@ -79,6 +79,42 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def resolve_image_path(image_file, data_root, coco_root=None):
+    """Resolve a GroundingSuite image against local and COCO asset roots.
+
+    GroundingSuite may store a COCO image ID as ``000000123456.jpg`` while
+    the official train2014 asset is ``COCO_train2014_000000123456.jpg``.
+    """
+    filename = os.path.basename(image_file)
+    roots = [data_root, os.path.join(data_root, "train2014")]
+    if coco_root:
+        roots.append(os.path.join(coco_root, "train2014"))
+
+    candidates = [image_file] if os.path.isabs(image_file) else []
+    if not os.path.isabs(image_file):
+        candidates.append(os.path.join(data_root, image_file))
+
+    match = re.fullmatch(r"(\d{12})\.jpg", filename)
+    coco_filename = f"COCO_train2014_{match.group(1)}.jpg" if match else None
+    for root in roots:
+        candidates.append(os.path.join(root, filename))
+        if coco_filename:
+            candidates.append(os.path.join(root, coco_filename))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    attempted = "\n  ".join(candidates)
+    raise FileNotFoundError(
+        f"Could not resolve GroundingSuite image {image_file!r}. Tried:\n  {attempted}"
+    )
+
+
 def load_image_with_retry(path, retries=6, base_delay=0.5):
     """Open an image, retrying transient NAS I/O failures with backoff.
 
@@ -86,6 +122,9 @@ def load_image_with_retry(path, retries=6, base_delay=0.5):
     raise transient I/O errors. Retrying avoids dropping/crashing on valid images.
     Raises the last error if all retries fail.
     """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+
     last = None
     for i in range(retries):
         try:
@@ -275,15 +314,13 @@ def main():
         caption = data_dict['caption']
         class_id = data_dict['class_id']
 
-        image_path = image_file if os.path.isabs(image_file) else os.path.join(args.data_root, image_file)
-        if not os.path.exists(image_path) and args.coco_root is not None:
-            image_path = os.path.join(args.coco_root, 'train2014', os.path.basename(image_file))
-    
         try:
+            image_path = resolve_image_path(image_file, args.data_root, args.coco_root)
             image = load_image_with_retry(image_path)
         except Exception as e:
-            print(f"skip {image_path} after retries: {e}")
-            continue
+            raise RuntimeError(
+                f"[task {args.task_id}] cannot load dataset idx={item_idx}, image={image_file!r}"
+            ) from e
         ori_width, ori_height = image.size
 
         question = f"Please carefully check the image and detect the object this sentence describes: {caption}"

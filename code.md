@@ -79,7 +79,10 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
-数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
+数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。GroundingSuite 的 JSONL 若只保存
+12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root` 和
+`coco_root/train2014` 中同时尝试该名称及官方的 `COCO_train2014_000000123456.jpg` 名称；无法
+解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
 单独配置可用凭据。
 
 该入口以项目 Conda 的明确解释器运行，并将仓库根目录加入 `PYTHONPATH`。顶层
@@ -586,3 +589,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2 节评测入口的 Python 模块路径约定。
 - 行为：入口显式导出 `PYTHONPATH=$REPO_DIR`，并在启动任一 action 前验证 `import projects`；DLC、RefCOCO 和 GroundingSuite 以文件路径运行时都可导入 `projects.transformers.vq_sam2`。此前环境解释器即使正确，`sys.path[0]` 仍是 `evaluation/<benchmark>` 子目录，导致 `ModuleNotFoundError: projects`。
 - 验证：执行 shell 语法检查、`PYTHONPATH` 导入静态检查和 `git diff --check`；本机没有完整 PyTorch/Ray/CUDA 环境，未运行模型推理。
+
+### 2026-07-28 - 修复 GroundingSuite COCO 文件名解析与缺图静默跳过
+
+- 代码：修改 `evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`。
+- 文档：更新第 2.2 节 GroundingSuite 的服务器图像路径契约。
+- 行为：当 JSONL 使用无前缀的 12 位 COCO image ID 时，评测同时尝试标准 `COCO_train2014_<id>.jpg` 文件名；仅对已存在的图片执行 NAS I/O 重试。真实缺图或无法读取的样本现在立即使 shard 失败，不再每条退避 31.5 秒后跳过且不写预测，从而避免进度停滞、未完成的 JSONL 合并和无效指标。
+- 验证：服务器日志复现无前缀 GroundingSuite 路径在已有 RefCOCO `train2014` 目录中找不到、每条等待约 31.5 秒的问题；本机执行 Python 语法检查和 `git diff --check`。本机没有服务器数据、CUDA、Qwen3-VL/SAMTok 权重，未运行 8 卡 GroundingSuite 推理。
