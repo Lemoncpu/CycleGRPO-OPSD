@@ -460,10 +460,14 @@ class FSDPWorker(Worker):
 
         self._has_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._has_critic = self.role == "critic"
-        self._has_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
-        self._has_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._has_rollout = (
+            self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+            and not self.config.export_mode
+        )
+        self._has_ref = self.role in ["ref", "actor_rollout_ref"] and not self.config.export_mode
         self._has_teacher = (
             self._has_actor
+            and not self.config.export_mode
             and self.config.opsd.enabled
             and self.config.opsd.routing.enabled
             and self.config.opsd.ema_teacher.enabled
@@ -917,12 +921,12 @@ class FSDPWorker(Worker):
             offload_fsdp_model(self.fsdp_module)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, path: str):
+    def load_checkpoint(self, path: str, load_optimizer: bool = True):
         assert self._has_actor or self._has_critic
         if self._use_param_offload:
             load_fsdp_model(self.fsdp_module)
 
-        self.checkpoint_manager.load_checkpoint(path)
+        self.checkpoint_manager.load_checkpoint(path, load_optimizer=load_optimizer)
         if self._has_teacher:
             teacher_file = os.path.join(
                 path, "ema_teacher", f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
@@ -955,12 +959,25 @@ class FSDPWorker(Worker):
                 del actor_state
                 if self._use_teacher_param_offload:
                     offload_fsdp_model(self.teacher_fsdp_module)
+
         dist.barrier()
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
 
         if self._use_optimizer_offload:  # avoid OOM in resuming
             offload_fsdp_optimizer(self.optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_huggingface_model(self, path: str):
+        """Export the loaded actor FSDP state to a Transformers-compatible directory."""
+        assert self._has_actor
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        try:
+            self.checkpoint_manager.export_huggingface_model(path)
+        finally:
+            if self._use_param_offload:
+                offload_fsdp_model(self.fsdp_module)
 
     def _process_multi_modal_inputs(self, data: DataProto):
         if "multi_modal_data" not in data.non_tensor_batch:

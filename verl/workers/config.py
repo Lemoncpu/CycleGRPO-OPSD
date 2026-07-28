@@ -41,6 +41,8 @@ __all__ = [
 @dataclass
 class WorkerConfig:
     hybrid_engine: bool = True
+    export_mode: bool = False
+    """Build only the actor FSDP model for checkpoint-to-HF export."""
     actor: ActorConfig = field(default_factory=ActorConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
     ref: RefConfig = field(default_factory=RefConfig)

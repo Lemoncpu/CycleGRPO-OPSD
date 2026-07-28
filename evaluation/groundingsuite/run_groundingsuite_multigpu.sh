@@ -15,6 +15,13 @@ SAVE_DIR=${3:-./results/groundingsuite/}
 VQ_SAM2_PATH=${VQ_SAM2_PATH:-Qwen/Qwen3-VL-4B-SAMTok/mask_tokenizer_256x2.pth}
 SAM2_PATH=${SAM2_PATH:-Qwen/sam2.1_hiera_large.pt}
 DATASET=${DATASET:-./data/GroundingSuiteEval/GroundingSuite-Eval.jsonl}
+DATA_ROOT=${DATA_ROOT:-$(dirname "$DATASET")}
+COCO_ROOT=${COCO_ROOT:-}
+PYTHON_BIN=${PYTHON_BIN:-python}
+COCO_ARGS=()
+if [[ -n "$COCO_ROOT" ]]; then
+    COCO_ARGS=(--coco_root "$COCO_ROOT")
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFER="$SCRIPT_DIR/qwen3vl_groundingsuite_infer.py"
@@ -30,11 +37,13 @@ mkdir -p "$SAVE_DIR" logs
 echo "Launching $NUM_GPUS shards | model=$MODEL_PATH | save=$SAVE_DIR"
 pids=()
 for ((t=0; t<NUM_GPUS; t++)); do
-    CUDA_VISIBLE_DEVICES=$t python "$INFER" \
+    CUDA_VISIBLE_DEVICES=$t "$PYTHON_BIN" "$INFER" \
         --model_path "$MODEL_PATH" \
         --vq_sam2_path "$VQ_SAM2_PATH" \
         --sam2_path "$SAM2_PATH" \
         --dataset "$DATASET" \
+        --data_root "$DATA_ROOT" \
+        "${COCO_ARGS[@]}" \
         --save_dir "$SAVE_DIR" \
         --task_id "$t" --num_tasks "$NUM_GPUS" --gpu_id 0 \
         > "logs/groundingsuite_shard${t}.log" 2>&1 &

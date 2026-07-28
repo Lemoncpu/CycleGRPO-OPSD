@@ -150,6 +150,8 @@ class TrainerConfig:
     """file to save ray timeline"""
     find_last_checkpoint: bool = True
     """automatically find the last checkpoint in the save checkpoint path to resume training"""
+    export_hf_model_path: Optional[str] = None
+    """export the loaded FSDP actor checkpoint as a Hugging Face model, then exit"""
 
     def post_init(self):
         if self.save_checkpoint_path is None:
@@ -162,6 +164,8 @@ class TrainerConfig:
             else:
                 print(f"Model checkpoint {self.load_checkpoint_path} not found.")
                 self.load_checkpoint_path = None
+        if self.export_hf_model_path is not None:
+            self.export_hf_model_path = os.path.abspath(self.export_hf_model_path)
 
 
 @dataclass

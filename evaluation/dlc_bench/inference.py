@@ -73,6 +73,11 @@ def parse_args():
         default="qwen3vl_samtok",
     )
     parser.add_argument(
+        "--output",
+        default=None,
+        help="Prediction JSON path. Defaults to evaluation/dlc_bench/model_outputs/<cache_name>.json.",
+    )
+    parser.add_argument(
         "--data_type",
         help="data dtype",
         type=str,
@@ -397,10 +402,11 @@ def main():
             pbar.update(1)
     pbar.close()
 
-    with open(f"evaluation/dlc_bench/model_outputs/{cache_name}.json", "w") as file:
+    output_path = args.output or f"evaluation/dlc_bench/model_outputs/{cache_name}.json"
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w") as file:
         json.dump(model_outputs, file, indent=4, ensure_ascii=False)
-
-    print(f"Cache name: {cache_name}")
+    print(f"Saved predictions: {output_path}")
 
 
 if __name__ == "__main__":

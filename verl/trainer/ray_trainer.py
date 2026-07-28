@@ -407,7 +407,7 @@ class RayPPOTrainer:
         with open(checkpointer_tracker_path, "w") as f:
             json.dump(checkpointer_tracker_info, f, ensure_ascii=False, indent=2)
 
-    def _load_checkpoint(self) -> None:
+    def _load_checkpoint(self, model_only: bool = False) -> None:
         if self.config.trainer.load_checkpoint_path is not None:
             load_checkpoint_path = self.config.trainer.load_checkpoint_path
         elif self.config.trainer.find_last_checkpoint:
@@ -427,17 +427,28 @@ class RayPPOTrainer:
         print(f"Load from checkpoint: {load_checkpoint_path}.")
         self.global_step = int(load_checkpoint_path.strip(os.path.sep).split("global_step_")[-1])
         actor_path = os.path.join(load_checkpoint_path, "actor")
-        self.actor_rollout_ref_wg.load_checkpoint(actor_path)
-        if self.use_critic:
+        self.actor_rollout_ref_wg.load_checkpoint(actor_path, load_optimizer=not model_only)
+        if self.use_critic and not model_only:
             critic_path = os.path.join(load_checkpoint_path, "critic")
             self.critic_wg.load_checkpoint(critic_path)
 
-        dataloader_path = os.path.join(load_checkpoint_path, "dataloader.pt")
-        if os.path.exists(dataloader_path):
-            dataloader_state_dict = torch.load(dataloader_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+        if not model_only:
+            dataloader_path = os.path.join(load_checkpoint_path, "dataloader.pt")
+            if os.path.exists(dataloader_path):
+                dataloader_state_dict = torch.load(dataloader_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+
+    def export_huggingface_checkpoint(self, output_path: str) -> None:
+        """Load an existing FSDP checkpoint and export its actor for offline evaluation."""
+        self.global_step = 0
+        self._load_checkpoint(model_only=True)
+        if self.global_step <= 0:
+            raise RuntimeError(
+                "No FSDP checkpoint was loaded. Set trainer.load_checkpoint_path to global_step_<N>."
+            )
+        self.actor_rollout_ref_wg.export_huggingface_model(output_path)
 
     def _maybe_log_val_generations(
         self, inputs: list[str], outputs: list[str], labels: list[str], scores: list[float]

@@ -91,6 +91,9 @@ class Runner:
             val_reward_fn=val_reward_fn,
         )
         trainer.init_workers()
+        if config.trainer.export_hf_model_path is not None:
+            trainer.export_huggingface_checkpoint(config.trainer.export_hf_model_path)
+            return
         trainer.fit()
 
 

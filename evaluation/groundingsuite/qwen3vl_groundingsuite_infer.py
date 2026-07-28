@@ -56,6 +56,14 @@ def parse_args():
         '--dataset',
         default='./data/GroundingSuiteEval/GroundingSuite-Eval.jsonl',
         help='Specify a ref dataset')
+    parser.add_argument(
+        '--data_root',
+        default='./data/GroundingSuiteEval',
+        help='Root directory containing GroundingSuite images and metadata.')
+    parser.add_argument(
+        '--coco_root',
+        default=None,
+        help='Optional COCO root containing train2014 for legacy image paths.')
     parser.add_argument('--task_id', '--task-id', type=int, default=0,
                         help='Shard index for this process (0 .. num_tasks-1).')
     parser.add_argument('--num_tasks', '--num-tasks', type=int, default=1,
@@ -267,10 +275,9 @@ def main():
         caption = data_dict['caption']
         class_id = data_dict['class_id']
 
-        image_path = os.path.join('./data/GroundingSuiteEval', image_file)
-        # Replace path for coco images
-        # image_path = image_path.replace('data/ref_seg/grefs/coco2014/train2014', 'data/coco/train2014')
-        image_path = image_path.replace('./data/ref_seg/grefs/coco2014/train2014', '<PATH_TO_COCO2014>/train2014')
+        image_path = image_file if os.path.isabs(image_file) else os.path.join(args.data_root, image_file)
+        if not os.path.exists(image_path) and args.coco_root is not None:
+            image_path = os.path.join(args.coco_root, 'train2014', os.path.basename(image_file))
     
         try:
             image = load_image_with_retry(image_path)

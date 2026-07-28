@@ -73,6 +73,15 @@ Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
 只固定当前服务器的数据与运行环境。
 
+火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。训练 checkpoint 中的
+`actor/model_world_size_8_rank_*.pt` 是 FSDP shard，`actor/huggingface/` 只包含配置和
+processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑只加载 actor model shard 并导出
+标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite` 和 `dlc` action 使用独立 CUDA
+进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
+及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
+数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
+单独配置可用凭据。
+
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
 ### 2.3 RefCOCO 20k 受控训练数据
@@ -320,6 +329,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `reward_function/tg_reward.py` | temporal grounding 可组合奖励库 |
 | `reward_function/llm_judge_reward.py` | 可选外部 vLLM caption judge 客户端，不属于无外部 judge 的主闭环 |
 
+`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。
+
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
@@ -336,6 +347,12 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - `visualize_*.py` / `vis_mask_overlay.py`：解码、叠加和检查 parquet/mask token。
 
 这些脚本普遍含本地数据路径，运行前必须逐个替换；生成后应先用可视化脚本抽样检查 schema、图像路径和 token 对齐。
+
+### 5.3.1 `projects/eval/`：火山引擎离线评测编排
+
+| 文件 | 职责 |
+|---|---|
+| `qwen3vl_4b_volcengine.sh` | export-only FSDP actor 转 HF safetensors，并顺序启动标准 RefCOCO、GroundingSuite mask GIoU 与 DLC-Bench prediction 生成；设置服务器路径、Conda、缓存和 Ray 地址隔离 |
 
 ### 5.4 `projects/transformers/`：模型定义
 
@@ -372,13 +389,14 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 目录 | 文件职责 |
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 解码 mask token、保存 shard、计算 gIoU/cIoU/N-acc；shell 多 GPU 分片 |
-| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；数据路径需替换 `<PATH_TO_COCO2014>` |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
+| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
 | `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图 |
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
-评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。它们含数据路径占位符、benchmark 特定依赖和输出约定，不能只凭主 README 直接运行。
+评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
 
 ## 6. 当前实现中的关键注意事项
 
@@ -399,6 +417,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。入口固定使用短的真实本地 `/tmp/cgrpo-ray-<uid>` 目录，并在启动时检查临时盘利用率。
 16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
 17. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
+18. **FSDP checkpoint 不是可直接评测的 HF 模型。** `actor/huggingface/` 仅保存 config/generation config/processor；必须使用与保存 world size 相同的 export-only FSDP worker 恢复 shard 后导出。不要把原 cold-start `MODEL_PATH` 当作训练后模型传给评测脚本。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -549,3 +568,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2 节火山引擎入口的验证语义。
 - 行为：`trainer.val_freq<=0` 现在同时跳过训练结束后的 final validation；训练循环完成后仍会立即执行既有的最终 checkpoint 保存。此前 `val_freq=-1` 虽关闭周期验证，仍在 step 结束后对完整 val dataloader 运行 validation，使 `global_step_78` 在验证完成前无法落盘。
 - 验证：执行 `py_compile`、收尾分支静态检查和 `git diff --check`。本机没有 Ray/vLLM、模型、数据或 8 张 GPU，未执行恢复训练；服务器应从 `global_step_75` 恢复，确认生成 `global_step_78` 与 tracker 更新。
+
+### 2026-07-28 - 增加火山引擎 FSDP 导出与离线评测入口
+
+- 代码：新增 `projects/eval/qwen3vl_4b_volcengine.sh`、`evaluation/refcoco/`；修改 trainer/worker/FSDP checkpoint 管理器、GroundingSuite launcher/inference 及 DLC inference。
+- 文档：更新第 2.2、5.3、5.6、6 节的 checkpoint 导出、RefCOCO/GroundingSuite/DLC 评测路径和环境边界。
+- 行为：`trainer.export_hf_model_path` 触发 export-only worker，跳过 rollout vLLM、reference policy、EMA teacher、SAMTok、optimizer/scheduler/RNG/dataloader state，使用完整 FSDP world-size 恢复 actor model shard 并在 rank 0 导出 safetensors/processor。服务器入口为 RefCOCO、GroundingSuite 和 DLC 传递已配置路径并清除平台 Ray 地址；RefCOCO 以逐句 shard 可恢复输出汇总 cIoU/mIoU；GroundingSuite 推理后合并 JSONL 并运行 mask GIoU metric；DLC action 仅生成 prediction JSON，不调用外部 judge。
+- 验证：执行新增/修改 Python 的 `py_compile`、三个 shell 的 `bash -n`、配置/路径静态检查和 `git diff --check`。本机缺少 PyTorch/Ray/FSDP、CUDA、服务器数据和 8 张 GPU，未实际导出或运行 benchmark；服务器先运行 export，再分别运行三个 evaluation action。
