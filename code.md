@@ -80,8 +80,9 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。GroundingSuite 的 JSONL 若只保存
-12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root` 和
-`coco_root/train2014` 中同时尝试该名称及官方的 `COCO_train2014_000000123456.jpg` 名称；无法
+12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root`、其 `assets/`、
+`unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
+`COCO_train2014_000000123456.jpg` 名称；无法
 解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
 单独配置可用凭据。
 
@@ -596,3 +597,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2 节 GroundingSuite 的服务器图像路径契约。
 - 行为：当 JSONL 使用无前缀的 12 位 COCO image ID 时，评测同时尝试标准 `COCO_train2014_<id>.jpg` 文件名；仅对已存在的图片执行 NAS I/O 重试。真实缺图或无法读取的样本现在立即使 shard 失败，不再每条退避 31.5 秒后跳过且不写预测，从而避免进度停滞、未完成的 JSONL 合并和无效指标。
 - 验证：服务器日志复现无前缀 GroundingSuite 路径在已有 RefCOCO `train2014` 目录中找不到、每条等待约 31.5 秒的问题；本机执行 Python 语法检查和 `git diff --check`。本机没有服务器数据、CUDA、Qwen3-VL/SAMTok 权重，未运行 8 卡 GroundingSuite 推理。
+
+### 2026-07-28 - 补全 GroundingSuite 发布数据的资产根目录
+
+- 代码：修改 `evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`。
+- 文档：更新第 2.2 节 GroundingSuite 图像解析根目录说明。
+- 行为：除 JSONL 相对路径和外部 COCO `train2014` 外，解析器也检查 GroundingSuite 发布包的 `assets/`、`unlabeled2017/` 及其可能的 `train2014/` 子目录。此前服务器的 `GSEval` 根目录包含这两个资产目录，但 bare image ID 无法被解析器发现，fail-fast 修复因而使全部 shard 立即退出。
+- 验证：服务器 8 shard 日志确认修复无前缀 COCO 名称后仍在 `GSEval/assets`/`unlabeled2017` 之外查找，60 秒内全部退出且仅保留上一轮 9 条输出；本机执行 Python 语法检查和 `git diff --check`。本机没有发布数据、CUDA、Qwen3-VL/SAMTok 权重，未运行 8 卡推理。

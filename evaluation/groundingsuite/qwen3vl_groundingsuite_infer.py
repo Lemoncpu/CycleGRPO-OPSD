@@ -86,7 +86,14 @@ def resolve_image_path(image_file, data_root, coco_root=None):
     the official train2014 asset is ``COCO_train2014_000000123456.jpg``.
     """
     filename = os.path.basename(image_file)
-    roots = [data_root, os.path.join(data_root, "train2014")]
+    roots = [
+        data_root,
+        os.path.join(data_root, "assets"),
+        os.path.join(data_root, "train2014"),
+        os.path.join(data_root, "assets", "train2014"),
+        os.path.join(data_root, "unlabeled2017"),
+        os.path.join(data_root, "assets", "unlabeled2017"),
+    ]
     if coco_root:
         roots.append(os.path.join(coco_root, "train2014"))
 
