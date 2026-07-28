@@ -16,9 +16,19 @@ ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-128}"
 CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+# Leave empty for the complete epoch.  Set 5, 10, ... to create a checkpoint
+# boundary for an offline RefCOCO validation before continuing with RESUME=true.
+MAX_STEPS="${MAX_STEPS:-}"
+# decay=1.0 makes the existing EMA update an identity, so teacher parameters
+# remain the SAMTok actor weights copied during worker initialization.
+TEACHER_EMA_DECAY="${TEACHER_EMA_DECAY:-1.0}"
+SAVE_FREQ="${SAVE_FREQ:-5}"
+# A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
+# continuing a checkpoint produced by this same frozen-teacher experiment.
+RESUME="${RESUME:-false}"
 
-RUN_NAME="${RUN_NAME:-refcoco10k_opsd_qwen3vl4b}"
-RUN_ROOT="${RUN_ROOT:-${REPO_DIR}/logs/refcoco10k_opsd}"
+RUN_NAME="${RUN_NAME:-refcoco10k_opsd_frozen_teacher}"
+RUN_ROOT="${RUN_ROOT:-${REPO_DIR}/logs/refcoco10k_opsd_frozen_teacher}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_ROOT}/checkpoints}"
 CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
@@ -30,6 +40,27 @@ RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/tmp/cgrpo-ray-${UID:-$(id -u)}}"
 if [[ ! -d "${REPO_DIR}" ]]; then
     echo "Repository directory not found: ${REPO_DIR}" >&2
     exit 1
+fi
+
+if [[ ! "${TEACHER_EMA_DECAY}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
+    || ! awk -v value="${TEACHER_EMA_DECAY}" 'BEGIN { exit !(value > 0 && value <= 1) }'; then
+    echo "TEACHER_EMA_DECAY must be in (0, 1]: ${TEACHER_EMA_DECAY}" >&2
+    exit 1
+fi
+
+if [[ "${RESUME}" != "true" && "${RESUME}" != "false" ]]; then
+    echo "RESUME must be true or false: ${RESUME}" >&2
+    exit 1
+fi
+
+if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
+    exit 1
+fi
+
+TRAINER_MAX_STEPS_ARG=()
+if [[ -n "${MAX_STEPS}" ]]; then
+    TRAINER_MAX_STEPS_ARG=("trainer.max_steps=${MAX_STEPS}")
 fi
 
 if [[ "${CONDA_PREFIX:-}" != "${ENV_DIR}" ]] && command -v conda >/dev/null 2>&1; then
@@ -167,6 +198,9 @@ echo "Start time: $(date --iso-8601=seconds)"
 echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
+echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
+echo "Resume: ${RESUME}"
+echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
 echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
 echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
@@ -174,6 +208,8 @@ echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
 "${PYTHON_BIN}" --version
 "${PYTHON_BIN}" -c 'import ray, torch, vllm; print(f"Ray: {ray.__version__}"); print(f"PyTorch: {torch.__version__}"); print(f"vLLM: {vllm.__version__}"); print(f"CUDA devices: {torch.cuda.device_count()}")'
 
+# Generic trainer validation does not run the RefCOCO mask/cIoU path. Evaluate
+# the checkpoints saved below with the offline RefCOCO evaluator instead.
 exec "${PYTHON_BIN}" -m verl.trainer.main \
     config=projects/rl/config.yaml \
     "data.train_files=['${TRAIN_DATA}']" \
@@ -209,18 +245,20 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
     worker.opsd.ema_teacher.enabled=true \
+    worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
     worker.opsd.teacher_analysis.enabled=true \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \
     trainer.experiment_name="${RUN_NAME}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    "${TRAINER_MAX_STEPS_ARG[@]}" \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node="${NUM_GPUS}" \
     trainer.val_freq=-1 \
     trainer.val_before_train=false \
-    trainer.save_freq=5 \
+    trainer.save_freq="${SAVE_FREQ}" \
     trainer.save_limit=20 \
     trainer.save_checkpoint_path="${CHECKPOINT_DIR}" \
-    trainer.find_last_checkpoint=true \
+    trainer.find_last_checkpoint="${RESUME}" \
     'trainer.logger=["file","wandb"]'

@@ -50,7 +50,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 外层 rollout `G` | `worker.rollout.n=6` | 与论文及 OPSD 默认一致 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
-| EMA teacher | `decay=0.999`、CPU offload | 与 frozen reference policy 完全独立 |
+| teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
 | rollout/global batch | `128` | 与论文一致 |
@@ -58,11 +58,17 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
-| 验证 | 关闭 | `val_freq=-1`、`val_before_train=false`；收尾也不会再额外运行 validation |
+| 验证 | checkpoint 后离线 RefCOCO | 入口每 5 step 保存 checkpoint，`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
 | 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
-环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。平台会注入
+环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。当前默认输出根为
+`logs/refcoco10k_opsd_frozen_teacher`，并设置 `worker.opsd.ema_teacher.decay=1.0`，所以 FSDP
+worker 初始化时从 actor 复制的 SAMTok 参数之后不会更新；需要继续同一冻结实验时才显式设 `RESUME=true`。
+`trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
+rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
+离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
+再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
@@ -79,12 +85,13 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
-数据根和可选 COCO 图像根，并在推理合并后运行仓库 mask GIoU metric。GroundingSuite 的 JSONL 若只保存
+数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
+目录计算 mask GIoU。GroundingSuite 的 JSONL 若只保存
 12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root`、其 `assets/`、
 `unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
 `COCO_train2014_000000123456.jpg` 名称；无法
 解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
-单独配置可用凭据。
+单独配置可用凭据。DLC caption inference 对全局图和可选 zoom-in 图使用同一事实性区域描述协议：只描述 mask 指定的区域，禁止推理、mask token、JSON 和区域外细节；生成上限固定为 192 token。此协议是评测条件的一部分，比较任何 checkpoint 前都必须以同一版本重新推理。
 
 该入口以项目 Conda 的明确解释器运行，并将仓库根目录加入 `PYTHONPATH`。顶层
 `evaluation/*/*.py` 是按文件路径执行的脚本，Python 默认只会把其子目录加入 `sys.path`；若
@@ -245,7 +252,8 @@ mid route 不重采样 caption。EMA teacher 在包含原图、目标/典型/最
 high GRPO + low CE + mid JSD，按候选比例归一化，再乘 caption_loss_weight=0.5
 全部 route 的 localization GRPO，再乘 localization_loss_weight=0.5
 clip grad norm -> one optimizer.step()
-optimizer.step 后原地执行 EMA shard 更新
+optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` 时，更新为恒等映射，teacher
+保持 worker 初始化时从初始 SAMTok actor 复制的参数。
 ```
 
 这保证单一模型被两个方向联合优化。
@@ -401,7 +409,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
-| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图 |
+| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理统一使用事实性、区域限定的 prompt 与 192-token 上限 |
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
 评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
@@ -420,7 +428,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 10. **测试覆盖有限。** 多数验证依赖 GPU、checkpoint 和数据集；小改动至少运行语法检查/导入检查，训练路径改动还应做最小单 batch smoke test。
 11. **OPSD dataclass 默认关闭，项目 YAML 显式开启。** 原始 SAMTok 消融设 `worker.opsd.enabled=false`；仅真实 IoU 的 CycleGRPO 设 `opsd.enabled=true`、`routing.enabled=false`、`ema_teacher.enabled=false`；完整版本保持主 YAML 默认。
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度；完整词表 JSD 以 response-token chunk 加 checkpoint 计算，`distillation.token_chunk_size` 只在 CUDA 峰值显存与 softmax 重算时间间取舍。其他 sequence-parallel 配置会在启动时显式报错。
-13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 EMA shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。
+13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 teacher shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。`decay=1.0` 时这个 shard 是启动时的 SAMTok teacher；不能用旧 EMA 实验的 checkpoint 启动新的固定-teacher 消融。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
 15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。入口固定使用短的真实本地 `/tmp/cgrpo-ray-<uid>` 目录，并在启动时检查临时盘利用率。
 16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
@@ -604,3 +612,24 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2 节 GroundingSuite 图像解析根目录说明。
 - 行为：除 JSONL 相对路径和外部 COCO `train2014` 外，解析器也检查 GroundingSuite 发布包的 `assets/`、`unlabeled2017/` 及其可能的 `train2014/` 子目录。此前服务器的 `GSEval` 根目录包含这两个资产目录，但 bare image ID 无法被解析器发现，fail-fast 修复因而使全部 shard 立即退出。
 - 验证：服务器 8 shard 日志确认修复无前缀 COCO 名称后仍在 `GSEval/assets`/`unlabeled2017` 之外查找，60 秒内全部退出且仅保留上一轮 9 条输出；本机执行 Python 语法检查和 `git diff --check`。本机没有发布数据、CUDA、Qwen3-VL/SAMTok 权重，未运行 8 卡推理。
+
+### 2026-07-28 - 修复 GroundingSuite metric 的预测输入类型
+
+- 代码：修改 `projects/eval/qwen3vl_4b_volcengine.sh`。
+- 文档：更新第 2.2 节 GroundingSuite 推理/metric 输出约定。
+- 行为：统一入口继续保留合并后的 `groundingsuite_pred.jsonl`，但向 `groundingsuite_metric.py --pred_folder` 传入逐样本 JSON 的 `groundingsuite/` 目录。该 metric 使用 `os.listdir()` 加载目录中的 JSON，不能直接读取合并 JSONL；此前推理完成后必然因 `NotADirectoryError` 退出。
+- 验证：服务器已完成 3715/3715 shard 输出并以合并 JSONL 作为 `--pred_folder` 复现 `NotADirectoryError`；本机执行 shell 语法检查和 `git diff --check`。本机没有 GroundingSuite 数据、CUDA 和模型，未运行 metric。
+
+### 2026-07-28 - 冻结初始 SAMTok teacher 的 RefCOCO 10k 受控消融
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、3.6、6 节的 teacher 更新语义、checkpoint 与验证边界。
+- 行为：入口默认 `TEACHER_EMA_DECAY=1.0`，EMA 更新系数因而为 0，teacher 保持 FSDP worker 启动时从 `MODEL_PATH` 复制的初始 SAMTok 权重。实验输出改为新的 frozen-teacher 目录且默认不恢复任何 checkpoint；仅显式 `RESUME=true` 才恢复同一冻结实验。仍每 5 step 保存 checkpoint，供释放 GPU 后用标准 RefCOCO 离线评测。可选 `MAX_STEPS=5,10,...` 让训练在每个 checkpoint 停止，以便评测完成后恢复；未启用通用 `trainer.val_freq`，因为它不计算 RefCOCO mask/cIoU。
+- 验证：执行 shell 语法检查、对 `decay=1.0` 的 FSDP EMA 公式进行静态核对、执行 `git diff --check`。本机没有服务器的 Ray、FSDP、CUDA、模型和 8 卡，未执行训练或 RefCOCO 评测。
+
+### 2026-07-28 - 修正 DLC 区域描述评测协议并限制生成长度
+
+- 代码：修改 `evaluation/dlc_bench/inference.py`。
+- 文档：更新第 2.2、5.6 节的 DLC 推理协议。
+- 行为：将原来语义错误的 `Given a detailed description ...` 改为与训练 caption 动词一致的 `Provide a detailed factual description ...`，并显式限制模型只描述 mask 指定区域的可见对象、属性和空间关系，禁止 reasoning、mask token、JSON 及区域外内容。zoom-in 分支明确第二张图是同一目标的放大视图。最大新 token 从 1024 降至 192，以阻断实测中接近长度上限的重复和虚构扩写。此修改只改变 DLC 推理协议，不改变训练；原始 SAMTok 与所有训练 checkpoint 必须在该协议下重新生成 prediction JSON 后才可横向比较。
+- 验证：执行该文件的 Python 语法检查和 `git diff --check`。本机没有 DLC 数据、Qwen3-VL/SAMTok 权重或 CUDA，未实际运行生成或 judge。

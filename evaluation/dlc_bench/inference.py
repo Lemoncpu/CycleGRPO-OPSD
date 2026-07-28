@@ -33,6 +33,12 @@ MT_END_TOKEN = '<|mt_end|>'
 MT_CONTEXT_TOKEN = '<|mt_{}|>'
 CODEBOOK_SIZE = 256
 CODEBOOK_DEPTH = 2
+DLC_CAPTION_MAX_NEW_TOKENS = 192
+REGION_DESCRIPTION_PROMPT = (
+    "Provide a detailed factual description of this region {SEG}. "
+    "Describe only the marked region using visible objects, attributes, and spatial relationships. "
+    "Do not output reasoning, mask tokens, JSON, or details outside the region."
+)
 
 
 class DirectResize:
@@ -320,7 +326,8 @@ def main():
                 remap_crop_quant_codes = [depth_idx * CODEBOOK_SIZE + quant_code for depth_idx, quant_code in enumerate(crop_quant_codes)]
                 zoom_in_mask_tokens_str = MT_START_TOKEN + ''.join([MT_CONTEXT_TOKEN.format(str(code).zfill(4)) for code in remap_crop_quant_codes]) + MT_END_TOKEN
 
-                question = "Given a detailed description of this region {SEG}. Zoom in with the perspective as ".format(SEG=global_mask_tokens_str)
+                question = REGION_DESCRIPTION_PROMPT.format(SEG=global_mask_tokens_str)
+                question += " The next image is a zoomed view of this same region."
                 
                 # Encode images to base64
                 buffer = io.BytesIO()
@@ -347,13 +354,16 @@ def main():
                                 "type": "image",
                                 "image": f"data:image/jpeg;base64,{crop_b64}",
                             },
-                            {"type": "text", "text": f", {zoom_in_mask_tokens_str}."},
+                            {
+                                "type": "text",
+                                "text": f"The same region in the zoomed view is {zoom_in_mask_tokens_str}.",
+                            },
                         ],
                     }
                 ]
             else:
                 # No zoom in case
-                question = "Given a detailed description of this region {SEG}.".format(SEG=global_mask_tokens_str)
+                question = REGION_DESCRIPTION_PROMPT.format(SEG=global_mask_tokens_str)
                 with open(img_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode()
 
@@ -383,7 +393,7 @@ def main():
             with torch.no_grad():
                 generated_ids = model.generate(
                     **inputs,
-                    max_new_tokens=1024,
+                    max_new_tokens=DLC_CAPTION_MAX_NEW_TOKENS,
                     do_sample=False,
                     top_p=1.0,
                 )

@@ -79,7 +79,7 @@ run_groundingsuite() {
     bash evaluation/groundingsuite/run_groundingsuite_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$EVAL_ROOT/groundingsuite"
     "$PYTHON_BIN" projects/vlm/tokenmask/evaluation/groundingsuite_metric.py \
         --image_dir "$GROUNDINGSUITE_ROOT" --gt_file "$dataset" \
-        --pred_folder "$EVAL_ROOT/groundingsuite_pred.jsonl" --mode mask --vis_samples 0 \
+        --pred_folder "$EVAL_ROOT/groundingsuite" --mode mask --vis_samples 0 \
         --output_file "$EVAL_ROOT/groundingsuite_metrics.json"
 }
 
