@@ -67,6 +67,16 @@ def caption_safety_reason(
     return None
 
 
+def uses_original_grpo(
+    route: str,
+    *,
+    caption_safe: bool,
+    preserve_original_grpo: bool = False,
+) -> bool:
+    """Whether a caption rollout contributes its native CycleGRPO policy loss."""
+    return bool(caption_safe) and (preserve_original_grpo or route == GRPO_ROUTE)
+
+
 def regenerate_weight(original_score: float, teacher_score: float, eps: float = 1e-6) -> float:
     improvement = float(teacher_score) - float(original_score)
     return float(np.clip(improvement / max(1.0 - float(original_score), eps), 0.0, 1.0))

@@ -25,6 +25,9 @@ MAX_STEPS="${MAX_STEPS:-}"
 # decay=1.0 makes the existing EMA update an identity, so teacher parameters
 # remain the SAMTok actor weights copied during worker initialization.
 TEACHER_EMA_DECAY="${TEACHER_EMA_DECAY:-1.0}"
+# B experiment: keep native CycleGRPO caption GRPO for every safe rollout;
+# regenerate CE and privileged JSD remain additive auxiliary gradients.
+PRESERVE_ORIGINAL_GRPO="${PRESERVE_ORIGINAL_GRPO:-true}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
 # continuing a checkpoint produced by this same frozen-teacher experiment.
@@ -53,6 +56,11 @@ fi
 
 if [[ "${RESUME}" != "true" && "${RESUME}" != "false" ]]; then
     echo "RESUME must be true or false: ${RESUME}" >&2
+    exit 1
+fi
+
+if [[ "${PRESERVE_ORIGINAL_GRPO}" != "true" && "${PRESERVE_ORIGINAL_GRPO}" != "false" ]]; then
+    echo "PRESERVE_ORIGINAL_GRPO must be true or false: ${PRESERVE_ORIGINAL_GRPO}" >&2
     exit 1
 fi
 
@@ -207,6 +215,7 @@ echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
+echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -253,6 +262,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.routing.enabled=true \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
+    worker.opsd.routing.preserve_original_grpo="${PRESERVE_ORIGINAL_GRPO}" \
     worker.opsd.caption_safety.enabled=true \
     worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
     worker.opsd.caption_safety.force_regenerate=true \

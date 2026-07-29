@@ -21,6 +21,7 @@ from .routing import (
     format_privileged_prompt,
     regenerate_weight,
     teacher_caption_is_safe,
+    uses_original_grpo,
 )
 
 
@@ -46,4 +47,5 @@ __all__ = [
     "parse_mask_codes",
     "regenerate_weight",
     "teacher_caption_is_safe",
+    "uses_original_grpo",
 ]

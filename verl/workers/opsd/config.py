@@ -25,6 +25,7 @@ class RoutingConfig:
     enabled: bool = True
     low_threshold: float = 0.5
     high_threshold: float = 0.85
+    preserve_original_grpo: bool = False
 
     def post_init(self):
         if not 0.0 <= self.low_threshold <= self.high_threshold <= 1.0:

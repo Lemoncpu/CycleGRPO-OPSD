@@ -26,7 +26,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 
 论文正文用 IoU 解释空间一致性；原始公开代码为降低高分辨率 mask 解码开销，采用 **Hierarchical Token Grading**。当前 OPSD 扩展已把图像 cycle source 改为训练时完整解码 SAMTok token 并计算真实像素 IoU；`worker.opsd.enabled=false` 时仍可回到原始 token-domain CycleGRPO。
 
-当前扩展在每条 caption 的 `K` 次真实 IoU 均值 `R_Ci` 上执行候选级三路由：`R_Ci<0.5` 进入 EMA teacher regenerate，`0.5<=R_Ci<=0.85` 进入 privileged on-policy distillation，`R_Ci>0.85` 保留 CycleGRPO caption GRPO。三路由只替换 caption 侧更新，所有 localization rollout 始终参与 CycleGRPO 更新。
+当前扩展在每条 caption 的 `K` 次真实 IoU 均值 `R_Ci` 上执行候选级三路由：`R_Ci<0.5` 进入 EMA teacher regenerate，`0.5<=R_Ci<=0.85` 进入 privileged on-policy distillation，`R_Ci>0.85` 保留 CycleGRPO caption GRPO。通用配置默认维持三路由替换 caption 更新；火山引擎 B 实验显式启用 `routing.preserve_original_grpo=true`，使所有安全 caption 都保留原始 CycleGRPO GRPO，再把 regenerate CE 或 privileged JSD 作为附加梯度。所有 localization rollout 始终参与 CycleGRPO 更新。
 
 ## 2. 论文结论与实现边界
 
@@ -51,6 +51,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | caption response 上限 | `256` token | 火山引擎入口的稳定化消融值；同时是 caption 安全门控的超长阈值 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
+| caption 原始 GRPO | B 入口默认保留 | 所有安全 rollout 都计算原始 CycleGRPO policy loss；low/mid 的 teacher 更新改为附加梯度 |
 | teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
@@ -69,6 +70,9 @@ worker 初始化时从 actor 复制的 SAMTok 参数之后不会更新；需要�
 该入口还默认设置 `CAPTION_MAX_RESPONSE_LENGTH=256`，并把同一值传给
 `worker.opsd.caption_safety.max_response_tokens`。这是针对 OPSD caption 任务漂移的稳定化消融，
 与论文历史的长 response 配置不同；可显式覆盖环境变量，但 rollout 上限和安全阈值必须保持一致。
+入口的 `PRESERVE_ORIGINAL_GRPO=true` 是 B 实验默认值：所有安全 caption 通过原始 CycleGRPO
+reward/advantage 计算 PPO/GRPO，low route 的 regenerate CE 和 mid route 的 JSD 不再替代它，而是
+在同一 optimizer step 前额外累积。设为 `false` 可复现之前的 route-replacement 消融。
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
 离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
@@ -169,7 +173,7 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 1. 从 dataloader 取 batch，为原始 prompt 分配 `uid`，用 `cap_*` 字段构造 `task=caption` 的 `DataProto`。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
-4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`，因此不会进入 caption 的 high-route GRPO 或 mid-route JSD；localization rollout/奖励仍保留。
+4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
 5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
@@ -245,7 +249,7 @@ localization:
 3. 计算组内均值和标准差，优势为 `(r_i - mean_group) / (std_group + eps)`。
 4. 将该标量乘 response mask，作为每个生成 token 的 advantage/return。
 
-`DataParallelPPOActor.update_policy` 重新计算 log probability，使用 clipped PPO/GRPO surrogate loss。caption 优势仍用同一 prompt 的全部 `G=6` 候选标准化，再由 `policy_loss_mask` 只对 high route 启用 caption PPO/KL；因此不会因 high 子集只有一条而失去组内基线。像素 IoU 的原始三路由之后，caption safety 会把 special-token、mask JSON 或超长 rollout 强制改为 low regenerate，故这些样本不会作为 PPO/JSD 的 student trajectory；若 teacher 生成安全且经 greedy reconstruction 验证的候选，仍可提供 regenerate CE。该门控不改变 segmentation batch，全部 localization rollout 继续参与其 GRPO 更新。主日志记录 `opsd/caption_safe_rate`、三种 unsafe rate 和 `opsd/caption_forced_regenerate_count`；reward 指标也拆分为 `cap_no_bbox_no_chinese_score` 与 `cap_no_special_token_or_json_score`，不再用错误的 `cap_no_mask_token_check_score` 名称代表 bbox/CJK gate。
+`DataParallelPPOActor.update_policy` 重新计算 log probability，使用 clipped PPO/GRPO surrogate loss。caption 优势仍用同一 prompt 的全部 `G=6` 候选标准化。默认 route-replacement 消融由 `policy_loss_mask` 只对 high route 启用 caption PPO/KL；因此不会因 high 子集只有一条而失去组内基线。B 实验设置 `routing.preserve_original_grpo=true` 后，`policy_loss_mask` 改为所有 `caption_safe` rollout：safe high 只保留原始 GRPO，safe low 在它之上增加可接受的 regenerate CE，safe mid 在它之上增加 JSD。像素 IoU 的原始三路由之后，caption safety 会把 special-token、mask JSON 或超长 rollout 强制改为 low regenerate；它们不作为原始 GRPO/JSD 的 student trajectory，但若 teacher 生成安全且经 greedy reconstruction 验证的候选，仍可提供 regenerate CE。该门控不改变 segmentation batch，全部 localization rollout 继续参与其 GRPO 更新。主日志记录 `opsd/caption_safe_rate`、三种 unsafe rate、`opsd/caption_forced_regenerate_count` 以及 B 的 `opsd/caption_original_grpo_active_{count,rate}`；reward 指标也拆分为 `cap_no_bbox_no_chinese_score` 与 `cap_no_special_token_or_json_score`，不再用错误的 `cap_no_mask_token_check_score` 名称代表 bbox/CJK gate。
 
 low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，过滤所有特殊 token/诊断泄漏，以当前 actor 做一次 greedy 重建，选每个低分轨迹的最佳改进 caption；相对原 `R_Ci` 提升至少 `0.05` 才采用，同 prompt 去重后最多两个 target。student 始终在原始 prompt 上做加权 CE，权重为 `(R_teacher-R_Ci)/(1-R_Ci+eps)`。
 
@@ -256,7 +260,9 @@ mid route 不重采样 caption。EMA teacher 在包含原图、目标/典型/最
 当 captioner 和 segmenter 都启用时，trainer 不分别 optimizer step，而是：
 
 ```text
-high GRPO + low CE + mid JSD，按候选比例归一化，再乘 caption_loss_weight=0.5
+route-replacement: high GRPO + low CE + mid JSD
+B: safe 全部原始 GRPO + low CE + mid JSD
+辅助 CE/JSD 均按候选比例归一化，caption 侧再乘 caption_loss_weight=0.5
 全部 route 的 localization GRPO，再乘 localization_loss_weight=0.5
 clip grad norm -> one optimizer.step()
 optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` 时，更新为恒等映射，teacher
@@ -325,7 +331,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate 与 distillation 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重和 distillation metrics |
 | `workers/opsd/mask_iou.py` | 严格 token 解析、原始 GT 转换、批量 mask 解码、尺寸恢复和像素 IoU |
-| `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、privileged context、route 权重与泄漏过滤 |
+| `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、privileged context、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
 | `single_controller/` | Ray worker、worker group、注册装饰器、资源/dispatch 管理 |
@@ -441,7 +447,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
 17. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
 18. **FSDP checkpoint 不是可直接评测的 HF 模型。** `actor/huggingface/` 仅保存 config/generation config/processor；必须使用与保存 world size 相同的 export-only FSDP worker 恢复 shard 后导出。不要把原 cold-start `MODEL_PATH` 当作训练后模型传给评测脚本。
-19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对 high GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
+19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对原始 GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
+20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -465,6 +472,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-07-29 - B 实验保留安全 caption 的原始 CycleGRPO
+
+- 代码：修改 `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`verl/trainer/ray_trainer.py`、`verl/workers/opsd/{__init__,config,routing}.py` 与 `tests/test_opsd_core.py`。
+- 文档：更新第 1、2.2、3.3、3.6、5.2、6 节。
+- 行为：新增 `routing.preserve_original_grpo`。通用 YAML 保持 `false` 以兼容 route-replacement；火山引擎入口默认以 `PRESERVE_ORIGINAL_GRPO=true` 开启 B 模式，使全部安全 caption 保留原始 CycleGRPO GRPO，low regenerate CE 与 mid JSD 在同一次 actor optimizer step 中附加累积。不安全 caption 继续被 A 层门控排除。新增原始 GRPO 激活数/比例指标。
+- 验证：执行 `python3 -m py_compile verl/workers/opsd/config.py verl/workers/opsd/routing.py verl/workers/opsd/__init__.py verl/trainer/ray_trainer.py tests/test_opsd_core.py`、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`。本机缺少 `torch`，`python3 -m unittest tests.test_opsd_core` 不能导入；服务器须运行该单测和 10-step smoke training。
 
 ### 2026-07-29 - 增加 OPSD caption 安全路由第一层稳定化
 

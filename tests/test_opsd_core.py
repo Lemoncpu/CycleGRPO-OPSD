@@ -22,6 +22,7 @@ from verl.workers.opsd.routing import (
     format_privileged_prompt,
     regenerate_weight,
     teacher_caption_is_safe,
+    uses_original_grpo,
 )
 
 
@@ -145,6 +146,43 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(
             caption_safety_reason("A red cup.", response_tokens=257, max_response_tokens=256),
             "overlength",
+        )
+
+    def test_b_mode_preserves_original_grpo_only_for_safe_captions(self):
+        self.assertTrue(
+            uses_original_grpo(
+                REGENERATE_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertTrue(
+            uses_original_grpo(
+                ON_POLICY_DISTILL_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertFalse(
+            uses_original_grpo(
+                REGENERATE_ROUTE,
+                caption_safe=False,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertFalse(
+            uses_original_grpo(
+                ON_POLICY_DISTILL_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=False,
+            )
+        )
+        self.assertTrue(
+            uses_original_grpo(
+                GRPO_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=False,
+            )
         )
 
     def test_chunked_jsd_matches_dense_loss_and_gradient(self):

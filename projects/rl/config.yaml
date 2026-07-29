@@ -51,6 +51,9 @@ worker:
       enabled: true
       low_threshold: 0.5
       high_threshold: 0.85
+      # The Volcengine B experiment overrides this to true. Keep generic YAML
+      # compatible with the original route-replacement ablation by default.
+      preserve_original_grpo: false
     caption_safety:
       enabled: true
       max_response_tokens: 256

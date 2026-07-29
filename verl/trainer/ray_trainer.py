@@ -52,6 +52,7 @@ from ..workers.opsd import (
     format_privileged_prompt,
     regenerate_weight,
     teacher_caption_is_safe,
+    uses_original_grpo,
 )
 from .config import PPOConfig
 from .core_algos import (
@@ -1395,6 +1396,17 @@ class RayPPOTrainer:
                             forced_regenerate = np.asarray(
                                 cycle_cap_batch.non_tensor_batch["caption_forced_regenerate"], dtype=bool
                             )
+                            base_grpo_active = np.asarray(
+                                [
+                                    uses_original_grpo(
+                                        route,
+                                        caption_safe=caption_safe,
+                                        preserve_original_grpo=self.config.worker.opsd.routing.preserve_original_grpo,
+                                    )
+                                    for route, caption_safe in zip(route_values, caption_safe_values)
+                                ],
+                                dtype=bool,
+                            )
                             metrics.update(
                                 {
                                     "opsd/caption_safe_rate": float(np.mean(caption_safe_values)),
@@ -1406,6 +1418,8 @@ class RayPPOTrainer:
                                     "opsd/caption_overlength_rate": caption_safety_reasons.count("overlength")
                                     / max(len(caption_safety_reasons), 1),
                                     "opsd/caption_forced_regenerate_count": int(np.sum(forced_regenerate)),
+                                    "opsd/caption_original_grpo_active_count": int(np.sum(base_grpo_active)),
+                                    "opsd/caption_original_grpo_active_rate": float(np.mean(base_grpo_active)),
                                 }
                             )
                             pixel_values = cycle_seg_batch.non_tensor_batch["pixel_iou"].astype(float)
@@ -1483,7 +1497,17 @@ class RayPPOTrainer:
                         )
                         if "route" in cycle_cap_batch.non_tensor_batch:
                             cycle_cap_batch.batch["policy_loss_mask"] = torch.tensor(
-                                [route == "grpo" for route in cycle_cap_batch.non_tensor_batch["route"]],
+                                [
+                                    uses_original_grpo(
+                                        route,
+                                        caption_safe=caption_safe,
+                                        preserve_original_grpo=self.config.worker.opsd.routing.preserve_original_grpo,
+                                    )
+                                    for route, caption_safe in zip(
+                                        cycle_cap_batch.non_tensor_batch["route"],
+                                        cycle_cap_batch.non_tensor_batch["caption_safe"],
+                                    )
+                                ],
                                 dtype=cycle_cap_batch.batch["response_mask"].dtype,
                             )
 
