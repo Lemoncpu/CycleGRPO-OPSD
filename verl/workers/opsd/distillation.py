@@ -3,10 +3,42 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+import re
+from typing import Dict, Mapping, Optional, Tuple
 
 import torch
 from torch.utils.checkpoint import checkpoint
+
+
+_CAPTION_BLOCKED_SPECIAL_TOKEN = re.compile(
+    r"^<\|(?:mt_(?:start|end|\d+)|object_ref(?:_[^|]+)?)\|>$"
+)
+
+
+def caption_blocked_special_token_ids(vocab: Mapping[str, int]) -> list[int]:
+    """Return SAMTok mask and object-reference token ids that captions cannot use."""
+    return sorted(
+        {
+            int(token_id)
+            for token, token_id in vocab.items()
+            if _CAPTION_BLOCKED_SPECIAL_TOKEN.fullmatch(str(token))
+        }
+    )
+
+
+def _masked_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    blocked_token_ids: Optional[torch.Tensor],
+) -> torch.Tensor:
+    scaled_logits = logits.float() / temperature
+    if blocked_token_ids is not None and blocked_token_ids.numel() > 0:
+        valid_ids = blocked_token_ids[
+            (blocked_token_ids >= 0) & (blocked_token_ids < scaled_logits.size(-1))
+        ]
+        if valid_ids.numel() > 0:
+            scaled_logits = scaled_logits.index_fill(-1, valid_ids, -torch.inf)
+    return torch.log_softmax(scaled_logits, dim=-1)
 
 
 def _validate_inputs(
@@ -43,6 +75,7 @@ def chunked_weighted_jsd_loss(
     temperature: float,
     entropy_weight_beta: float,
     token_chunk_size: int,
+    blocked_token_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Return the original weighted generalized-JSD without full-response fp32 tensors.
 
@@ -79,8 +112,8 @@ def chunked_weighted_jsd_loss(
     with torch.no_grad():
         for start in range(0, response_length, token_chunk_size):
             end = min(start + token_chunk_size, response_length)
-            teacher_log_probs = torch.log_softmax(
-                teacher_logits[:, start:end, :].float() / temperature, dim=-1
+            teacher_log_probs = _masked_log_softmax(
+                teacher_logits[:, start:end, :], temperature, blocked_token_ids
             )
             teacher_entropy[:, start:end] = -(
                 teacher_log_probs.exp() * teacher_log_probs
@@ -111,8 +144,8 @@ def chunked_weighted_jsd_loss(
             teacher_chunk: torch.Tensor = teacher_chunk,
             weight_chunk: torch.Tensor = weight_chunk,
         ) -> torch.Tensor:
-            student_log_probs = torch.log_softmax(student_chunk.float() / temperature, dim=-1)
-            teacher_log_probs = torch.log_softmax(teacher_chunk.float() / temperature, dim=-1)
+            student_log_probs = _masked_log_softmax(student_chunk, temperature, blocked_token_ids)
+            teacher_log_probs = _masked_log_softmax(teacher_chunk, temperature, blocked_token_ids)
             mixture_log_probs = torch.logaddexp(
                 student_log_probs + log_student_weight,
                 teacher_log_probs + log_teacher_weight,
@@ -137,5 +170,10 @@ def chunked_weighted_jsd_loss(
         "local_loss": loss_numerator.detach() / valid_tokens,
         "teacher_entropy": (teacher_entropy * token_mask).sum() / valid_tokens,
         "teacher_sequence_score": (teacher_target_log_probs * token_mask).sum() / valid_tokens,
+        "blocked_vocab_size": torch.tensor(
+            0 if blocked_token_ids is None else blocked_token_ids.numel(),
+            device=student_logits.device,
+            dtype=torch.float32,
+        ),
     }
     return loss_numerator, metrics

@@ -90,6 +90,7 @@ from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
 from .opsd import (
     build_privileged_context,
+    caption_blocked_special_token_ids,
     chunked_weighted_jsd_loss,
     coerce_raw_mask,
     compute_binary_iou,
@@ -450,6 +451,7 @@ class FSDPWorker(Worker):
         self.config = config
         self.role = role
         self._cache = {}
+        self._caption_distillation_blocked_token_ids: Optional[torch.Tensor] = None
 
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
@@ -805,6 +807,23 @@ class FSDPWorker(Worker):
         state = torch.load(reward_config.mask_tokenizer_path, map_location="cpu")
         self.vq_sam2.load_state_dict(state)
         self.sam2_image_processor = DirectResize(1024)
+
+    def _get_caption_distillation_blocked_token_ids(self) -> Optional[torch.Tensor]:
+        """Cache caption-forbidden SAMTok/object-reference ids on the local GPU."""
+        if not self.config.opsd.distillation.block_caption_special_token_vocab:
+            return None
+        if self._caption_distillation_blocked_token_ids is None:
+            token_ids = caption_blocked_special_token_ids(self.tokenizer.get_vocab())
+            self._caption_distillation_blocked_token_ids = torch.tensor(
+                token_ids,
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
+            self.print_rank0(
+                "OPSD JSD blocks "
+                f"{len(token_ids)} SAMTok/object-reference caption vocabulary tokens."
+            )
+        return self._caption_distillation_blocked_token_ids
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1714,6 +1733,7 @@ class FSDPWorker(Worker):
         self.fsdp_module.train()
         self.teacher_fsdp_module.eval()
         config = self.config.opsd.distillation
+        blocked_token_ids = self._get_caption_distillation_blocked_token_ids()
         micro_batches = data.split(self.config.actor.micro_batch_size_per_device_for_update)
         total_response_tokens = torch.sum(data.batch["response_mask"])
         dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
@@ -1768,6 +1788,7 @@ class FSDPWorker(Worker):
                 temperature=config.temperature,
                 entropy_weight_beta=config.entropy_weight_beta,
                 token_chunk_size=config.token_chunk_size,
+                blocked_token_ids=blocked_token_ids,
             )
             scaled_loss = (
                 loss_numerator
@@ -1783,6 +1804,9 @@ class FSDPWorker(Worker):
             )
             metric_values["opsd/teacher_sequence_score"].append(
                 float(distillation_metrics["teacher_sequence_score"])
+            )
+            metric_values["opsd/distill_blocked_vocab_size"].append(
+                float(distillation_metrics["blocked_vocab_size"])
             )
             # Release full-vocabulary outputs before preparing the next micro-batch.
             del scaled_loss, loss_numerator, student_logits, teacher_logits

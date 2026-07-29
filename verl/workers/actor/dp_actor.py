@@ -232,6 +232,8 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         if "policy_loss_mask" in data.batch:
             select_keys.append("policy_loss_mask")
+        if "caption_anchor_kl_mask" in data.batch:
+            select_keys.append("caption_anchor_kl_mask")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -260,9 +262,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    base_response_mask = model_inputs["response_mask"]
+                    response_mask = base_response_mask
                     if "policy_loss_mask" in model_inputs:
                         response_mask = response_mask * model_inputs["policy_loss_mask"].unsqueeze(-1)
+                    anchor_kl_mask = None
+                    if (
+                        self.config.caption_anchor_kl_coef > 0
+                        and self.config.caption_anchor_kl_all_safe_routes
+                        and "caption_anchor_kl_mask" in model_inputs
+                    ):
+                        anchor_kl_mask = base_response_mask * model_inputs[
+                            "caption_anchor_kl_mask"
+                        ].unsqueeze(-1)
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -280,22 +292,41 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_type=self.config.loss_type,
                         loss_avg_mode=self.config.loss_avg_mode,
                     )
+                    policy_token_count = torch.sum(response_mask)
+                    loss_numerator = pg_loss * policy_token_count
+                    kld = None
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]
-                        # compute kl loss
                         kld = compute_kl(
                             log_probs=log_probs,
                             ref_log_probs=ref_log_probs,
                             kl_penalty=self.config.kl_penalty,
                         )
                         kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
-                        loss = pg_loss + kl_loss * self.config.kl_coef
+                        loss_numerator = loss_numerator + kl_loss * self.config.kl_coef * policy_token_count
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_coef
-                    else:
-                        loss = pg_loss
+                    if anchor_kl_mask is not None and "ref_log_probs" in model_inputs:
+                        if kld is None:
+                            ref_log_probs = model_inputs["ref_log_probs"]
+                            kld = compute_kl(
+                                log_probs=log_probs,
+                                ref_log_probs=ref_log_probs,
+                                kl_penalty=self.config.kl_penalty,
+                            )
+                        anchor_kl_loss = average_loss(
+                            kld,
+                            anchor_kl_mask,
+                            mode=self.config.loss_avg_mode,
+                        )
+                        anchor_kl_token_count = torch.sum(anchor_kl_mask)
+                        loss_numerator = loss_numerator + (
+                            anchor_kl_loss * self.config.caption_anchor_kl_coef * anchor_kl_token_count
+                        )
+                        metrics["actor/caption_anchor_kl_loss"] = anchor_kl_loss.detach().item()
+                        metrics["actor/caption_anchor_kl_coef"] = self.config.caption_anchor_kl_coef
 
-                    loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                    loss = loss_numerator * self.world_size / total_response_tokens
                     # Apply gradient weight for accumulation
                     loss = loss * grad_weight
                     loss.backward()

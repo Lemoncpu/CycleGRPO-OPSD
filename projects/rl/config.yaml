@@ -41,6 +41,8 @@ worker:
     localization_rollouts: 6
     caption_loss_weight: 0.5
     localization_loss_weight: 0.5
+    caption_anchor_kl_coef: 0.0
+    caption_anchor_kl_all_safe_routes: false
     pixel_iou:
       enabled: true
       decode_batch_size: 64
@@ -81,6 +83,7 @@ worker:
       entropy_weight_beta: 1.0
       min_sample_weight: 0.1
       token_chunk_size: 256
+      block_caption_special_token_vocab: true
     teacher_analysis:
       enabled: true
       max_samples_per_step: 2

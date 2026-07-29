@@ -183,6 +183,10 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        self.worker.actor.caption_anchor_kl_coef = self.worker.opsd.caption_anchor_kl_coef
+        self.worker.actor.caption_anchor_kl_all_safe_routes = (
+            self.worker.opsd.caption_anchor_kl_all_safe_routes
+        )
 
     def deep_post_init(self):
         recursive_post_init(self)

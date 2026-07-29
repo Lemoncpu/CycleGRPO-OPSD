@@ -28,6 +28,11 @@ TEACHER_EMA_DECAY="${TEACHER_EMA_DECAY:-1.0}"
 # B experiment: keep native CycleGRPO caption GRPO for every safe rollout;
 # regenerate CE and privileged JSD remain additive auxiliary gradients.
 PRESERVE_ORIGINAL_GRPO="${PRESERVE_ORIGINAL_GRPO:-true}"
+# C experiment: keep segmentation-only vocabulary out of privileged caption
+# JSD and anchor every safe caption to the frozen SAMTok reference.
+CAPTION_ANCHOR_KL_COEF="${CAPTION_ANCHOR_KL_COEF:-0.05}"
+CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES:-true}"
+JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
 # continuing a checkpoint produced by this same frozen-teacher experiment.
@@ -61,6 +66,24 @@ fi
 
 if [[ "${PRESERVE_ORIGINAL_GRPO}" != "true" && "${PRESERVE_ORIGINAL_GRPO}" != "false" ]]; then
     echo "PRESERVE_ORIGINAL_GRPO must be true or false: ${PRESERVE_ORIGINAL_GRPO}" >&2
+    exit 1
+fi
+
+if [[ ! "${CAPTION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
+    || ! awk -v value="${CAPTION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
+    echo "CAPTION_ANCHOR_KL_COEF must be a non-negative number: ${CAPTION_ANCHOR_KL_COEF}" >&2
+    exit 1
+fi
+
+if [[ "${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" != "true" \
+    && "${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" != "false" ]]; then
+    echo "CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES must be true or false: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" >&2
+    exit 1
+fi
+
+if [[ "${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" != "true" \
+    && "${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" != "false" ]]; then
+    echo "JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB must be true or false: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" >&2
     exit 1
 fi
 
@@ -216,6 +239,8 @@ echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
+echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
+echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -258,6 +283,8 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
     worker.opsd.caption_loss_weight=0.5 \
     worker.opsd.localization_loss_weight=0.5 \
+    worker.opsd.caption_anchor_kl_coef="${CAPTION_ANCHOR_KL_COEF}" \
+    worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
     worker.opsd.pixel_iou.enabled=true \
     worker.opsd.routing.enabled=true \
     worker.opsd.routing.low_threshold=0.5 \
@@ -266,6 +293,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.caption_safety.enabled=true \
     worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
     worker.opsd.caption_safety.force_regenerate=true \
+    worker.opsd.distillation.block_caption_special_token_vocab="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" \
     worker.opsd.ema_teacher.enabled=true \
     worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
     worker.opsd.teacher_analysis.enabled=true \

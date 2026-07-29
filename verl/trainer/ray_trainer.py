@@ -1510,6 +1510,24 @@ class RayPPOTrainer:
                                 ],
                                 dtype=cycle_cap_batch.batch["response_mask"].dtype,
                             )
+                        if (
+                            self.config.worker.opsd.caption_anchor_kl_coef > 0
+                            and self.config.worker.opsd.caption_anchor_kl_all_safe_routes
+                            and self.use_reference_policy
+                        ):
+                            anchor_kl_values = np.asarray(
+                                cycle_cap_batch.non_tensor_batch["caption_safe"], dtype=bool
+                            )
+                            cycle_cap_batch.batch["caption_anchor_kl_mask"] = torch.tensor(
+                                anchor_kl_values,
+                                dtype=cycle_cap_batch.batch["response_mask"].dtype,
+                            )
+                            metrics["opsd/caption_anchor_kl_active_count"] = int(
+                                np.sum(anchor_kl_values)
+                            )
+                            metrics["opsd/caption_anchor_kl_active_rate"] = float(
+                                np.mean(anchor_kl_values)
+                            )
 
                     # update critic
                     if self.use_critic:
@@ -1594,6 +1612,12 @@ class RayPPOTrainer:
                 if non_cycle_batch is not None and cycle_cap_batch is not None:
                     if "policy_loss_mask" in cycle_cap_batch.batch:
                         non_cycle_batch.batch["policy_loss_mask"] = torch.ones(
+                            len(non_cycle_batch), dtype=non_cycle_batch.batch["response_mask"].dtype
+                        )
+                    if "caption_anchor_kl_mask" in cycle_cap_batch.batch:
+                        # The OPSD anchor is caption-cycle specific. Non-cycle tasks
+                        # retain their normal algorithm KL but receive no extra anchor.
+                        non_cycle_batch.batch["caption_anchor_kl_mask"] = torch.zeros(
                             len(non_cycle_batch), dtype=non_cycle_batch.batch["response_mask"].dtype
                         )
                     # Remove iou_scores and correct_mask from batch before concat

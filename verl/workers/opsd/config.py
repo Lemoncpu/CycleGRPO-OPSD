@@ -85,6 +85,7 @@ class DistillationConfig:
     entropy_weight_beta: float = 1.0
     min_sample_weight: float = 0.1
     token_chunk_size: int = 256
+    block_caption_special_token_vocab: bool = True
 
     def post_init(self):
         if not 0.0 < self.beta < 1.0:
@@ -119,6 +120,8 @@ class OPSDConfig:
     localization_rollouts: int = 6
     caption_loss_weight: float = 0.5
     localization_loss_weight: float = 0.5
+    caption_anchor_kl_coef: float = 0.0
+    caption_anchor_kl_all_safe_routes: bool = False
     pixel_iou: PixelIoUConfig = field(default_factory=PixelIoUConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     caption_safety: CaptionSafetyConfig = field(default_factory=CaptionSafetyConfig)
@@ -134,6 +137,8 @@ class OPSDConfig:
             raise ValueError("OPSD task loss weights must be non-negative.")
         if self.caption_loss_weight + self.localization_loss_weight <= 0:
             raise ValueError("At least one OPSD task loss weight must be positive.")
+        if self.caption_anchor_kl_coef < 0:
+            raise ValueError("caption_anchor_kl_coef must be non-negative.")
         if self.enabled and self.routing.enabled and not self.pixel_iou.enabled:
             raise ValueError("OPSD three-route training requires pixel_iou.enabled=true.")
         if self.enabled and self.routing.enabled and not self.ema_teacher.enabled:

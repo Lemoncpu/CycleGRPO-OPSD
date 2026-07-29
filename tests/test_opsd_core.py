@@ -3,7 +3,10 @@ import unittest
 import torch
 from PIL import Image
 
-from verl.workers.opsd.distillation import chunked_weighted_jsd_loss
+from verl.workers.opsd.distillation import (
+    caption_blocked_special_token_ids,
+    chunked_weighted_jsd_loss,
+)
 from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
@@ -184,6 +187,52 @@ class OPSDCoreTest(unittest.TestCase):
                 preserve_original_grpo=False,
             )
         )
+
+    def test_caption_distillation_blocks_mask_and_object_reference_vocabulary(self):
+        vocab = {
+            "ordinary": 0,
+            "<|mt_start|>": 1,
+            "<|mt_0007|>": 2,
+            "<|mt_end|>": 3,
+            "<|object_ref_start|>": 4,
+            "<|object_ref_end|>": 5,
+            "<|im_end|>": 6,
+        }
+        self.assertEqual(caption_blocked_special_token_ids(vocab), [1, 2, 3, 4, 5])
+
+        torch.manual_seed(11)
+        student_logits = torch.randn(1, 2, 7, requires_grad=True)
+        teacher_logits = torch.randn(1, 2, 7)
+        blocked_ids = torch.tensor([5, 6])
+        common_kwargs = {
+            "target_ids": torch.tensor([[0, 1]]),
+            "response_mask": torch.ones(1, 2),
+            "sample_weight": torch.ones(1),
+            "beta": 0.5,
+            "temperature": 1.0,
+            "entropy_weight_beta": 1.0,
+            "token_chunk_size": 1,
+            "blocked_token_ids": blocked_ids,
+        }
+        baseline_loss, baseline_metrics = chunked_weighted_jsd_loss(
+            student_logits,
+            teacher_logits,
+            **common_kwargs,
+        )
+        baseline_loss.backward()
+        self.assertTrue(torch.equal(student_logits.grad[..., blocked_ids], torch.zeros_like(student_logits.grad[..., blocked_ids])))
+        self.assertEqual(baseline_metrics["blocked_vocab_size"].item(), 2.0)
+
+        changed_student = student_logits.detach().clone().requires_grad_(True)
+        changed_teacher = teacher_logits.detach().clone()
+        changed_student.data[..., blocked_ids] = 1e4
+        changed_teacher[..., blocked_ids] = -1e4
+        changed_loss, _ = chunked_weighted_jsd_loss(
+            changed_student,
+            changed_teacher,
+            **common_kwargs,
+        )
+        self.assertTrue(torch.allclose(changed_loss, baseline_loss.detach(), atol=1e-6, rtol=1e-6))
 
     def test_chunked_jsd_matches_dense_loss_and_gradient(self):
         torch.manual_seed(7)

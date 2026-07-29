@@ -1,5 +1,5 @@
 from .config import CaptionSafetyConfig, OPSDConfig
-from .distillation import chunked_weighted_jsd_loss
+from .distillation import caption_blocked_special_token_ids, chunked_weighted_jsd_loss
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
     coerce_raw_mask,
@@ -34,6 +34,7 @@ __all__ = [
     "REGENERATE_ROUTE",
     "aggregate_caption_rollouts",
     "build_privileged_context",
+    "caption_blocked_special_token_ids",
     "caption_safety_reason",
     "chunked_weighted_jsd_loss",
     "classify_route",
