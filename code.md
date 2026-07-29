@@ -91,7 +91,9 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 `unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
 `COCO_train2014_000000123456.jpg` 名称；无法
 解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
-单独配置可用凭据。DLC caption inference 对全局图和可选 zoom-in 图使用同一事实性区域描述协议：只描述 mask 指定的区域，禁止推理、mask token、JSON 和区域外细节；生成上限固定为 192 token。此协议是评测条件的一部分，比较任何 checkpoint 前都必须以同一版本重新推理。
+单独配置可用凭据。DLC caption inference 对全局图和可选 zoom-in 图使用与训练相同的正向 caption 指令
+`Provide a detailed factual description of this region {SEG}.`；评测 prompt 不出现 `mask`、`token`、`JSON` 或
+`reasoning` 等 segmentation 格式词，以免 SAMTok 将描述请求误解为定位请求。生成上限固定为 192 token。此协议是评测条件的一部分，比较任何 checkpoint 前都必须以同一版本重新推理。
 
 该入口以项目 Conda 的明确解释器运行，并将仓库根目录加入 `PYTHONPATH`。顶层
 `evaluation/*/*.py` 是按文件路径执行的脚本，Python 默认只会把其子目录加入 `sys.path`；若
@@ -409,7 +411,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
-| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理统一使用事实性、区域限定的 prompt 与 192-token 上限 |
+| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt 与 192-token 上限 |
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
 评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
@@ -632,4 +634,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 代码：修改 `evaluation/dlc_bench/inference.py`。
 - 文档：更新第 2.2、5.6 节的 DLC 推理协议。
 - 行为：将原来语义错误的 `Given a detailed description ...` 改为与训练 caption 动词一致的 `Provide a detailed factual description ...`，并显式限制模型只描述 mask 指定区域的可见对象、属性和空间关系，禁止 reasoning、mask token、JSON 及区域外内容。zoom-in 分支明确第二张图是同一目标的放大视图。最大新 token 从 1024 降至 192，以阻断实测中接近长度上限的重复和虚构扩写。此修改只改变 DLC 推理协议，不改变训练；原始 SAMTok 与所有训练 checkpoint 必须在该协议下重新生成 prediction JSON 后才可横向比较。
+- 验证：执行该文件的 Python 语法检查和 `git diff --check`。本机没有 DLC 数据、Qwen3-VL/SAMTok 权重或 CUDA，未实际运行生成或 judge。
+
+### 2026-07-29 - 移除 DLC prompt 中的 segmentation 格式触发词
+
+- 代码：修改 `evaluation/dlc_bench/inference.py`。
+- 文档：更新第 2.2、5.6 节的 DLC 推理协议。
+- 行为：DLC 的正向 caption 指令保留 `Provide a detailed factual description of this region {SEG}.`，移除此前加入的 `mask tokens`、`JSON` 和 `reasoning` 等负向格式词。实际推理中，96/100 个样本将这些词解释为输出格式提示，主动生成 `mask_2d` JSON 而非自然语言描述。zoom-in 图仍被声明为同一 region 的放大视图，192-token 上限保持不变。此前产生的 DLC prediction JSON 无效，必须重新生成。
 - 验证：执行该文件的 Python 语法检查和 `git diff --check`。本机没有 DLC 数据、Qwen3-VL/SAMTok 权重或 CUDA，未实际运行生成或 judge。

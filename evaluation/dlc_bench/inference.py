@@ -35,9 +35,7 @@ CODEBOOK_SIZE = 256
 CODEBOOK_DEPTH = 2
 DLC_CAPTION_MAX_NEW_TOKENS = 192
 REGION_DESCRIPTION_PROMPT = (
-    "Provide a detailed factual description of this region {SEG}. "
-    "Describe only the marked region using visible objects, attributes, and spatial relationships. "
-    "Do not output reasoning, mask tokens, JSON, or details outside the region."
+    "Provide a detailed factual description of this region {SEG}."
 )
 
 
