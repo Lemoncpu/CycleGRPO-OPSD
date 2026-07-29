@@ -48,6 +48,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 |---|---:|---|
 | 模型 | `<PATH_TO_COLD_START_CKPT>` | 必须替换为 co-SFT/SAMTok checkpoint |
 | 外层 rollout `G` | `worker.rollout.n=6` | 与论文及 OPSD 默认一致 |
+| caption response 上限 | `256` token | 火山引擎入口的稳定化消融值；同时是 caption 安全门控的超长阈值 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
 | teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
@@ -65,6 +66,9 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。当前默认输出根为
 `logs/refcoco10k_opsd_frozen_teacher`，并设置 `worker.opsd.ema_teacher.decay=1.0`，所以 FSDP
 worker 初始化时从 actor 复制的 SAMTok 参数之后不会更新；需要继续同一冻结实验时才显式设 `RESUME=true`。
+该入口还默认设置 `CAPTION_MAX_RESPONSE_LENGTH=256`，并把同一值传给
+`worker.opsd.caption_safety.max_response_tokens`。这是针对 OPSD caption 任务漂移的稳定化消融，
+与论文历史的长 response 配置不同；可显式覆盖环境变量，但 rollout 上限和安全阈值必须保持一致。
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
 离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
@@ -165,8 +169,9 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 1. 从 dataloader 取 batch，为原始 prompt 分配 `uid`，用 `cap_*` 字段构造 `task=caption` 的 `DataProto`。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
-4. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
-5. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
+4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`，因此不会进入 caption 的 high-route GRPO 或 mid-route JSD；localization rollout/奖励仍保留。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
+6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
 
@@ -210,7 +215,7 @@ m_i   = mean_k(s_i,k)
 
 caption:
   R_cap_i = (non_repeat_i + 10*m_i) * valid_i + valid_i
-  valid_i 检查 caption 中没有 bbox、没有中文；违规时正奖励被门控清零。
+  valid_i 同时检查没有 bbox/中文，且没有非终止 special token 或 mask_2d JSON；违规时正奖励被门控清零。
 
 localization:
   R_loc_i,k = 10 * (s_i,k * m_i) + non_repeat_i,k + mask_format_i,k
@@ -240,7 +245,7 @@ localization:
 3. 计算组内均值和标准差，优势为 `(r_i - mean_group) / (std_group + eps)`。
 4. 将该标量乘 response mask，作为每个生成 token 的 advantage/return。
 
-`DataParallelPPOActor.update_policy` 重新计算 log probability，使用 clipped PPO/GRPO surrogate loss。caption 优势仍用同一 prompt 的全部 `G=6` 候选标准化，再由 `policy_loss_mask` 只对 high route 启用 caption PPO/KL；因此不会因 high 子集只有一条而失去组内基线。
+`DataParallelPPOActor.update_policy` 重新计算 log probability，使用 clipped PPO/GRPO surrogate loss。caption 优势仍用同一 prompt 的全部 `G=6` 候选标准化，再由 `policy_loss_mask` 只对 high route 启用 caption PPO/KL；因此不会因 high 子集只有一条而失去组内基线。像素 IoU 的原始三路由之后，caption safety 会把 special-token、mask JSON 或超长 rollout 强制改为 low regenerate，故这些样本不会作为 PPO/JSD 的 student trajectory；若 teacher 生成安全且经 greedy reconstruction 验证的候选，仍可提供 regenerate CE。该门控不改变 segmentation batch，全部 localization rollout 继续参与其 GRPO 更新。主日志记录 `opsd/caption_safe_rate`、三种 unsafe rate 和 `opsd/caption_forced_regenerate_count`；reward 指标也拆分为 `cap_no_bbox_no_chinese_score` 与 `cap_no_special_token_or_json_score`，不再用错误的 `cap_no_mask_token_check_score` 名称代表 bbox/CJK gate。
 
 low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，过滤所有特殊 token/诊断泄漏，以当前 actor 做一次 greedy 重建，选每个低分轨迹的最佳改进 caption；相对原 `R_Ci` 提升至少 `0.05` 才采用，同 prompt 去重后最多两个 target。student 始终在原始 prompt 上做加权 CE，权重为 `(R_teacher-R_Ci)/(1-R_Ci+eps)`。
 
@@ -317,10 +322,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/sharding_manager/fsdp_vllm.py` | FSDP 参数与 vLLM engine 同步/offload |
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
-| `workers/opsd/config.py` | pixel IoU、路由、EMA teacher、regenerate 与 distillation 配置及边界校验 |
+| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate 与 distillation 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重和 distillation metrics |
 | `workers/opsd/mask_iou.py` | 严格 token 解析、原始 GT 转换、批量 mask 解码、尺寸恢复和像素 IoU |
-| `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、privileged context、route 权重与泄漏过滤 |
+| `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、privileged context、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
 | `single_controller/` | Ray worker、worker group、注册装饰器、资源/dispatch 管理 |
@@ -436,6 +441,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
 17. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
 18. **FSDP checkpoint 不是可直接评测的 HF 模型。** `actor/huggingface/` 仅保存 config/generation config/processor；必须使用与保存 world size 相同的 export-only FSDP worker 恢复 shard 后导出。不要把原 cold-start `MODEL_PATH` 当作训练后模型传给评测脚本。
+19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对 high GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -459,6 +465,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-07-29 - 增加 OPSD caption 安全路由第一层稳定化
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`projects/rl/config.yaml`、`projects/rl/reward_function/text2mask.py`、`verl/trainer/ray_trainer.py`、`verl/workers/opsd/{__init__,config,routing}.py` 与 `tests/test_opsd_core.py`。
+- 文档：更新第 2.2、3.3、3.5、3.6、5.2、6 节。
+- 行为：服务器训练入口默认将 caption rollout 限制为 256 token，并使 OPSD safety 使用相同阈值。driver 在像素 IoU 路由后检查真实 response：非终止 special token、`mask_2d` JSON 或超长输出会记录原因并强制进入 regenerate，不参与 caption GRPO/JSD；localization 更新保持不变。caption reward 的 bbox/CJK gate 之外新增 special-token/JSON gate，指标改为语义准确的两个独立名称。
+- 验证：执行 `python3 -m py_compile verl/workers/opsd/config.py verl/workers/opsd/routing.py verl/workers/opsd/__init__.py verl/trainer/ray_trainer.py projects/rl/reward_function/text2mask.py tests/test_opsd_core.py`、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`。`python3 -m unittest tests.test_opsd_core` 在本机因缺少 `torch` 未能导入；GPU/Ray/vLLM 端到端训练和该单测须在火山引擎服务器环境运行。
 
 ### 2026-07-19 - 建立论文与代码知识库
 

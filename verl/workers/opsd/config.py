@@ -32,6 +32,19 @@ class RoutingConfig:
 
 
 @dataclass
+class CaptionSafetyConfig:
+    """Keep malformed caption rollouts out of caption PPO and JSD updates."""
+
+    enabled: bool = True
+    max_response_tokens: int = 256
+    force_regenerate: bool = True
+
+    def post_init(self):
+        if self.max_response_tokens <= 0:
+            raise ValueError("caption_safety.max_response_tokens must be positive.")
+
+
+@dataclass
 class EMATeacherConfig:
     enabled: bool = True
     decay: float = 0.999
@@ -107,6 +120,7 @@ class OPSDConfig:
     localization_loss_weight: float = 0.5
     pixel_iou: PixelIoUConfig = field(default_factory=PixelIoUConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
+    caption_safety: CaptionSafetyConfig = field(default_factory=CaptionSafetyConfig)
     ema_teacher: EMATeacherConfig = field(default_factory=EMATeacherConfig)
     regenerate: RegenerateConfig = field(default_factory=RegenerateConfig)
     distillation: DistillationConfig = field(default_factory=DistillationConfig)

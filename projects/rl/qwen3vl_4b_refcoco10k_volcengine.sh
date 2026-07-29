@@ -15,6 +15,9 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-128}"
 ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-128}"
 CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
+# Caption rollouts should be short natural descriptions. This cap also bounds
+# the OPSD safety gate before any caption PPO or JSD update.
+CAPTION_MAX_RESPONSE_LENGTH="${CAPTION_MAX_RESPONSE_LENGTH:-256}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 # Leave empty for the complete epoch.  Set 5, 10, ... to create a checkpoint
 # boundary for an offline RefCOCO validation before continuing with RESUME=true.
@@ -55,6 +58,11 @@ fi
 
 if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
+    exit 1
+fi
+
+if [[ ! "${CAPTION_MAX_RESPONSE_LENGTH}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CAPTION_MAX_RESPONSE_LENGTH must be a positive integer: ${CAPTION_MAX_RESPONSE_LENGTH}" >&2
     exit 1
 fi
 
@@ -201,6 +209,7 @@ echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
+echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
 echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
 echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
@@ -220,7 +229,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     data.seed=1 \
     data.rollout_batch_size="${ROLLOUT_BATCH_SIZE}" \
     data.max_prompt_length=8192 \
-    data.max_response_length=8192 \
+    data.max_response_length="${CAPTION_MAX_RESPONSE_LENGTH}" \
     worker.actor.model.model_path="${MODEL_PATH}" \
     worker.actor.model.freeze_vision_tower=true \
     worker.actor.model.enable_gradient_checkpointing=true \
@@ -244,6 +253,9 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.routing.enabled=true \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
+    worker.opsd.caption_safety.enabled=true \
+    worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
+    worker.opsd.caption_safety.force_regenerate=true \
     worker.opsd.ema_teacher.enabled=true \
     worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
     worker.opsd.teacher_analysis.enabled=true \

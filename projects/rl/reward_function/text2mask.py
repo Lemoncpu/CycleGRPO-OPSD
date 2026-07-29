@@ -15,6 +15,7 @@ from pycocotools import mask as mask_utils
 from pycocoevalcap.cider.cider import Cider
 from torchvision.transforms.functional import to_pil_image
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
+from verl.workers.opsd import caption_safety_reason
 
 _MODEL_CACHE = {'vq_sam2': None, 'sam2_image_processor': None}
 
@@ -1259,19 +1260,24 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 # semantic_alignment_score = compute_semantic_alignment_reward(response_answer_content, gt_answer_content)
                 # think_content_no_repeat_score = gm_non_repeat_reward(response_think_content)
                 
-                answer_content_no_repeat_score = gm_non_repeat_reward(reward_input["response"])
-                # cap_no_mask_token_check_score = cap_no_mask_token_check(reward_input["response"])
-                cap_no_bbox_no_chinese_score = cap_no_bbox_no_chinese_check(reward_input["response"])
+                response = reward_input["response"]
+                answer_content_no_repeat_score = gm_non_repeat_reward(response)
+                cap_no_bbox_no_chinese_score = cap_no_bbox_no_chinese_check(response)
+                # Keep malformed SAMTok/JSON outputs from obtaining a positive
+                # caption reward even before the driver excludes them from PPO/JSD.
+                cap_no_special_token_or_json_score = float(caption_safety_reason(response) is None)
                 iou_scores = reward_input['iou_scores']
-                # 方案 A: 乘性 gating —— 输出含 bbox 或中文时，no_repeat 与 iou 奖励一并清零，
-                # 让违规直接抹掉所有正向收益，模型无法用 bbox 蹭 iou 分。
-                cap_overall = (answer_content_no_repeat_score + 10*iou_scores) * cap_no_bbox_no_chinese_score + cap_no_bbox_no_chinese_score
+                # Both validity gates are multiplicative: a malformed caption
+                # cannot collect pixel-IoU reward through the cycle objective.
+                cap_validity_score = cap_no_bbox_no_chinese_score * cap_no_special_token_or_json_score
+                cap_overall = (answer_content_no_repeat_score + 10*iou_scores) * cap_validity_score + cap_validity_score
                 scores.append(
                     {
                         "cap_overall": cap_overall,
                         "cap_iou_scores": iou_scores,
                         "cap_answer_content_no_repeat_score": answer_content_no_repeat_score,
-                        "cap_no_mask_token_check_score": cap_no_bbox_no_chinese_score,
+                        "cap_no_bbox_no_chinese_score": cap_no_bbox_no_chinese_score,
+                        "cap_no_special_token_or_json_score": cap_no_special_token_or_json_score,
                     }
                 )
 

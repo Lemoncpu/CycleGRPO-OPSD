@@ -16,6 +16,7 @@ from verl.workers.opsd.routing import (
     REGENERATE_ROUTE,
     aggregate_caption_rollouts,
     build_privileged_context,
+    caption_safety_reason,
     classify_route,
     distillation_weight,
     format_privileged_prompt,
@@ -123,6 +124,28 @@ class OPSDCoreTest(unittest.TestCase):
             teacher_caption_is_safe("<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>")
         )
         self.assertFalse(teacher_caption_is_safe("A cup. <|im_start|>system"))
+
+    def test_caption_safety_rejects_special_tokens_json_and_overlength(self):
+        self.assertIsNone(
+            caption_safety_reason(
+                "<think>brief reasoning</think> A red ceramic cup.",
+                response_tokens=12,
+                max_response_tokens=256,
+            )
+        )
+        self.assertIsNone(caption_safety_reason("A red cup.<|im_end|>"))
+        self.assertEqual(
+            caption_safety_reason("<|mt_start|><|mt_0001|><|mt_end|>"),
+            "special_token",
+        )
+        self.assertEqual(
+            caption_safety_reason('{"mask_2d": "<|mt_start|>..."}'),
+            "mask_json",
+        )
+        self.assertEqual(
+            caption_safety_reason("A red cup.", response_tokens=257, max_response_tokens=256),
+            "overlength",
+        )
 
     def test_chunked_jsd_matches_dense_loss_and_gradient(self):
         torch.manual_seed(7)

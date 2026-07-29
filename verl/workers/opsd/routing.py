@@ -1,3 +1,4 @@
+import re
 from typing import Optional, Sequence
 
 import numpy as np
@@ -9,6 +10,10 @@ from .mask_iou import mask_summary
 REGENERATE_ROUTE = "regenerate"
 ON_POLICY_DISTILL_ROUTE = "on_policy_distill"
 GRPO_ROUTE = "grpo"
+
+_TERMINAL_SPECIAL_TOKENS = re.compile(r"<\|(?:im_end|endoftext|eos)\|>", re.IGNORECASE)
+_SPECIAL_TOKEN = re.compile(r"<\|[^|]+\|>")
+_MASK_JSON = re.compile(r"[\"']?mask_2d[\"']?\s*:", re.IGNORECASE)
 
 
 PRIVILEGED_LEAKAGE_TERMS = (
@@ -37,6 +42,29 @@ def classify_route(score: float, low_threshold: float = 0.5, high_threshold: flo
     if score <= high_threshold:
         return ON_POLICY_DISTILL_ROUTE
     return GRPO_ROUTE
+
+
+def caption_safety_reason(
+    text: str,
+    *,
+    response_tokens: Optional[int] = None,
+    max_response_tokens: Optional[int] = None,
+) -> Optional[str]:
+    """Return the first reason a caption cannot safely train caption PPO/JSD.
+
+    Rollout decoding preserves special tokens so that accidental SAMTok mask output
+    can be detected. Normal terminal markers are stripped because vLLM may append
+    them after an otherwise valid caption.
+    """
+    if max_response_tokens is not None and response_tokens is not None:
+        if response_tokens > max_response_tokens:
+            return "overlength"
+    content = _TERMINAL_SPECIAL_TOKENS.sub("", text or "")
+    if _MASK_JSON.search(content):
+        return "mask_json"
+    if _SPECIAL_TOKEN.search(content):
+        return "special_token"
+    return None
 
 
 def regenerate_weight(original_score: float, teacher_score: float, eps: float = 1e-6) -> float:

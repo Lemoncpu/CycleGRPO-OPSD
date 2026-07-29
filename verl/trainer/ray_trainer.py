@@ -47,6 +47,7 @@ from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import FunctionRewardManager
 from ..workers.opsd import (
+    caption_safety_reason,
     distillation_weight,
     format_privileged_prompt,
     regenerate_weight,
@@ -839,12 +840,58 @@ class RayPPOTrainer:
                 context_by_uid.setdefault(str(uid), context)
 
         caption_contexts = [context_by_uid[str(uid)] for uid in caption_batch.non_tensor_batch["caption_uid"]]
+        safety_config = self.config.worker.opsd.caption_safety
+        response_lengths = torch.sum(caption_batch.batch["response_mask"], dim=-1)
+        caption_safe = []
+        caption_safety_reasons = []
+        caption_response_tokens = []
+        caption_route_before_safety = []
+        caption_forced_regenerate = []
+
+        # Pixel IoU has already assigned the normal low/mid/high route. Inspect
+        # the exact caption rollout before privileged JSD or caption PPO can use it.
+        for index, context in enumerate(caption_contexts):
+            response_tokens = int(response_lengths[index].item())
+            response_ids = caption_batch.batch["responses"][index][:response_tokens]
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+            reason = (
+                caption_safety_reason(
+                    response_text,
+                    response_tokens=response_tokens,
+                    max_response_tokens=safety_config.max_response_tokens,
+                )
+                if safety_config.enabled
+                else None
+            )
+            original_route = str(context["route"])
+            forced_regenerate = bool(reason is not None and safety_config.force_regenerate)
+            if forced_regenerate:
+                context["route"] = "regenerate"
+            context["caption_safe"] = reason is None
+            context["caption_safety_reason"] = reason
+            context["caption_response_tokens"] = response_tokens
+            context["route_before_caption_safety"] = original_route
+            caption_safe.append(reason is None)
+            caption_safety_reasons.append(reason)
+            caption_response_tokens.append(response_tokens)
+            caption_route_before_safety.append(original_route)
+            caption_forced_regenerate.append(forced_regenerate)
+
         caption_batch.non_tensor_batch["privileged_context"] = np.array(caption_contexts, dtype=object)
         caption_batch.non_tensor_batch["R_Ci"] = np.array(
             [context["R_Ci"] for context in caption_contexts], dtype=object
         )
         caption_batch.non_tensor_batch["route"] = np.array(
             [context["route"] for context in caption_contexts], dtype=object
+        )
+        caption_batch.non_tensor_batch["caption_safe"] = np.array(caption_safe, dtype=object)
+        caption_batch.non_tensor_batch["caption_safety_reason"] = np.array(caption_safety_reasons, dtype=object)
+        caption_batch.non_tensor_batch["caption_response_tokens"] = np.array(caption_response_tokens, dtype=object)
+        caption_batch.non_tensor_batch["route_before_caption_safety"] = np.array(
+            caption_route_before_safety, dtype=object
+        )
+        caption_batch.non_tensor_batch["caption_forced_regenerate"] = np.array(
+            caption_forced_regenerate, dtype=object
         )
         for key in (
             "representative_mask",
@@ -859,6 +906,13 @@ class RayPPOTrainer:
             )
         caption_batch.non_tensor_batch["iou_scores"] = caption_batch.non_tensor_batch["R_Ci"].copy()
         segmentation_batch.non_tensor_batch["iou_scores"] = segmentation_batch.non_tensor_batch["R_Ci"].copy()
+        final_route_by_uid = {
+            str(uid): route for uid, route in zip(caption_batch.non_tensor_batch["caption_uid"], caption_batch.non_tensor_batch["route"])
+        }
+        segmentation_batch.non_tensor_batch["route"] = np.array(
+            [final_route_by_uid.get(str(uid), route) for uid, route in zip(caption_uids, segmentation_batch.non_tensor_batch["route"])],
+            dtype=object,
+        )
 
     def _build_opsd_prompt_batch(self, caption_batch: DataProto, indices: list[int], mode: str) -> DataProto:
         records = []
@@ -1332,6 +1386,28 @@ class RayPPOTrainer:
                                 metrics[f"opsd/route_{route_name}_rate"] = route_values.count(route_name) / max(
                                     len(route_values), 1
                                 )
+                            caption_safety_reasons = list(
+                                cycle_cap_batch.non_tensor_batch["caption_safety_reason"]
+                            )
+                            caption_safe_values = np.asarray(
+                                cycle_cap_batch.non_tensor_batch["caption_safe"], dtype=bool
+                            )
+                            forced_regenerate = np.asarray(
+                                cycle_cap_batch.non_tensor_batch["caption_forced_regenerate"], dtype=bool
+                            )
+                            metrics.update(
+                                {
+                                    "opsd/caption_safe_rate": float(np.mean(caption_safe_values)),
+                                    "opsd/caption_unsafe_rate": float(np.mean(~caption_safe_values)),
+                                    "opsd/caption_special_token_rate": caption_safety_reasons.count("special_token")
+                                    / max(len(caption_safety_reasons), 1),
+                                    "opsd/caption_mask_json_rate": caption_safety_reasons.count("mask_json")
+                                    / max(len(caption_safety_reasons), 1),
+                                    "opsd/caption_overlength_rate": caption_safety_reasons.count("overlength")
+                                    / max(len(caption_safety_reasons), 1),
+                                    "opsd/caption_forced_regenerate_count": int(np.sum(forced_regenerate)),
+                                }
+                            )
                             pixel_values = cycle_seg_batch.non_tensor_batch["pixel_iou"].astype(float)
                             caption_scores = cycle_cap_batch.non_tensor_batch["R_Ci"].astype(float)
                             metrics.update(
@@ -1505,6 +1581,11 @@ class RayPPOTrainer:
                         "privileged_context",
                         "R_Ci",
                         "route",
+                        "caption_safe",
+                        "caption_safety_reason",
+                        "caption_response_tokens",
+                        "route_before_caption_safety",
+                        "caption_forced_regenerate",
                         "representative_mask",
                         "best_mask",
                         "iou_mean",

@@ -51,6 +51,10 @@ worker:
       enabled: true
       low_threshold: 0.5
       high_threshold: 0.85
+    caption_safety:
+      enabled: true
+      max_response_tokens: 256
+      force_regenerate: true
     ema_teacher:
       enabled: true
       decay: 0.999

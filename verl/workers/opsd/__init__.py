@@ -1,4 +1,4 @@
-from .config import OPSDConfig
+from .config import CaptionSafetyConfig, OPSDConfig
 from .distillation import chunked_weighted_jsd_loss
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
@@ -15,6 +15,7 @@ from .routing import (
     REGENERATE_ROUTE,
     aggregate_caption_rollouts,
     build_privileged_context,
+    caption_safety_reason,
     classify_route,
     distillation_weight,
     format_privileged_prompt,
@@ -27,10 +28,12 @@ __all__ = [
     "GRPO_ROUTE",
     "MASK_TOKEN_PATTERN",
     "ON_POLICY_DISTILL_ROUTE",
+    "CaptionSafetyConfig",
     "OPSDConfig",
     "REGENERATE_ROUTE",
     "aggregate_caption_rollouts",
     "build_privileged_context",
+    "caption_safety_reason",
     "chunked_weighted_jsd_loss",
     "classify_route",
     "coerce_raw_mask",
