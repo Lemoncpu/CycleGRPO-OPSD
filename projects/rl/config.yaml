@@ -45,6 +45,13 @@ worker:
     caption_anchor_kl_all_safe_routes: false
     segmentation_anchor_kl_coef: 0.0
     asymmetric_gradient_projection: false
+    teacher_confidence:
+      # The Volcengine controlled experiment enables this gate. Keep generic
+      # YAML compatible with historical all-low/mid auxiliary updates.
+      enabled: false
+      regenerate_min_teacher_score: 0.65
+      regenerate_min_normalized_improvement: 0.30
+      distill_min_caption_score: 0.65
     pixel_iou:
       enabled: true
       decode_batch_size: 64

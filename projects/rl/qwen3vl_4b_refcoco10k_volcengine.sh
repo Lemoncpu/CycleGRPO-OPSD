@@ -33,8 +33,14 @@ PRESERVE_ORIGINAL_GRPO="${PRESERVE_ORIGINAL_GRPO:-true}"
 CAPTION_ANCHOR_KL_COEF="${CAPTION_ANCHOR_KL_COEF:-0.05}"
 CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES:-true}"
 SEGMENTATION_ANCHOR_KL_COEF="${SEGMENTATION_ANCHOR_KL_COEF:-0.05}"
-ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-true}"
+# The measured caption/segmentation cosine is nearly zero, so projection does
+# not materially alter updates and is disabled for the high-confidence teacher run.
+ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-false}"
 JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
+TEACHER_CONFIDENCE_ENABLED="${TEACHER_CONFIDENCE_ENABLED:-true}"
+REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
+REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
+DISTILL_MIN_CAPTION_SCORE="${DISTILL_MIN_CAPTION_SCORE:-0.65}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
 # continuing a checkpoint produced by this same frozen-teacher experiment.
@@ -100,6 +106,21 @@ if [[ "${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" != "true" \
     echo "JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB must be true or false: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" >&2
     exit 1
 fi
+
+if [[ "${TEACHER_CONFIDENCE_ENABLED}" != "true" \
+    && "${TEACHER_CONFIDENCE_ENABLED}" != "false" ]]; then
+    echo "TEACHER_CONFIDENCE_ENABLED must be true or false: ${TEACHER_CONFIDENCE_ENABLED}" >&2
+    exit 1
+fi
+
+for threshold_name in REGENERATE_MIN_TEACHER_SCORE REGENERATE_MIN_NORMALIZED_IMPROVEMENT DISTILL_MIN_CAPTION_SCORE; do
+    threshold_value="${!threshold_name}"
+    if [[ ! "${threshold_value}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
+        || ! awk -v value="${threshold_value}" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
+        echo "${threshold_name} must be a number in [0, 1]: ${threshold_value}" >&2
+        exit 1
+    fi
+done
 
 if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
@@ -257,6 +278,7 @@ echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_A
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
 echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADIENT_PROJECTION}"
 echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
+echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -303,6 +325,10 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
     worker.opsd.segmentation_anchor_kl_coef="${SEGMENTATION_ANCHOR_KL_COEF}" \
     worker.opsd.asymmetric_gradient_projection="${ASYMMETRIC_GRADIENT_PROJECTION}" \
+    worker.opsd.teacher_confidence.enabled="${TEACHER_CONFIDENCE_ENABLED}" \
+    worker.opsd.teacher_confidence.regenerate_min_teacher_score="${REGENERATE_MIN_TEACHER_SCORE}" \
+    worker.opsd.teacher_confidence.regenerate_min_normalized_improvement="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}" \
+    worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
     worker.opsd.pixel_iou.enabled=true \
     worker.opsd.routing.enabled=true \
     worker.opsd.routing.low_threshold=0.5 \

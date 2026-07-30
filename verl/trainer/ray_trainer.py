@@ -1002,6 +1002,10 @@ class RayPPOTrainer:
             "opsd/regenerate_improvement_rate": 0.0,
             "opsd/teacher_target_acceptance_rate": 0.0,
             "opsd/regenerate_mean_improvement": 0.0,
+            "opsd/regenerate_validated_candidate_count": 0,
+            "opsd/regenerate_confident_candidate_count": 0,
+            "opsd/regenerate_confident_candidate_rate": 0.0,
+            "opsd/regenerate_confident_target_acceptance_rate": 0.0,
         }
         if not low_indices:
             return None, regen_metrics
@@ -1095,6 +1099,9 @@ class RayPPOTrainer:
         self._merge_pixel_iou_metadata(validation_cap, validation_seg)
 
         candidates_by_parent = defaultdict(list)
+        confidence_config = self.config.worker.opsd.teacher_confidence
+        validated_candidates = 0
+        confident_candidates = 0
         for candidate_index, parent_index in enumerate(parent_indices):
             parent_index = int(parent_index)
             original_score = float(caption_batch.non_tensor_batch["R_Ci"][parent_index])
@@ -1103,6 +1110,13 @@ class RayPPOTrainer:
             if improvement < config.min_improvement:
                 continue
             weight = regenerate_weight(original_score, teacher_score)
+            validated_candidates += 1
+            if confidence_config.enabled and (
+                teacher_score < confidence_config.regenerate_min_teacher_score
+                or weight < confidence_config.regenerate_min_normalized_improvement
+            ):
+                continue
+            confident_candidates += 1
             response = validation_cap.batch["responses"][candidate_index][: config.max_new_tokens]
             response_mask = validation_cap.batch["response_mask"][candidate_index][: config.max_new_tokens]
             candidates_by_parent[parent_index].append(
@@ -1130,21 +1144,56 @@ class RayPPOTrainer:
                 selected_improvements.append(score - float(caption_batch.non_tensor_batch["R_Ci"][parent_index]))
                 if len(seen) >= config.max_targets_per_prompt:
                     break
-        improved_candidates = sum(len(candidates) for candidates in candidates_by_parent.values())
-        regen_metrics["opsd/regenerate_improvement_rate"] = improved_candidates / max(len(decoded), 1)
+        regen_metrics["opsd/regenerate_improvement_rate"] = validated_candidates / max(
+            len(decoded), 1
+        )
         regen_metrics["opsd/teacher_target_acceptance_rate"] = len(selected) / max(len(low_indices), 1)
+        regen_metrics["opsd/regenerate_validated_candidate_count"] = validated_candidates
+        regen_metrics["opsd/regenerate_confident_candidate_count"] = confident_candidates
+        regen_metrics["opsd/regenerate_confident_candidate_rate"] = confident_candidates / max(
+            validated_candidates, 1
+        )
+        regen_metrics["opsd/regenerate_confident_target_acceptance_rate"] = len(selected) / max(
+            len(low_indices), 1
+        )
         if selected_improvements:
             regen_metrics["opsd/regenerate_mean_improvement"] = float(np.mean(selected_improvements))
         return self._build_supervised_batch(caption_batch, selected), regen_metrics
 
-    def _build_distillation_batch(self, caption_batch: DataProto) -> Optional[DataProto]:
+    def _build_distillation_batch(
+        self, caption_batch: DataProto
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
         mid_indices = [
             index
             for index, route in enumerate(caption_batch.non_tensor_batch["route"])
             if route == "on_policy_distill"
         ]
+        distill_metrics = {
+            "opsd/distillation_route_count": len(mid_indices),
+            "opsd/distillation_confident_count": 0,
+            "opsd/distillation_confident_rate": 0.0,
+            "opsd/distillation_confident_R_Ci_mean": 0.0,
+        }
         if not mid_indices:
-            return None
+            return None, distill_metrics
+        confidence_config = self.config.worker.opsd.teacher_confidence
+        if confidence_config.enabled:
+            mid_indices = [
+                index
+                for index in mid_indices
+                if float(caption_batch.non_tensor_batch["R_Ci"][index])
+                >= confidence_config.distill_min_caption_score
+            ]
+        distill_metrics["opsd/distillation_confident_count"] = len(mid_indices)
+        distill_metrics["opsd/distillation_confident_rate"] = len(mid_indices) / max(
+            distill_metrics["opsd/distillation_route_count"], 1
+        )
+        if mid_indices:
+            distill_metrics["opsd/distillation_confident_R_Ci_mean"] = float(
+                np.mean([float(caption_batch.non_tensor_batch["R_Ci"][index]) for index in mid_indices])
+            )
+        if not mid_indices:
+            return None, distill_metrics
         student = caption_batch[mid_indices]
         teacher_prompts = self._build_opsd_prompt_batch(caption_batch, mid_indices, mode="distill")
         responses = student.batch["responses"]
@@ -1183,7 +1232,7 @@ class RayPPOTrainer:
         student.non_tensor_batch["teacher_multi_modal_data"] = teacher_prompts.non_tensor_batch[
             "multi_modal_data"
         ]
-        return student
+        return student, distill_metrics
 
     def _select_teacher_analysis_indices(self, caption_batch: DataProto) -> list[int]:
         config = self.config.worker.opsd.teacher_analysis
@@ -1451,7 +1500,10 @@ class RayPPOTrainer:
                             teacher_diagnoses = self._generate_teacher_diagnoses(cycle_cap_batch)
                             self._write_teacher_diagnoses(teacher_diagnoses)
                             metrics["opsd/teacher_analysis_count"] = len(teacher_diagnoses)
-                            distillation_batch = self._build_distillation_batch(cycle_cap_batch)
+                            distillation_batch, distillation_metrics = self._build_distillation_batch(
+                                cycle_cap_batch
+                            )
+                            metrics.update(distillation_metrics)
                             regenerate_batch, regenerate_metrics = self._generate_regenerate_supervision(
                                 cycle_cap_batch
                             )

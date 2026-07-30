@@ -101,6 +101,28 @@ class DistillationConfig:
 
 
 @dataclass
+class TeacherConfidenceConfig:
+    """Gate privileged auxiliary losses to teacher signals with cycle evidence."""
+
+    enabled: bool = False
+    regenerate_min_teacher_score: float = 0.65
+    regenerate_min_normalized_improvement: float = 0.30
+    distill_min_caption_score: float = 0.65
+
+    def post_init(self):
+        for name, value in (
+            ("regenerate_min_teacher_score", self.regenerate_min_teacher_score),
+            (
+                "regenerate_min_normalized_improvement",
+                self.regenerate_min_normalized_improvement,
+            ),
+            ("distill_min_caption_score", self.distill_min_caption_score),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"teacher_confidence.{name} must be in [0, 1].")
+
+
+@dataclass
 class TeacherAnalysisConfig:
     enabled: bool = True
     max_samples_per_step: int = 2
@@ -130,6 +152,7 @@ class OPSDConfig:
     ema_teacher: EMATeacherConfig = field(default_factory=EMATeacherConfig)
     regenerate: RegenerateConfig = field(default_factory=RegenerateConfig)
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    teacher_confidence: TeacherConfidenceConfig = field(default_factory=TeacherConfidenceConfig)
     teacher_analysis: TeacherAnalysisConfig = field(default_factory=TeacherAnalysisConfig)
 
     def post_init(self):
@@ -143,6 +166,7 @@ class OPSDConfig:
             raise ValueError("caption_anchor_kl_coef must be non-negative.")
         if self.segmentation_anchor_kl_coef < 0:
             raise ValueError("segmentation_anchor_kl_coef must be non-negative.")
+        self.teacher_confidence.post_init()
         if self.enabled and self.routing.enabled and not self.pixel_iou.enabled:
             raise ValueError("OPSD three-route training requires pixel_iou.enabled=true.")
         if self.enabled and self.routing.enabled and not self.ema_teacher.enabled:

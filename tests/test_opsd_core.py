@@ -7,7 +7,7 @@ from verl.workers.opsd.distillation import (
     caption_blocked_special_token_ids,
     chunked_weighted_jsd_loss,
 )
-from verl.workers.opsd.config import OPSDConfig
+from verl.workers.opsd.config import OPSDConfig, TeacherConfidenceConfig
 from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
@@ -39,6 +39,21 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertTrue(OPSDConfig(asymmetric_gradient_projection=True).asymmetric_gradient_projection)
         with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
             OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
+
+    def test_teacher_confidence_thresholds_are_unit_intervals(self):
+        config = OPSDConfig(
+            teacher_confidence=TeacherConfidenceConfig(
+                enabled=True,
+                regenerate_min_teacher_score=0.65,
+                regenerate_min_normalized_improvement=0.30,
+                distill_min_caption_score=0.65,
+            )
+        )
+        config.post_init()
+        with self.assertRaisesRegex(ValueError, "teacher_confidence.distill_min_caption_score"):
+            OPSDConfig(
+                teacher_confidence=TeacherConfidenceConfig(distill_min_caption_score=1.01)
+            ).post_init()
 
     def test_route_boundaries_are_strict(self):
         self.assertEqual(classify_route(0.4999), REGENERATE_ROUTE)
