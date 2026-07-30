@@ -118,6 +118,7 @@ class ActorConfig:
     kl_coef: float = field(default=0.0, init=False)
     caption_anchor_kl_coef: float = field(default=0.0, init=False)
     caption_anchor_kl_all_safe_routes: bool = field(default=False, init=False)
+    segmentation_anchor_kl_coef: float = field(default=0.0, init=False)
 
 
 @dataclass

@@ -605,19 +605,19 @@ class RLHFDataset(Dataset):
         return example
 
     def preprocess_opsd_prompt(self, prompt_text: str, multi_modal_data: dict[str, Any]) -> dict[str, Any]:
-        """Tokenize an image OPSD prompt with the same Qwen-VL path as training data."""
+        """Tokenize a multi-image OPSD teacher prompt with the Qwen-VL training path."""
         if "images" not in multi_modal_data or not multi_modal_data["images"]:
-            raise ValueError("OPSD privileged prompts currently require one image.")
-        clean_text = re.sub(r"^\s*<image>\s*", "", prompt_text)
+            raise ValueError("OPSD privileged prompts require at least one image.")
+        clean_text = re.sub(r"^(?:\s*<image>\s*)+", "", prompt_text)
+        images = list(multi_modal_data["images"])
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "image"}, {"type": "text", "text": clean_text}],
+                "content": ([{"type": "image"} for _ in images] + [{"type": "text", "text": clean_text}]),
             }
         ]
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         prompt = add_no_think_prefix(prompt, self.enable_no_think_prefix)
-        images = list(multi_modal_data["images"][:1])
         processed_images = [process_image(image, self.min_pixels, self.max_pixels) for image in images]
         model_inputs = self.processor(
             text=[prompt], images=processed_images, add_special_tokens=False, return_tensors="pt"

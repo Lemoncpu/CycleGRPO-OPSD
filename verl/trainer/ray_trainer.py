@@ -41,6 +41,7 @@ from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWo
 from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
+from ..utils.dataset import process_image
 from ..utils.logger import Tracker
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -48,6 +49,7 @@ from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import FunctionRewardManager
 from ..workers.opsd import (
     caption_safety_reason,
+    build_privileged_teacher_images,
     distillation_weight,
     format_privileged_prompt,
     regenerate_weight,
@@ -921,10 +923,18 @@ class RayPPOTrainer:
         for index in indices:
             context = caption_batch.non_tensor_batch["privileged_context"][index]
             prompt_text = format_privileged_prompt(context, mode=mode)
+            original_media = caption_batch.non_tensor_batch["multi_modal_data"][index]
+            original_images = original_media.get("images", [])
+            if not original_images:
+                raise ValueError("OPSD privileged teacher prompts require an image.")
+            scene = process_image(original_images[0], None, None)
+            teacher_media = {
+                "images": build_privileged_teacher_images(scene, context),
+            }
             records.append(
                 dataset.preprocess_opsd_prompt(
                     prompt_text,
-                    caption_batch.non_tensor_batch["multi_modal_data"][index],
+                    teacher_media,
                 )
             )
         tensors = {
@@ -1594,6 +1604,21 @@ class RayPPOTrainer:
                                 gamma=self.config.algorithm.gamma,
                                 lam=self.config.algorithm.lam,
                             )
+                            if (
+                                self.config.worker.opsd.segmentation_anchor_kl_coef > 0
+                                and self.use_reference_policy
+                            ):
+                                segmentation_anchor_values = np.ones(len(cycle_seg_batch), dtype=bool)
+                                cycle_seg_batch.batch["segmentation_anchor_kl_mask"] = torch.tensor(
+                                    segmentation_anchor_values,
+                                    dtype=cycle_seg_batch.batch["response_mask"].dtype,
+                                )
+                                metrics["opsd/segmentation_anchor_kl_active_count"] = int(
+                                    np.sum(segmentation_anchor_values)
+                                )
+                                metrics["opsd/segmentation_anchor_kl_active_rate"] = float(
+                                    np.mean(segmentation_anchor_values)
+                                )
 
                     # update critic
                     if cycle_seg_batch is not None and self.use_critic:

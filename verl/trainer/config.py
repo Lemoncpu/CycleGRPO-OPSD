@@ -187,6 +187,7 @@ class PPOConfig:
         self.worker.actor.caption_anchor_kl_all_safe_routes = (
             self.worker.opsd.caption_anchor_kl_all_safe_routes
         )
+        self.worker.actor.segmentation_anchor_kl_coef = self.worker.opsd.segmentation_anchor_kl_coef
 
     def deep_post_init(self):
         recursive_post_init(self)

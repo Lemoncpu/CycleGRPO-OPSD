@@ -1,8 +1,9 @@
 import re
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import torch
+from PIL import Image
 
 from .mask_iou import mask_summary
 
@@ -33,6 +34,8 @@ PRIVILEGED_LEAKAGE_TERMS = (
     "region 2",
     "<|",
 )
+
+_PRIVILEGED_CROP_MAX_PIXELS = 512 * 512
 
 
 def classify_route(score: float, low_threshold: float = 0.5, high_threshold: float = 0.85) -> str:
@@ -129,6 +132,110 @@ def _pack_mask(mask: Optional[torch.Tensor]) -> Optional[dict[str, object]]:
     }
 
 
+def _unpack_mask(packed_mask: Optional[dict[str, object]]) -> Optional[np.ndarray]:
+    if not packed_mask:
+        return None
+    shape = tuple(int(value) for value in packed_mask.get("shape", []))
+    if len(shape) != 2 or min(shape) <= 0:
+        return None
+    packed_bits = packed_mask.get("packbits")
+    if not isinstance(packed_bits, bytes):
+        return None
+    size = int(np.prod(shape))
+    values = np.unpackbits(np.frombuffer(packed_bits, dtype=np.uint8), count=size)
+    if values.size != size:
+        return None
+    return values.reshape(shape).astype(bool)
+
+
+def _align_mask_to_image(mask: Optional[np.ndarray], image: Image.Image) -> Optional[np.ndarray]:
+    if mask is None:
+        return None
+    if mask.shape == (image.height, image.width):
+        return mask
+    resized = Image.fromarray(mask.astype(np.uint8) * 255).resize(
+        image.size, resample=Image.Resampling.NEAREST
+    )
+    return np.asarray(resized, dtype=np.uint8).astype(bool)
+
+
+def _union_crop_box(
+    target_mask: Optional[np.ndarray],
+    reconstruction_mask: Optional[np.ndarray],
+    *,
+    width: int,
+    height: int,
+    padding_fraction: float,
+) -> tuple[int, int, int, int]:
+    candidates = [
+        mask for mask in (target_mask, reconstruction_mask) if mask is not None and mask.any()
+    ]
+    if not candidates:
+        return (0, 0, width, height)
+    union = np.logical_or.reduce(candidates)
+    ys, xs = np.nonzero(union)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    padding = int(np.ceil(max(x1 - x0, y1 - y0) * padding_fraction))
+    return (
+        max(0, x0 - padding),
+        max(0, y0 - padding),
+        min(width, x1 + padding),
+        min(height, y1 + padding),
+    )
+
+
+def _masked_crop(
+    image: Image.Image,
+    mask: Optional[np.ndarray],
+    box: tuple[int, int, int, int],
+) -> Image.Image:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    isolated = np.full_like(pixels, 127)
+    if mask is not None:
+        isolated[mask] = pixels[mask]
+    return Image.fromarray(isolated, mode="RGB").crop(box)
+
+
+def _limit_crop_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
+    if image.width * image.height <= max_pixels:
+        return image
+    scale = float(np.sqrt(max_pixels / (image.width * image.height)))
+    size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+    return image.resize(size, resample=Image.Resampling.LANCZOS)
+
+
+def build_privileged_teacher_images(
+    image: Image.Image,
+    context: dict[str, Any],
+    *,
+    padding_fraction: float = 0.15,
+    max_crop_pixels: int = _PRIVILEGED_CROP_MAX_PIXELS,
+) -> list[Image.Image]:
+    """Build teacher-only scene, GT-target, and reconstructed-target visual evidence."""
+    if not 0.0 <= padding_fraction <= 1.0:
+        raise ValueError("padding_fraction must be in [0, 1].")
+    if max_crop_pixels <= 0:
+        raise ValueError("max_crop_pixels must be positive.")
+    scene = image.convert("RGB")
+    target_mask = _align_mask_to_image(_unpack_mask(context.get("target_mask")), scene)
+    reconstruction_mask = _align_mask_to_image(
+        _unpack_mask(context.get("representative_mask")), scene
+    )
+    box = _union_crop_box(
+        target_mask,
+        reconstruction_mask,
+        width=scene.width,
+        height=scene.height,
+        padding_fraction=padding_fraction,
+    )
+    return [
+        scene,
+        _limit_crop_pixels(_masked_crop(scene, target_mask, box), max_crop_pixels),
+        _limit_crop_pixels(_masked_crop(scene, reconstruction_mask, box), max_crop_pixels),
+    ]
+
+
 def _relative_position(target: dict[str, object], reconstruction: dict[str, object]) -> dict[str, object]:
     target_center = target.get("center")
     reconstruction_center = reconstruction.get("center")
@@ -179,6 +286,7 @@ def build_privileged_context(
             for token in predicted_mask_tokens
         ],
         "valid_mask_token_count": sum(token is not None for token in predicted_mask_tokens),
+        "target_mask": _pack_mask(target_mask),
         "representative_mask": _pack_mask(representative_mask),
         "best_mask": _pack_mask(best_mask),
     }
@@ -186,42 +294,28 @@ def build_privileged_context(
 
 
 def format_privileged_prompt(context: dict[str, object], *, mode: str) -> str:
-    def metric(name: str) -> float:
-        value = context.get(name, 0.0)
-        return float(value) if value is not None else 0.0
-
     base = (
-        "<image>\nYou are improving region captioning with privileged localization evidence.\n"
-        f"Target region token: {context.get('target_mask_token') or 'unavailable'}\n"
-        f"Typical reconstruction token: {context.get('representative_mask_token') or 'invalid'}\n"
-        f"Best reconstruction token: {context.get('best_mask_token') or 'invalid'}\n"
+        "You are improving an object caption with privileged visual evidence.\n"
+        "Image 1 is the full scene. Image 2 isolates the intended object. "
+        "Image 3 isolates the object or area recovered from the student caption.\n"
         f"Student caption: {context.get('student_caption', '')}\n"
-        f"Localization IoUs: {context.get('pixel_ious')}\n"
-        f"Mean/std/min/max: {metric('iou_mean'):.4f} / {metric('iou_std'):.4f} / "
-        f"{metric('iou_min'):.4f} / {metric('iou_max'):.4f}\n"
-        f"Target summary: {context.get('target_summary')}\n"
-        f"Typical reconstruction summary: {context.get('representative_summary')}\n"
-        f"Missing target evidence: {context.get('target_only_summary')}\n"
-        f"Distractor evidence: {context.get('reconstruction_only_summary')}\n"
-        f"Typical reconstruction relative to target: {context.get('relative_position')}\n"
-        f"Localization output status: {context.get('localization_status')}\n"
     )
     if mode == "regenerate":
         return base + (
-            "Write one corrected, detailed and natural caption for the target region. "
-            "Use visible attributes that distinguish it from the reconstructed distractor. "
-            "Output only the caption. Never mention masks, tokens, scores, regions, or this analysis."
+            "Write one corrected, detailed, factual caption for the intended object. "
+            "Use visible attributes that distinguish it from the recovered object or area. "
+            "Output only the caption. Never mention images, crops, scores, coordinates, or this analysis."
         )
     if mode == "distill":
         return base + (
             "Evaluate the exact student caption trajectory token by token. Shift probability toward visible "
-            "details supported by the target and away from details supported only by the reconstruction."
+            "details supported by Image 2 and away from details supported only by Image 3."
         )
     if mode == "analysis":
         return base + (
             "Produce a concise training-only diagnosis as JSON with the keys failure_mode, missing_evidence, "
             "distractor_evidence, and correction_focus. Describe visible evidence in natural language. "
-            "Do not output mask tokens, region labels, IoU values, scores, or a replacement caption."
+            "Do not output scores, coordinates, or a replacement caption."
         )
     raise ValueError(f"Unknown privileged prompt mode: {mode}")
 

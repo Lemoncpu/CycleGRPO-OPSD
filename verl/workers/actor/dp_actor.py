@@ -237,6 +237,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("policy_loss_mask")
         if "caption_anchor_kl_mask" in data.batch:
             select_keys.append("caption_anchor_kl_mask")
+        if "segmentation_anchor_kl_mask" in data.batch:
+            select_keys.append("segmentation_anchor_kl_mask")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -277,6 +279,14 @@ class DataParallelPPOActor(BasePPOActor):
                     ):
                         anchor_kl_mask = base_response_mask * model_inputs[
                             "caption_anchor_kl_mask"
+                        ].unsqueeze(-1)
+                    segmentation_anchor_kl_mask = None
+                    if (
+                        self.config.segmentation_anchor_kl_coef > 0
+                        and "segmentation_anchor_kl_mask" in model_inputs
+                    ):
+                        segmentation_anchor_kl_mask = base_response_mask * model_inputs[
+                            "segmentation_anchor_kl_mask"
                         ].unsqueeze(-1)
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
@@ -328,6 +338,31 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         metrics["actor/caption_anchor_kl_loss"] = anchor_kl_loss.detach().item()
                         metrics["actor/caption_anchor_kl_coef"] = self.config.caption_anchor_kl_coef
+                    if segmentation_anchor_kl_mask is not None and "ref_log_probs" in model_inputs:
+                        if kld is None:
+                            ref_log_probs = model_inputs["ref_log_probs"]
+                            kld = compute_kl(
+                                log_probs=log_probs,
+                                ref_log_probs=ref_log_probs,
+                                kl_penalty=self.config.kl_penalty,
+                            )
+                        segmentation_anchor_kl_loss = average_loss(
+                            kld,
+                            segmentation_anchor_kl_mask,
+                            mode=self.config.loss_avg_mode,
+                        )
+                        segmentation_anchor_kl_token_count = torch.sum(segmentation_anchor_kl_mask)
+                        loss_numerator = loss_numerator + (
+                            segmentation_anchor_kl_loss
+                            * self.config.segmentation_anchor_kl_coef
+                            * segmentation_anchor_kl_token_count
+                        )
+                        metrics["actor/segmentation_anchor_kl_loss"] = (
+                            segmentation_anchor_kl_loss.detach().item()
+                        )
+                        metrics["actor/segmentation_anchor_kl_coef"] = (
+                            self.config.segmentation_anchor_kl_coef
+                        )
 
                     loss = loss_numerator * self.world_size / total_response_tokens
                     # Apply gradient weight for accumulation

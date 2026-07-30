@@ -7,6 +7,7 @@ from verl.workers.opsd.distillation import (
     caption_blocked_special_token_ids,
     chunked_weighted_jsd_loss,
 )
+from verl.workers.opsd.config import OPSDConfig
 from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
@@ -19,6 +20,7 @@ from verl.workers.opsd.routing import (
     REGENERATE_ROUTE,
     aggregate_caption_rollouts,
     build_privileged_context,
+    build_privileged_teacher_images,
     caption_safety_reason,
     classify_route,
     distillation_weight,
@@ -30,6 +32,12 @@ from verl.workers.opsd.routing import (
 
 
 class OPSDCoreTest(unittest.TestCase):
+    def test_anchor_kl_coefficients_must_be_non_negative(self):
+        config = OPSDConfig(caption_anchor_kl_coef=0.05, segmentation_anchor_kl_coef=0.05)
+        config.post_init()
+        with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
+            OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
+
     def test_route_boundaries_are_strict(self):
         self.assertEqual(classify_route(0.4999), REGENERATE_ROUTE)
         self.assertEqual(classify_route(0.5), ON_POLICY_DISTILL_ROUTE)
@@ -111,9 +119,41 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(context["representative_mask"]["shape"], [2, 2])
         self.assertEqual(context["relative_position"]["horizontal"], "aligned")
         self.assertEqual(context["valid_mask_token_count"], 0)
+        self.assertEqual(context["target_mask"]["shape"], [2, 2])
         diagnosis_prompt = format_privileged_prompt(context, mode="analysis")
         self.assertIn("failure_mode", diagnosis_prompt)
         self.assertIn("correction_focus", diagnosis_prompt)
+        self.assertNotIn("Target region token", diagnosis_prompt)
+        self.assertNotIn("<|mt_start|>", diagnosis_prompt)
+
+    def test_privileged_teacher_images_keep_mask_evidence_out_of_text_prompt(self):
+        target = torch.tensor(
+            [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=torch.bool
+        )
+        reconstruction = torch.tensor(
+            [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.bool
+        )
+        context = build_privileged_context(
+            student_caption="a red object",
+            target_mask_token="<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>",
+            predicted_mask_tokens=["<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|>"],
+            pixel_ious=[0.2],
+            target_mask=target,
+            predicted_masks=[reconstruction],
+        )
+        image = Image.new("RGB", (4, 4), color=(20, 40, 60))
+        evidence = build_privileged_teacher_images(image, context, padding_fraction=0.0)
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual(evidence[0].size, (4, 4))
+        self.assertEqual(evidence[1].size, evidence[2].size)
+        self.assertEqual(evidence[1].getpixel((0, 0)), (20, 40, 60))
+        self.assertEqual(evidence[1].getpixel((3, 3)), (127, 127, 127))
+        self.assertEqual(evidence[2].getpixel((0, 0)), (127, 127, 127))
+        self.assertEqual(evidence[2].getpixel((3, 3)), (20, 40, 60))
+        prompt = format_privileged_prompt(context, mode="distill")
+        self.assertIn("Image 2", prompt)
+        self.assertNotIn("IoU", prompt)
+        self.assertNotIn("<|mt_start|>", prompt)
 
     def test_route_weights(self):
         self.assertAlmostEqual(regenerate_weight(0.4, 0.7), 0.5)

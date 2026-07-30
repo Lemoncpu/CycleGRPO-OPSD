@@ -43,6 +43,7 @@ worker:
     localization_loss_weight: 0.5
     caption_anchor_kl_coef: 0.0
     caption_anchor_kl_all_safe_routes: false
+    segmentation_anchor_kl_coef: 0.0
     pixel_iou:
       enabled: true
       decode_batch_size: 64
