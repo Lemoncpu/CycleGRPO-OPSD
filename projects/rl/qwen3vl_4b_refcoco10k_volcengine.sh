@@ -33,6 +33,7 @@ PRESERVE_ORIGINAL_GRPO="${PRESERVE_ORIGINAL_GRPO:-true}"
 CAPTION_ANCHOR_KL_COEF="${CAPTION_ANCHOR_KL_COEF:-0.05}"
 CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES:-true}"
 SEGMENTATION_ANCHOR_KL_COEF="${SEGMENTATION_ANCHOR_KL_COEF:-0.05}"
+ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-true}"
 JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
@@ -85,6 +86,12 @@ fi
 if [[ ! "${SEGMENTATION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
     || ! awk -v value="${SEGMENTATION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
     echo "SEGMENTATION_ANCHOR_KL_COEF must be a non-negative number: ${SEGMENTATION_ANCHOR_KL_COEF}" >&2
+    exit 1
+fi
+
+if [[ "${ASYMMETRIC_GRADIENT_PROJECTION}" != "true" \
+    && "${ASYMMETRIC_GRADIENT_PROJECTION}" != "false" ]]; then
+    echo "ASYMMETRIC_GRADIENT_PROJECTION must be true or false: ${ASYMMETRIC_GRADIENT_PROJECTION}" >&2
     exit 1
 fi
 
@@ -248,6 +255,7 @@ echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok te
 echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
 echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
+echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADIENT_PROJECTION}"
 echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
@@ -294,6 +302,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.caption_anchor_kl_coef="${CAPTION_ANCHOR_KL_COEF}" \
     worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
     worker.opsd.segmentation_anchor_kl_coef="${SEGMENTATION_ANCHOR_KL_COEF}" \
+    worker.opsd.asymmetric_gradient_projection="${ASYMMETRIC_GRADIENT_PROJECTION}" \
     worker.opsd.pixel_iou.enabled=true \
     worker.opsd.routing.enabled=true \
     worker.opsd.routing.low_threshold=0.5 \

@@ -54,6 +54,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | caption 原始 GRPO | B 入口默认保留 | 所有安全 rollout 都计算原始 CycleGRPO policy loss；low/mid 的 teacher 更新改为附加梯度 |
 | C: caption anchor KL | `0.05`、全部安全 route | 火山引擎入口的稳定化值；独立于 `algorithm.kl_coef=0.01`，只锚定 cycle caption |
 | C2: segmentation anchor KL | `0.05`、全部 cycle localization response | 与通用 KL 分开记录；以 frozen reference 约束 mask-token policy，避免共享 actor 的 caption/teacher 更新快速破坏 text-to-mask |
+| C2: 非对称梯度投影 | 开启 | caption 梯度若与 localization 梯度冲突，只投影 caption 分量；保持一个 actor 和所有原始 cycle loss |
 | C: JSD 特殊词表屏蔽 | 开启 | teacher/student JSD 同时禁止 `mt_*` 和 `object_ref_*` token |
 | teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
@@ -265,7 +266,7 @@ low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，
 
 mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：原图全景、由 GT mask 隔离出的目标 crop、以及由代表性 localization reconstruction 隔离出的 crop；并根据 student caption 进行同轨迹 teacher forcing。两个 crop 使用同一 GT/reconstruction union box、外扩 15%、mask 外中性灰填充，并在送入 processor 前各自限制为最多 `512x512` 等效像素，避免三图使 teacher FSDP 的视觉 token 峰值失控。GT/reconstruction mask 仍是 privileged evidence，但 teacher prompt 不再写 raw mask token、IoU 向量、面积/中心、相对位置或差异摘要，避免这些几何文本诱导全图定位语言。两者以 `beta=0.5` generalized JSD、归一化的 `exp(-H_teacher)` teacher 置信度和 `clamp((0.85-R_Ci)/0.35,0.1,1)` 样本权重更新。C 的第一部分在每个 JSD chunk 的 teacher/student softmax 前将 tokenizer 词表中所有 `<|mt_start|>`、`<|mt_####|>`、`<|mt_end|>` 和 `<|object_ref_*|>` logit 置为不可选，因此这些分割结构没有概率质量、JSD 梯度也不会把它们泄漏到 caption。student 原始 GRPO target 与 localization rollout 不变。为控制 Qwen3-VL 大词表的峰值显存，`workers/opsd/distillation.py` 继续按 response token 块计算 teacher 熵、token score 和 JSD；每块的 student JSD softmax/probability 中间量使用 activation checkpoint 在反向时重算。
 
-C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。主日志记录 `opsd/caption_anchor_kl_active_{count,rate}`、`opsd/segmentation_anchor_kl_active_{count,rate}`、`cap_actor/caption_anchor_kl_loss`、`seg_actor/segmentation_anchor_kl_loss` 及 `opsd/distill_blocked_vocab_size`。JSD 屏蔽实现使用 float32 的有限最小 logit，而不是 `-inf`：softmax 中这些 token 仍精确下溢为零概率和零 student gradient，但 entropy/JSD 的 `p * log(p)` 不会出现 `0 * -inf`。JSD loss/metrics 与 actor gradient norm 任一非有限时现在立即抛错，禁止产生仅推进 global step 的无效 checkpoint。
+C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。为避免 teacher/caption 梯度抵消同一 actor 的 localization 更新，`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。主日志记录 `opsd/caption_anchor_kl_active_{count,rate}`、`opsd/segmentation_anchor_kl_active_{count,rate}`、`opsd/caption_seg_grad_cosine`、`opsd/caption_seg_gradient_conflict_rate`、`opsd/caption_grad_norm`、`opsd/segmentation_grad_norm`、`cap_actor/caption_anchor_kl_loss`、`seg_actor/segmentation_anchor_kl_loss` 及 `opsd/distill_blocked_vocab_size`。JSD 屏蔽实现使用 float32 的有限最小 logit，而不是 `-inf`：softmax 中这些 token 仍精确下溢为零概率和零 student gradient，但 entropy/JSD 的 `p * log(p)` 不会出现 `0 * -inf`。JSD loss/metrics 与 actor gradient norm 任一非有限时现在立即抛错，禁止产生仅推进 global step 的无效 checkpoint。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -461,7 +462,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 18. **FSDP checkpoint 不是可直接评测的 HF 模型。** `actor/huggingface/` 仅保存 config/generation config/processor；必须使用与保存 world size 相同的 export-only FSDP worker 恢复 shard 后导出。不要把原 cold-start `MODEL_PATH` 当作训练后模型传给评测脚本。
 19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对原始 GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
 20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
-21. **C 当前同时处理 special-token 支持集、reference anchor 和 teacher 特权信息形态。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 还以单独的 segmentation anchor KL 约束全部 cycle localization response；该项与全局 KL 相加，系数需通过 10-step RefCOCO/GroundingSuite 消融验证。该实现增加 teacher 多图计算，但不改变 student 的原始 GRPO target 或 localization rollout。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
+21. **C 当前同时处理 special-token 支持集、reference anchor、teacher 特权信息形态和共享梯度冲突。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 以 segmentation anchor KL 约束全部 cycle localization response，并可用非对称梯度投影移除 caption-side gradient 中与 localization gradient 冲突的分量；两者都不把 `seg_answer` 作为 student CE target，保持单 actor 的 cycle-only 训练信号。投影会额外保留一份本 rank 的 caption gradient，因此增加约一个 FSDP gradient shard 的显存；系数和冲突率必须通过 10-step RefCOCO/GroundingSuite 消融验证。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -485,6 +486,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-07-30 - C2 非对称投影保护 localization 梯度
+
+- 代码：修改 `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`verl/workers/opsd/config.py`、`verl/trainer/ray_trainer.py`、`verl/workers/fsdp_workers.py` 与 `tests/test_opsd_core.py`。
+- 文档：更新第 2.2、3.6、6 节。
+- 行为：新增 `worker.opsd.asymmetric_gradient_projection`，通用 YAML 默认关闭、火山引擎入口默认开启。启用后，FSDP worker 在单次 optimizer step 前保存 caption GRPO/regenerate/JSD/anchor 梯度并清零，再计算 localization 梯度；全 rank all-reduce 得到 gradient dot product。仅当内积为负时，从 caption gradient 中投影掉其反向 localization 分量，segmentation gradient 保持原样，随后相加并沿用原 optimizer/clip/EMA 路径。没有 GT `seg_answer` CE，单 actor 闭环训练与原 reward 保持不变。新增 cosine、冲突率及两个未投影梯度范数日志。
+- 验证：配置开关单测、修改模块语法检查、shell 语法检查和 `git diff --check`；本机没有 PyTorch，OPSD 单测和 8-GPU FSDP smoke training 须在服务器执行，并确认 projection 指标有限且没有梯度 NaN。
 
 ### 2026-07-30 - 为 C2 增加独立 segmentation anchor KL
 

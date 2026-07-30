@@ -1697,67 +1697,95 @@ class RayPPOTrainer:
                                 cap_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(cap_batch)
                                 actor_metrics.update({f"cap_{k}": v for k, v in reduce_metrics(cap_output.non_tensor_batch).items()})
                             
-                            # Step 2: Accumulate gradients from segmentation batch
+                            def accumulate_caption_auxiliary_gradients() -> None:
+                                if regenerate_batch is not None and len(regenerate_batch) > 0:
+                                    regen_count = len(regenerate_batch)
+                                    regen_batch, regen_pad = pad_dataproto_to_divisor(
+                                        regenerate_batch,
+                                        self.actor_rollout_ref_wg.world_size
+                                        * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                    )
+                                    if regen_pad:
+                                        regen_batch.batch["sample_weight"][-regen_pad:] = 0.0
+                                    self._balance_batch(regen_batch, metrics=metrics, logging_prefix="regen_seqlen")
+                                    regen_batch.meta_info["global_token_num"] = torch.sum(
+                                        regen_batch.batch["attention_mask"], dim=-1
+                                    ).tolist()
+                                    regen_batch.meta_info["grad_weight"] = (
+                                        self.config.worker.opsd.caption_loss_weight
+                                        * regen_count
+                                        / max(len(cycle_batch), 1)
+                                    )
+                                    regen_output = self.actor_rollout_ref_wg.accumulate_supervised_gradients(
+                                        regen_batch
+                                    )
+                                    actor_metrics.update(
+                                        {
+                                            f"regen_{key}": value
+                                            for key, value in reduce_metrics(
+                                                regen_output.non_tensor_batch
+                                            ).items()
+                                        }
+                                    )
+
+                                if distillation_batch is not None and len(distillation_batch) > 0:
+                                    distill_count = len(distillation_batch)
+                                    distill_batch, distill_pad = pad_dataproto_to_divisor(
+                                        distillation_batch,
+                                        self.actor_rollout_ref_wg.world_size
+                                        * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                    )
+                                    if distill_pad:
+                                        distill_batch.batch["distill_weight"][-distill_pad:] = 0.0
+                                    self._balance_batch(
+                                        distill_batch, metrics=metrics, logging_prefix="distill_seqlen"
+                                    )
+                                    distill_batch.meta_info["global_token_num"] = torch.sum(
+                                        distill_batch.batch["attention_mask"], dim=-1
+                                    ).tolist()
+                                    distill_batch.meta_info["grad_weight"] = (
+                                        self.config.worker.opsd.caption_loss_weight
+                                        * distill_count
+                                        / max(len(cycle_batch), 1)
+                                    )
+                                    distill_output = self.actor_rollout_ref_wg.accumulate_distillation_gradients(
+                                        distill_batch
+                                    )
+                                    actor_metrics.update(
+                                        {
+                                            f"distill_{key}": value
+                                            for key, value in reduce_metrics(
+                                                distill_output.non_tensor_batch
+                                            ).items()
+                                        }
+                                    )
+
+                            projection_enabled = bool(
+                                self.config.worker.opsd.asymmetric_gradient_projection
+                                and cap_batch_size > 0
+                                and seg_batch_size > 0
+                            )
+                            if projection_enabled:
+                                # Keep every caption-side loss separate before taking segmentation gradients.
+                                accumulate_caption_auxiliary_gradients()
+                                stash_output = self.actor_rollout_ref_wg.stash_actor_caption_gradients()
+                                if stash_output and hasattr(stash_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(reduce_metrics(stash_output[0].non_tensor_batch))
+
+                            # Step 2: Accumulate gradients from the localization batch.
                             if seg_batch is not None and seg_batch_size > 0:
                                 seg_batch.meta_info['grad_weight'] = seg_grad_weight
                                 seg_batch.meta_info['global_batch_size_per_device'] = len(seg_batch) // self.actor_rollout_ref_wg.world_size
                                 seg_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(seg_batch)
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
 
-                            if regenerate_batch is not None and len(regenerate_batch) > 0:
-                                regen_count = len(regenerate_batch)
-                                regenerate_batch, regen_pad = pad_dataproto_to_divisor(
-                                    regenerate_batch,
-                                    self.actor_rollout_ref_wg.world_size
-                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
-                                )
-                                if regen_pad:
-                                    regenerate_batch.batch["sample_weight"][-regen_pad:] = 0.0
-                                self._balance_batch(regenerate_batch, metrics=metrics, logging_prefix="regen_seqlen")
-                                regenerate_batch.meta_info["global_token_num"] = torch.sum(
-                                    regenerate_batch.batch["attention_mask"], dim=-1
-                                ).tolist()
-                                regenerate_batch.meta_info["grad_weight"] = (
-                                    self.config.worker.opsd.caption_loss_weight
-                                    * regen_count
-                                    / max(len(cycle_batch), 1)
-                                )
-                                regen_output = self.actor_rollout_ref_wg.accumulate_supervised_gradients(
-                                    regenerate_batch
-                                )
-                                actor_metrics.update(
-                                    {f"regen_{k}": v for k, v in reduce_metrics(regen_output.non_tensor_batch).items()}
-                                )
-
-                            if distillation_batch is not None and len(distillation_batch) > 0:
-                                distill_count = len(distillation_batch)
-                                distillation_batch, distill_pad = pad_dataproto_to_divisor(
-                                    distillation_batch,
-                                    self.actor_rollout_ref_wg.world_size
-                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
-                                )
-                                if distill_pad:
-                                    distillation_batch.batch["distill_weight"][-distill_pad:] = 0.0
-                                self._balance_batch(
-                                    distillation_batch, metrics=metrics, logging_prefix="distill_seqlen"
-                                )
-                                distillation_batch.meta_info["global_token_num"] = torch.sum(
-                                    distillation_batch.batch["attention_mask"], dim=-1
-                                ).tolist()
-                                distillation_batch.meta_info["grad_weight"] = (
-                                    self.config.worker.opsd.caption_loss_weight
-                                    * distill_count
-                                    / max(len(cycle_batch), 1)
-                                )
-                                distill_output = self.actor_rollout_ref_wg.accumulate_distillation_gradients(
-                                    distillation_batch
-                                )
-                                actor_metrics.update(
-                                    {
-                                        f"distill_{k}": v
-                                        for k, v in reduce_metrics(distill_output.non_tensor_batch).items()
-                                    }
-                                )
+                            if not projection_enabled:
+                                # Preserve the historical accumulation order when projection is disabled.
+                                accumulate_caption_auxiliary_gradients()
+                            else:
+                                projection_output = self.actor_rollout_ref_wg.merge_asymmetric_actor_gradients()
+                                if projection_output and hasattr(projection_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(reduce_metrics(projection_output[0].non_tensor_batch))
                             
                             # Step 3: Perform optimizer step with accumulated gradients
                             opt_output = self.actor_rollout_ref_wg.step_actor_optimizer()

@@ -1249,6 +1249,102 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stash_actor_caption_gradients(self):
+        """Save caption-side FSDP gradients and clear them before segmentation backward."""
+        assert self._has_actor
+        if getattr(self, "_opsd_caption_gradients", None) is not None:
+            raise RuntimeError("Caption gradients are already stashed for asymmetric projection.")
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        params = list(self.fsdp_module.parameters())
+        caption_gradients = [
+            None if parameter.grad is None else parameter.grad.detach().clone()
+            for parameter in params
+        ]
+        self._opsd_caption_gradients = caption_gradients
+
+        local_caption_norm_sq = torch.zeros((), device=torch.cuda.current_device(), dtype=torch.float32)
+        for gradient in caption_gradients:
+            if gradient is not None:
+                local_caption_norm_sq.add_(gradient.float().square().sum())
+        dist.all_reduce(local_caption_norm_sq, op=dist.ReduceOp.SUM)
+
+        for parameter in params:
+            parameter.grad = None
+
+        output = DataProto(
+            non_tensor_batch={
+                "opsd/caption_grad_norm": np.array([local_caption_norm_sq.sqrt().item()])
+            }
+        )
+        return output.to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def merge_asymmetric_actor_gradients(self):
+        """Project only caption gradient components that oppose the segmentation gradient."""
+        assert self._has_actor
+        caption_gradients = getattr(self, "_opsd_caption_gradients", None)
+        if caption_gradients is None:
+            raise RuntimeError("Caption gradients must be stashed before asymmetric projection.")
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        params = list(self.fsdp_module.parameters())
+        if len(params) != len(caption_gradients):
+            raise RuntimeError("Actor parameter layout changed while caption gradients were stashed.")
+
+        stats = torch.zeros(3, device=torch.cuda.current_device(), dtype=torch.float32)
+        for parameter, caption_gradient in zip(params, caption_gradients, strict=True):
+            segmentation_gradient = parameter.grad
+            if caption_gradient is not None:
+                stats[0].add_(caption_gradient.float().square().sum())
+            if segmentation_gradient is not None:
+                stats[1].add_(segmentation_gradient.float().square().sum())
+            if caption_gradient is not None and segmentation_gradient is not None:
+                stats[2].add_((caption_gradient.float() * segmentation_gradient.float()).sum())
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        if not torch.isfinite(stats).all():
+            self._opsd_caption_gradients = None
+            raise FloatingPointError("Non-finite caption/segmentation gradient statistics before projection.")
+
+        caption_norm_sq, segmentation_norm_sq, dot_product = stats.unbind()
+        denominator = torch.sqrt(caption_norm_sq * segmentation_norm_sq).clamp_min(1e-12)
+        cosine = dot_product / denominator
+        conflict = bool((dot_product < 0).item() and (segmentation_norm_sq > 0).item())
+        projection_scale = dot_product / segmentation_norm_sq.clamp_min(1e-12) if conflict else None
+
+        for parameter, caption_gradient in zip(params, caption_gradients, strict=True):
+            segmentation_gradient = parameter.grad
+            if caption_gradient is None:
+                continue
+            projected_caption_gradient = caption_gradient
+            if conflict and segmentation_gradient is not None:
+                projected_caption_gradient = (
+                    caption_gradient.float() - projection_scale * segmentation_gradient.float()
+                ).to(dtype=caption_gradient.dtype)
+            if segmentation_gradient is None:
+                parameter.grad = projected_caption_gradient
+            else:
+                segmentation_gradient.add_(projected_caption_gradient.to(dtype=segmentation_gradient.dtype))
+
+        self._opsd_caption_gradients = None
+        output = DataProto(
+            non_tensor_batch={
+                "opsd/caption_seg_grad_cosine": np.array([cosine.item()]),
+                "opsd/caption_seg_gradient_conflict_rate": np.array([float(conflict)]),
+                "opsd/segmentation_grad_norm": np.array([segmentation_norm_sq.sqrt().item()]),
+            }
+        )
+        return output.to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def step_actor_optimizer(self):
         """Perform optimizer step after gradient accumulation."""
         assert self._has_actor

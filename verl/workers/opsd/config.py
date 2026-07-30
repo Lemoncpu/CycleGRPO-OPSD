@@ -123,6 +123,7 @@ class OPSDConfig:
     caption_anchor_kl_coef: float = 0.0
     caption_anchor_kl_all_safe_routes: bool = False
     segmentation_anchor_kl_coef: float = 0.0
+    asymmetric_gradient_projection: bool = False
     pixel_iou: PixelIoUConfig = field(default_factory=PixelIoUConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     caption_safety: CaptionSafetyConfig = field(default_factory=CaptionSafetyConfig)

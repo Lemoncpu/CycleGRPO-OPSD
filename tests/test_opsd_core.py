@@ -35,6 +35,8 @@ class OPSDCoreTest(unittest.TestCase):
     def test_anchor_kl_coefficients_must_be_non_negative(self):
         config = OPSDConfig(caption_anchor_kl_coef=0.05, segmentation_anchor_kl_coef=0.05)
         config.post_init()
+        self.assertFalse(config.asymmetric_gradient_projection)
+        self.assertTrue(OPSDConfig(asymmetric_gradient_projection=True).asymmetric_gradient_projection)
         with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
             OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
 

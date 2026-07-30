@@ -44,6 +44,7 @@ worker:
     caption_anchor_kl_coef: 0.0
     caption_anchor_kl_all_safe_routes: false
     segmentation_anchor_kl_coef: 0.0
+    asymmetric_gradient_projection: false
     pixel_iou:
       enabled: true
       decode_batch_size: 64
