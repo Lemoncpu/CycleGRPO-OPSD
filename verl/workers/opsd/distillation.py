@@ -37,7 +37,13 @@ def _masked_log_softmax(
             (blocked_token_ids >= 0) & (blocked_token_ids < scaled_logits.size(-1))
         ]
         if valid_ids.numel() > 0:
-            scaled_logits = scaled_logits.index_fill(-1, valid_ids, -torch.inf)
+            # Do not use -inf here.  Downstream entropy/JSD terms multiply a
+            # probability by its log-probability, and 0 * -inf is NaN.  The
+            # finite fp32 floor still underflows to zero in softmax, while
+            # preserving finite log-probabilities for every vocab entry.
+            scaled_logits = scaled_logits.index_fill(
+                -1, valid_ids, torch.finfo(scaled_logits.dtype).min
+            )
     return torch.log_softmax(scaled_logits, dim=-1)
 
 
@@ -176,4 +182,12 @@ def chunked_weighted_jsd_loss(
             dtype=torch.float32,
         ),
     }
+    if not torch.isfinite(loss_numerator):
+        raise FloatingPointError(
+            "OPSD generalized-JSD loss is non-finite. Check teacher/student logits, "
+            "the response mask, and the privileged vocabulary mask."
+        )
+    for name, value in metrics.items():
+        if not torch.isfinite(value):
+            raise FloatingPointError(f"OPSD generalized-JSD metric {name} is non-finite.")
     return loss_numerator, metrics

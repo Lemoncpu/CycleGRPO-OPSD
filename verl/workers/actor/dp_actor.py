@@ -161,10 +161,13 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.max_grad_norm)
 
         if not torch.isfinite(grad_norm):
-            print("Gradient norm is not finite. Skip update.")
-        else:
-            self.actor_optimizer.step()
+            self.actor_optimizer.zero_grad()
+            raise FloatingPointError(
+                "Actor gradient norm is non-finite; aborting the optimizer step "
+                "instead of silently continuing training."
+            )
 
+        self.actor_optimizer.step()
         self.actor_optimizer.zero_grad()
         return grad_norm
 

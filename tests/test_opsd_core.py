@@ -219,7 +219,11 @@ class OPSDCoreTest(unittest.TestCase):
             teacher_logits,
             **common_kwargs,
         )
+        self.assertTrue(torch.isfinite(baseline_loss))
+        self.assertTrue(torch.isfinite(baseline_metrics["teacher_entropy"]))
+        self.assertTrue(torch.isfinite(baseline_metrics["local_loss"]))
         baseline_loss.backward()
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
         self.assertTrue(torch.equal(student_logits.grad[..., blocked_ids], torch.zeros_like(student_logits.grad[..., blocked_ids])))
         self.assertEqual(baseline_metrics["blocked_vocab_size"].item(), 2.0)
 
@@ -231,6 +235,15 @@ class OPSDCoreTest(unittest.TestCase):
             changed_student,
             changed_teacher,
             **common_kwargs,
+        )
+        self.assertTrue(torch.isfinite(changed_loss))
+        changed_loss.backward()
+        self.assertTrue(torch.isfinite(changed_student.grad).all())
+        self.assertTrue(
+            torch.equal(
+                changed_student.grad[..., blocked_ids],
+                torch.zeros_like(changed_student.grad[..., blocked_ids]),
+            )
         )
         self.assertTrue(torch.allclose(changed_loss, baseline_loss.detach(), atol=1e-6, rtol=1e-6))
 
