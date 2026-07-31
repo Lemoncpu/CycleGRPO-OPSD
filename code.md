@@ -90,6 +90,10 @@ caption 剩余 IoU 差距的比例 `>=0.30` 与原有绝对改善 `>=0.05`，才
 caption 的 `R_Ci>=0.65` 时才加入 privileged JSD。低置信辅助样本仍保留其原始 GRPO，全部 localization
 rollout 仍保留 CycleGRPO，因此这是 teacher auxiliary-loss 的样本选择消融，不是直接 RefCOCO CE 或
 移除闭环训练。
+入口的 `OPSD_ENABLED=false` 是原始 HTG 纯 CycleGRPO 对照：不会构建/调用 pixel mask decoder 或任何
+teacher routing、anchor KL、CE/JSD 辅助项；localization rollout 保留 FSDP worker 中的二级 mask-token
+grading（完整匹配 `1.0`、两个 code 匹配 `0.8`、首 code 匹配 `0.4`、否则 `0.0`）。这与
+`OPSD_ENABLED=true` 的真实 pixel-IoU 路径是互斥的，不能将两者的 `R_Ci` 数值或 `0.5/0.85` 阈值直接比较。
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
 离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
@@ -499,6 +503,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 1、2.2、3.6 节。
 - 行为：新增 `worker.opsd.teacher_confidence`。通用 YAML 默认关闭以保持历史 all-low/mid 辅助更新，火山引擎入口默认开启。开启时，regenerate 候选在原有安全和绝对 IoU 改善 `>=0.05` 之后，还要求 greedy 验证的 teacher `R_Ci>=0.65` 且归一化改善 `>=0.30`，才形成 CE target；mid route 的 privileged JSD 仅保留原 caption `R_Ci>=0.65` 的候选。全部安全 caption 原始 GRPO 与所有 localization GRPO 保持不变，因此未增加 GT `seg_answer` CE、没有脱离单 actor 的循环训练范式。新增 regenerate 验证/高置信候选数、接受率，以及 distillation 路由/高置信数和 score 均值日志。实测 gradient cosine 接近零后，入口默认关闭但保留可选非对称梯度投影。
 - 验证：执行 `python3 -m py_compile verl/workers/opsd/config.py verl/trainer/ray_trainer.py tests/test_opsd_core.py`、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`，均通过；本机无 `PyYAML`，未执行 YAML 运行时加载，随后 OPSD 单测须使用服务器的训练环境运行。
+
+### 2026-07-31 - 使火山引擎入口可运行原始 HTG 纯 CycleGRPO 对照
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节。
+- 行为：新增 `OPSD_ENABLED`，默认 `true` 保持真实 pixel-IoU OPSD 路径。显式设为 `false` 时，入口将 `worker.opsd.enabled=false` 传给 trainer；不创建 pixel decoder、EMA teacher 或 teacher auxiliary update，训练使用历史 FSDP `mask_token_accuracy` 的 HTG score 和纯 CycleGRPO。其余数据、模型、batch、rollout、学习率、冻结 vision tower 与 checkpoint 周期不变，适合作为“仅改变 reward representation”的 10-step 对照。
+- 验证：执行 shell 语法检查与 `git diff --check`；本机没有 Ray/FSDP/vLLM、CUDA 或服务器数据，未执行 8-GPU training smoke test。
 
 ### 2026-07-30 - C2 非对称投影保护 localization 梯度
 

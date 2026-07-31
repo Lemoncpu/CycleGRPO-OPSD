@@ -15,6 +15,7 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-128}"
 ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-128}"
 CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
+OPSD_ENABLED="${OPSD_ENABLED:-true}"
 # Caption rollouts should be short natural descriptions. This cap also bounds
 # the OPSD safety gate before any caption PPO or JSD update.
 CAPTION_MAX_RESPONSE_LENGTH="${CAPTION_MAX_RESPONSE_LENGTH:-256}"
@@ -74,6 +75,11 @@ fi
 
 if [[ "${PRESERVE_ORIGINAL_GRPO}" != "true" && "${PRESERVE_ORIGINAL_GRPO}" != "false" ]]; then
     echo "PRESERVE_ORIGINAL_GRPO must be true or false: ${PRESERVE_ORIGINAL_GRPO}" >&2
+    exit 1
+fi
+
+if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
+    echo "OPSD_ENABLED must be true or false: ${OPSD_ENABLED}" >&2
     exit 1
 fi
 
@@ -273,6 +279,7 @@ echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
+echo "OPSD pixel-IoU routing: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
 echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
@@ -317,7 +324,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.rollout.gpu_memory_utilization=0.6 \
     worker.rollout.max_num_batched_tokens=16384 \
     worker.rollout.disable_tqdm=true \
-    worker.opsd.enabled=true \
+    worker.opsd.enabled="${OPSD_ENABLED}" \
     worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
     worker.opsd.caption_loss_weight=0.5 \
     worker.opsd.localization_loss_weight=0.5 \
