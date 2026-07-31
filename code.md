@@ -195,7 +195,7 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target` non-cycle 样本。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -252,7 +252,7 @@ localization:
 
 | `source` | 奖励行为 |
 |---|---|
-| `groundingme` / `denseworld_*` / `refcoco_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
+| `groundingme` / `denseworld_*` / `refcoco_cycle` / `grefcoco_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
 | `gres_no_target` | no-target/null 正确性 + 非重复奖励 |
 | `tg_multi_merged` | 视频循环：tIoU、时间格式、段数门控、禁止 caption 泄漏时间 |
 | `dam_captioning` / `tg_captioning` | 外部 OpenAI-compatible vLLM judge 的布尔 caption reward；仅当 batch 实际包含这些 source 时才初始化 judge client，不是主 CycleGRPO 路径 |
@@ -386,6 +386,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
+- `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
 - `prepare_gres_rl_dataset.py`、`prepare_more_gres_rl_dataset.py`、`prepare_res_rl_dataset.py`、`prepare_reasonseg_rl_dataset.py`：不同 referring segmentation 数据转统一 schema。
@@ -496,6 +497,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-07-31 - 支持 gRefCOCO single/multi/no-target CycleGRPO 训练集
+
+- 代码：新增 `projects/rl/datasets/prepare_grefcoco_cycle_dataset.py`；修改 `verl/trainer/ray_trainer.py`、`verl/workers/reward/function.py` 与 `projects/rl/reward_function/text2mask.py`。
+- 文档：更新第 3.3、3.5、5.2 节的 source 和数据转换契约。
+- 行为：新增 `grefcoco_cycle` 主 cycle source，进入原有 caption-to-localization rollout、真实 pixel-IoU、OPSD route 与 CycleGRPO reward；转换器从 gRefCOCO train 的单实例和多实例正样本构造 union mask、编码 SAMTok token 与原始 RLE。`ann_id=[-1]` 记录不伪造空 mask，而是写为 `gres_no_target`，继续使用现有 no-target reward。转换器按默认 `4.5k single + 4.5k multi + 1k no-target` 输出三个 parquet 和 manifest。gRefCOCO 基于 COCO instance masks，不能提供 GroundingSuite Part 类的真实 part masks，manifest 因而固定记录 `part_instance=0`；需要 Part 覆盖时须额外混入 part-aware 数据。
+- 验证：对新增/修改 Python 源执行无缓存语法编译并运行 `git diff --check`；本机没有 PyTorch、datasets、Hydra、SAMTok 权重、COCO/gRefCOCO 数据或 CUDA，未运行 token 编码与 8-GPU train smoke test。
 
 ### 2026-07-31 - 高置信 cycle-evidence teacher 辅助更新
 
