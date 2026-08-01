@@ -170,8 +170,9 @@ Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做�
 仅保留面积占图像 1% 到 90% 的语义区域。
 
 所有正样本只写入图像、目标 mask、由当前 SAMTok VQ-SAM2 编码出的 `seg_answer` 与从该 mask 构造的
-caption prompt；RefCOCO、gRefCOCO、PACO 与 COCO-Stuff 正样本均不注入任何 referring expression
-或人工 `cap_answer`。gRefCOCO no-target 继续沿用已有 `gres_no_target` schema 与 rejection reward，
+caption prompt；混合器在写出最终 parquet 前统一清除 RefCOCO、gRefCOCO、PACO 与 COCO-Stuff
+正样本继承的 `cap_answer`，因此不注入任何 referring expression 或人工 caption。gRefCOCO
+no-target 继续沿用已有 `gres_no_target` schema 与 rejection reward，
 其表达式是必须被拒识的 query。混合器写入 manifest，固定记录
 输入 parquet、seed、五类数量与最终 source counts；任一来源不足请求数量时 fail-fast。该数据配方是当前
 OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数据或方法公式的一部分。
@@ -546,6 +547,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：修正第 2.4 节正样本数据契约。
 - 行为：gRefCOCO single/multi 正样本现在将 `cap_answer=None`，只保留图像、union target mask、SAMTok mask code 与由 mask 构造的 prompt；`gres_no_target` 保留表达式，因为 null-grounding 的拒识奖励必须有待判断的 query。
 - 验证：执行该转换器的 Python 语法编译与 `git diff --check`；本机未运行服务器侧 VQ-SAM2 编码。
+
+### 2026-08-01 - 在 20k 混合器中清除正样本的继承 caption 标签
+
+- 代码：修改 `projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py`。
+- 文档：修正第 2.4 节最终 parquet 的数据契约。
+- 行为：合并时无条件将四类正样本的 `cap_answer` 置为 `None`，包括旧 RefCOCO/gRefCOCO parquet 中可能遗留的 referring expression；no-target 的表达式仍只存在于 `cap_problem`。因此无需重跑 VQ-SAM2 编码，重新执行合并即可得到图像/mask-only 的 20k 文件。
+- 验证：执行混合器 Python 语法编译与 `git diff --check`；本机没有服务器侧 parquet，未执行最终行数和路径校验。
 
 ### 2026-08-01 - 参数化真实 pixel-IoU 纯 CycleGRPO 对照入口
 
