@@ -153,6 +153,29 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 该数据替代论文报告的 DenseWorld 约 20k 区域数据，属于受控数据替换实验，不能将结果
 直接表述为论文原始数据设置的复现。
 
+### 2.4 GroundingSuite 类型均衡 20k 受控训练数据
+
+`projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py` 将五份已转换的 parquet 固定混合为
+20,000 条图像/mask CycleGRPO 数据：7,000 条 RefCOCO 单实例 (`refcoco_cycle`)、5,000 条
+gRefCOCO 多实例 union mask (`grefcoco_cycle`)、4,000 条 COCO-Stuff 语义区域
+(`cocostuff_cycle`)、2,000 条 PACO-LVIS 真 part mask (`paco_part_cycle`) 和 2,000 条
+gRefCOCO no-target (`gres_no_target`)。这些比例分别为 Single 35%、Multi 25%、Stuff 20%、
+Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做数据分布受控消融。
+
+`prepare_paco_lvis_part_cycle_dataset.py` 只接受 `id != obj_ann_id` 的 PACO annotation，并且每张图
+最多选一个 part，因而不会把 parent object mask 混入 Part 配额或让少数密集标注图主导。PACO-LVIS
+需要其对应的 COCO 2017 图像。`prepare_cocostuff_cycle_dataset.py` 只从官方
+`stuffthingmaps_trainval2017` PNG 的像素值 91..181 选取区域；这些值对应 COCO-Stuff 官方 label id
+92..182，0..90 是 COCO thing、255 是 void，均不进入 Stuff 配额。Stuff 转换按类别频率优先选取，
+仅保留面积占图像 1% 到 90% 的语义区域。
+
+所有正样本只写入图像、目标 mask、由当前 SAMTok VQ-SAM2 编码出的 `seg_answer` 与从该 mask 构造的
+caption prompt；RefCOCO、gRefCOCO、PACO 与 COCO-Stuff 正样本均不注入任何 referring expression
+或人工 `cap_answer`。gRefCOCO no-target 继续沿用已有 `gres_no_target` schema 与 rejection reward，
+其表达式是必须被拒识的 query。混合器写入 manifest，固定记录
+输入 parquet、seed、五类数量与最终 source counts；任一来源不足请求数量时 fail-fast。该数据配方是当前
+OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数据或方法公式的一部分。
+
 ## 3. 主训练调用链
 
 ### 3.1 启动与配置合并
@@ -204,7 +227,7 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target` non-cycle 样本。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target` non-cycle 样本。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -261,7 +284,7 @@ localization:
 
 | `source` | 奖励行为 |
 |---|---|
-| `groundingme` / `denseworld_*` / `refcoco_cycle` / `grefcoco_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
+| `groundingme` / `denseworld_*` / `refcoco_cycle` / `grefcoco_cycle` / `cocostuff_cycle` / `paco_part_cycle` / `dam_cyclegrpo` / `None` | 图像 CycleGRPO 主分支 |
 | `gres_no_target` | no-target/null 正确性 + 非重复奖励 |
 | `tg_multi_merged` | 视频循环：tIoU、时间格式、段数门控、禁止 caption 泄漏时间 |
 | `dam_captioning` / `tg_captioning` | 外部 OpenAI-compatible vLLM judge 的布尔 caption reward；仅当 batch 实际包含这些 source 时才初始化 judge client，不是主 CycleGRPO 路径 |
@@ -396,6 +419,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
 - `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
+- `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask，限制每图一个 part，编码为 `paco_part_cycle` parquet 与 part-category manifest。
+- `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并记录区域面积范围和类别直方图。
+- `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后固定抽取 Single/Multi/Stuff/Part/no-target 的 `7k/5k/4k/2k/2k`，随机打散为一个 20k parquet 和可复现实验 manifest。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
 - `prepare_gres_rl_dataset.py`、`prepare_more_gres_rl_dataset.py`、`prepare_res_rl_dataset.py`、`prepare_reasonseg_rl_dataset.py`：不同 referring segmentation 数据转统一 schema。
@@ -506,6 +532,20 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-08-01 - 增加 GroundingSuite 类型均衡 20k 图像/mask 训练数据
+
+- 代码：新增 `projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py`、`projects/rl/datasets/prepare_cocostuff_cycle_dataset.py` 和 `projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py`；修改 `verl/trainer/ray_trainer.py`、`verl/workers/reward/function.py` 与 `projects/rl/reward_function/text2mask.py`。
+- 文档：新增第 2.4 节，并更新第 3.3、3.5、5.3 节的 source/转换器契约。
+- 行为：新增 PACO-LVIS 真 Part、COCO-Stuff 真 Stuff 以及确定性五路混合器。20k 默认比例为 RefCOCO Single 7k、gRefCOCO Multi 5k、COCO-Stuff 4k、PACO Part 2k、gRefCOCO no-target 2k；新增 `cocostuff_cycle` 与 `paco_part_cycle` 被明确接入 caption/localization cycle batch、pixel-IoU metadata 和 text2mask reward。PACO parent object 与 COCO-Stuff thing/void 像素均被排除。该数据消融只使用图像、目标 mask 和其 SAMTok code，不把 PACO/COCO-Stuff 类别名称、referring expression 或人工 caption 写入正样本 prompt。
+- 验证：执行新增 Python 的无缓存语法编译、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、source 白名单静态检查与 `git diff --check`；本机没有服务器 PACO/COCO-Stuff/gRefCOCO/RefCOCO 数据、CUDA 或 VQ-SAM2 权重，未执行 20k token 编码和 8-GPU smoke training。
+
+### 2026-08-01 - 移除 gRefCOCO 正样本残留的 referring expression
+
+- 代码：修改 `projects/rl/datasets/prepare_grefcoco_cycle_dataset.py`。
+- 文档：修正第 2.4 节正样本数据契约。
+- 行为：gRefCOCO single/multi 正样本现在将 `cap_answer=None`，只保留图像、union target mask、SAMTok mask code 与由 mask 构造的 prompt；`gres_no_target` 保留表达式，因为 null-grounding 的拒识奖励必须有待判断的 query。
+- 验证：执行该转换器的 Python 语法编译与 `git diff --check`；本机未运行服务器侧 VQ-SAM2 编码。
 
 ### 2026-08-01 - 参数化真实 pixel-IoU 纯 CycleGRPO 对照入口
 

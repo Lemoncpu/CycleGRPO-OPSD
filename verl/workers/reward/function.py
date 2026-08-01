@@ -174,7 +174,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     "response_length": cur_response_length,
                     "source": data.non_tensor_batch["source"][i],
                     "task": task,
-                    "iou_scores": data.non_tensor_batch["iou_scores"][i] if data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'tg_multi_merged', 'dam_cyclegrpo', None] else None,
+                    "iou_scores": data.non_tensor_batch["iou_scores"][i] if data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'tg_multi_merged', 'dam_cyclegrpo', None] else None,
                     "mask_token_accuracy": data.non_tensor_batch["mask_token_accuracy"][i] if task == 'segmentation' else None,
                     # "correct_mask": data.non_tensor_batch["correct_mask"][i], 
                     # "image": images[i]['images'][0] if task == 'segmentation' else None,
@@ -198,7 +198,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
             reward_tensor[i, cur_response_length - 1] = score["cap_overall"] if task == 'caption' else score["seg_overall"]
             for key, value in score.items():
                 reward_metrics[key].append(value)
-            if task == 'caption' and data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'tg_multi_merged', 'dam_cyclegrpo', '', None]:
+            if task == 'caption' and data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'tg_multi_merged', 'dam_cyclegrpo', '', None]:
                 reward_metrics['cap_correct_mask'] = data.non_tensor_batch["correct_mask"][i]
 
         return reward_tensor, reward_metrics

@@ -175,7 +175,9 @@ def main() -> None:
             {
                 "images": [str(path.resolve())],
                 "cap_problem": CAPTION_PROMPT.format(mask_token=mask_token),
-                "cap_answer": expression(ref),
+                # Positive cycle records are image-and-mask only. Keeping the
+                # source expression would retain text supervision in the data.
+                "cap_answer": None,
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(binary_mask),

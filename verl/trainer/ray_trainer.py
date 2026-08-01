@@ -569,6 +569,7 @@ class RayPPOTrainer:
 
             DW_SOURCES = [
                 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle',
+                'cocostuff_cycle', 'paco_part_cycle',
                 'tg_multi_merged', 'dam_cyclegrpo', None,
             ]
             new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
