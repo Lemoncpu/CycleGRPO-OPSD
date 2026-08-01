@@ -94,6 +94,15 @@ rollout 仍保留 CycleGRPO，因此这是 teacher auxiliary-loss 的样本选�
 teacher routing、anchor KL、CE/JSD 辅助项；localization rollout 保留 FSDP worker 中的二级 mask-token
 grading（完整匹配 `1.0`、两个 code 匹配 `0.8`、首 code 匹配 `0.4`、否则 `0.0`）。这与
 `OPSD_ENABLED=true` 的真实 pixel-IoU 路径是互斥的，不能将两者的 `R_Ci` 数值或 `0.5/0.85` 阈值直接比较。
+为隔离真实 pixel-IoU 与 teacher 辅助项，入口也接受 `OPSD_ENABLED=true`、`PIXEL_IOU_ENABLED=true`、
+`ROUTING_ENABLED=false`。该组合仍在每个 cycle 生成后完整解码预测/GT mask 并把真实 pixel IoU 写回
+caption 与 localization CycleGRPO reward，但所有 caption route 固定为 `grpo`，不创建 EMA teacher，
+不执行 regenerate CE、privileged JSD 或 teacher diagnosis。用于该对照时还应显式将 caption/segmentation
+anchor KL 设为 `0`、关闭 caption safety，以免保留 C/C2 的额外策略约束；这是一项当前扩展的受控消融，
+不是论文公开 HTG 实现。`CAPTION_SAFETY_ENABLED`、`CAPTION_SAFETY_FORCE_REGENERATE`、
+`EMA_TEACHER_ENABLED` 与 `TEACHER_ANALYSIS_ENABLED` 默认均为 `true`；`PIXEL_IOU_ENABLED` 与
+`ROUTING_ENABLED` 默认跟随 `OPSD_ENABLED`，所以主 C2 与原始 HTG
+启动行为均不变。入口会拒绝没有 pixel IoU 或 EMA teacher 的三路由配置。
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
 离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
@@ -463,7 +472,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 8. **存在大量历史代码。** `*_old.py`、Qwen2.5-VL 联合栈、未调用 reward 分支和注释块不应被当作当前执行路径。
 9. **路径尚未参数化完整。** 主训练、评测和 ETL 都有 `<PATH_TO_*>` 或本地路径，生产运行前必须审计。
 10. **测试覆盖有限。** 多数验证依赖 GPU、checkpoint 和数据集；小改动至少运行语法检查/导入检查，训练路径改动还应做最小单 batch smoke test。
-11. **OPSD dataclass 默认关闭，项目 YAML 显式开启。** 原始 SAMTok 消融设 `worker.opsd.enabled=false`；仅真实 IoU 的 CycleGRPO 设 `opsd.enabled=true`、`routing.enabled=false`、`ema_teacher.enabled=false`；完整版本保持主 YAML 默认。
+11. **OPSD dataclass 默认关闭，项目 YAML 显式开启。** 原始 SAMTok 消融设 `worker.opsd.enabled=false`；仅真实 IoU 的 CycleGRPO 设 `opsd.enabled=true`、`pixel_iou.enabled=true`、`routing.enabled=false`、`ema_teacher.enabled=false`，并将 C/C2 anchor KL 与 caption safety 关闭；完整版本保持主 YAML 默认。
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度；完整词表 JSD 以 response-token chunk 加 checkpoint 计算，`distillation.token_chunk_size` 只在 CUDA 峰值显存与 softmax 重算时间间取舍。其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 teacher shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。`decay=1.0` 时这个 shard 是启动时的 SAMTok teacher；不能用旧 EMA 实验的 checkpoint 启动新的固定-teacher 消融。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
@@ -497,6 +506,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-08-01 - 参数化真实 pixel-IoU 纯 CycleGRPO 对照入口
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 与第 6 节的 HTG/真实 pixel-IoU 消融边界。
+- 行为：入口新增 `PIXEL_IOU_ENABLED`、`ROUTING_ENABLED`、caption safety、EMA teacher 与 teacher analysis 的环境变量，默认均保持现有 C2 主路径。设置 `OPSD_ENABLED=true`、`PIXEL_IOU_ENABLED=true`、`ROUTING_ENABLED=false` 可保留训练时 SAMTok 解码像素 IoU，同时使全部 cycle caption 回到原始 GRPO，跳过 teacher 创建、regenerate CE、privileged JSD 和诊断；入口拒绝无 pixel-IoU/EMA teacher 的三路由组合。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`；本机没有服务器 Ray/FSDP/vLLM、CUDA、模型或数据，未执行 8-GPU smoke training。
 
 ### 2026-07-31 - 支持 gRefCOCO single/multi/no-target CycleGRPO 训练集
 

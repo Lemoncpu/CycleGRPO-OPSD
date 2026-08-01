@@ -16,6 +16,12 @@ ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-128}"
 CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
+PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
+ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
+CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
+CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
+EMA_TEACHER_ENABLED="${EMA_TEACHER_ENABLED:-true}"
+TEACHER_ANALYSIS_ENABLED="${TEACHER_ANALYSIS_ENABLED:-true}"
 # Caption rollouts should be short natural descriptions. This cap also bounds
 # the OPSD safety gate before any caption PPO or JSD update.
 CAPTION_MAX_RESPONSE_LENGTH="${CAPTION_MAX_RESPONSE_LENGTH:-256}"
@@ -80,6 +86,35 @@ fi
 
 if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
     echo "OPSD_ENABLED must be true or false: ${OPSD_ENABLED}" >&2
+    exit 1
+fi
+
+for bool_name in \
+    PIXEL_IOU_ENABLED \
+    ROUTING_ENABLED \
+    CAPTION_SAFETY_ENABLED \
+    CAPTION_SAFETY_FORCE_REGENERATE \
+    EMA_TEACHER_ENABLED \
+    TEACHER_ANALYSIS_ENABLED; do
+    bool_value="${!bool_name}"
+    if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
+        echo "${bool_name} must be true or false: ${bool_value}" >&2
+        exit 1
+    fi
+done
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${OPSD_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires OPSD_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${PIXEL_IOU_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires PIXEL_IOU_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${EMA_TEACHER_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires EMA_TEACHER_ENABLED=true." >&2
     exit 1
 fi
 
@@ -279,7 +314,10 @@ echo "Repository: ${REPO_DIR}"
 echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
-echo "OPSD pixel-IoU routing: ${OPSD_ENABLED} (false uses original HTG token grading)"
+echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
+echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
+echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
+echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
 echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
 echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
@@ -336,18 +374,18 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.teacher_confidence.regenerate_min_teacher_score="${REGENERATE_MIN_TEACHER_SCORE}" \
     worker.opsd.teacher_confidence.regenerate_min_normalized_improvement="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}" \
     worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
-    worker.opsd.pixel_iou.enabled=true \
-    worker.opsd.routing.enabled=true \
+    worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
+    worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
     worker.opsd.routing.preserve_original_grpo="${PRESERVE_ORIGINAL_GRPO}" \
-    worker.opsd.caption_safety.enabled=true \
+    worker.opsd.caption_safety.enabled="${CAPTION_SAFETY_ENABLED}" \
     worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
-    worker.opsd.caption_safety.force_regenerate=true \
+    worker.opsd.caption_safety.force_regenerate="${CAPTION_SAFETY_FORCE_REGENERATE}" \
     worker.opsd.distillation.block_caption_special_token_vocab="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" \
-    worker.opsd.ema_teacher.enabled=true \
+    worker.opsd.ema_teacher.enabled="${EMA_TEACHER_ENABLED}" \
     worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
-    worker.opsd.teacher_analysis.enabled=true \
+    worker.opsd.teacher_analysis.enabled="${TEACHER_ANALYSIS_ENABLED}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \
