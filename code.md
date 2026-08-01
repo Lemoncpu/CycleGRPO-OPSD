@@ -65,7 +65,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
-| 验证 | checkpoint 后离线 RefCOCO | 入口每 5 step 保存 checkpoint，`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
+| 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
 | 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
@@ -554,6 +554,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：修正第 2.4 节最终 parquet 的数据契约。
 - 行为：合并时无条件将四类正样本的 `cap_answer` 置为 `None`，包括旧 RefCOCO/gRefCOCO parquet 中可能遗留的 referring expression；no-target 的表达式仍只存在于 `cap_problem`。因此无需重跑 VQ-SAM2 编码，重新执行合并即可得到图像/mask-only 的 20k 文件。
 - 验证：执行混合器 Python 语法编译与 `git diff --check`；本机没有服务器侧 parquet，未执行最终行数和路径校验。
+
+### 2026-08-01 - 参数化训练 checkpoint 保留数量
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节 checkpoint 保存配置。
+- 行为：入口新增正整数环境变量 `SAVE_LIMIT`，默认保持既有的 20；传入 `SAVE_LIMIT=2` 时，训练仍按 `SAVE_FREQ` 创建 checkpoint，但 trainer 只保留最新两个，以控制持久磁盘占用。
+- 验证：执行 shell 语法检查与 `git diff --check`；未在服务器执行 FSDP checkpoint 轮转。
 
 ### 2026-08-01 - 参数化真实 pixel-IoU 纯 CycleGRPO 对照入口
 

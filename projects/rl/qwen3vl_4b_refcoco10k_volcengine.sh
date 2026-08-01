@@ -49,6 +49,7 @@ REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
 REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
 DISTILL_MIN_CAPTION_SCORE="${DISTILL_MIN_CAPTION_SCORE:-0.65}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
+SAVE_LIMIT="${SAVE_LIMIT:-20}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
 # continuing a checkpoint produced by this same frozen-teacher experiment.
 RESUME="${RESUME:-false}"
@@ -165,6 +166,11 @@ done
 
 if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
+    exit 1
+fi
+
+if [[ ! "${SAVE_LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAVE_LIMIT must be a positive integer: ${SAVE_LIMIT}" >&2
     exit 1
 fi
 
@@ -328,6 +334,7 @@ echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
+echo "Checkpoint retention limit: ${SAVE_LIMIT}"
 echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
 echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
 echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
@@ -397,7 +404,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     trainer.val_freq=-1 \
     trainer.val_before_train=false \
     trainer.save_freq="${SAVE_FREQ}" \
-    trainer.save_limit=20 \
+    trainer.save_limit="${SAVE_LIMIT}" \
     trainer.save_checkpoint_path="${CHECKPOINT_DIR}" \
     trainer.find_last_checkpoint="${RESUME}" \
     'trainer.logger=["file","wandb"]'
