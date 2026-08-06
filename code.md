@@ -117,6 +117,9 @@ Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
 只固定当前服务器的数据与运行环境。
 
+入口以 `set -u` 运行时，未设置或显式清空 `MAX_STEPS` 不会向 Hydra 传入空位置参数；仅在该变量为正整数时
+才附加 `trainer.max_steps=<value>`。因此完整 epoch 与分段运行共用同一入口，不需要为完整 epoch 人为设置步数。
+
 火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。训练 checkpoint 中的
 `actor/model_world_size_8_rank_*.pt` 是 FSDP shard，`actor/huggingface/` 只包含配置和
 processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑只加载 actor model shard 并导出
@@ -535,6 +538,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-08-06 - 修复未设置 MAX_STEPS 时的训练入口启动失败
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节训练入口的 `MAX_STEPS` 行为。
+- 行为：在 `set -u` 下安全展开可选的 `TRAINER_MAX_STEPS_ARG` 数组；`MAX_STEPS` 为空时不再触发 unbound variable，且不会把空参数传给 Hydra。设置正整数时仍传入相同的 `trainer.max_steps` 覆盖。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`，并用最小 Bash `set -u` 测试覆盖空数组和设置数组两种展开结果；未在本机运行 GPU/Ray/FSDP 训练。
 
 ### 2026-08-06 - 参数化 GroundingSuite 20k 数据混合配额
 

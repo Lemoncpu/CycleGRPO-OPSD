@@ -398,7 +398,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     trainer.project_name=cyclegrpo \
     trainer.experiment_name="${RUN_NAME}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
-    "${TRAINER_MAX_STEPS_ARG[@]}" \
+    "${TRAINER_MAX_STEPS_ARG[@]+"${TRAINER_MAX_STEPS_ARG[@]}"}" \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node="${NUM_GPUS}" \
     trainer.val_freq=-1 \
