@@ -66,7 +66,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
-| 日志 | file + wandb | shell 强制 `WANDB_MODE=offline` |
+| 日志 | file + wandb | shell 强制 `WANDB_MODE=offline`；可设 `TRAINER_LOGGERS='["file"]'`，不需要安装 W&B |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
 环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。当前默认输出根为
@@ -111,7 +111,7 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
-`/tmp/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
+`/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
 符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
@@ -550,8 +550,15 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
 - 文档：更新第 2.2 节 Ray 临时目录约束。
-- 行为：`RAY_SHORT_ROOT` 不再限定在 `/tmp`，接受长度不超过 32 的绝对、非符号链接目录；默认值仍为 `/tmp/cgrpo-ray-<uid>`。根分区空间不足时可显式设为本地数据盘短路径（如 `/data5/ray-<uid>`），仍保留 95% 文件系统使用率检查以符合 Ray object spill 的要求。
+- 行为：`RAY_SHORT_ROOT` 不再限定在 `/tmp`，接受长度不超过 32 的绝对、非符号链接目录；默认值改为 `/dev/shm/cgrpo-ray-<uid>`。根分区空间不足时也可显式设为本地数据盘短路径（如 `/data5/ray-<uid>`），仍保留 95% 文件系统使用率检查以符合 Ray object spill 的要求。
 - 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`；未在本机运行 Ray。
+
+### 2026-08-06 - 支持没有 W&B 的 file-only 训练日志
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节日志配置。
+- 行为：入口新增 `TRAINER_LOGGERS` 环境变量，默认仍为 `['file','wandb']`。设置 `TRAINER_LOGGERS='["file"]'` 后仅创建 checkpoint 目录中的 JSONL 与 generation 文件，不导入或调用 W&B，适用于未安装 `wandb` 的离线环境。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`；基于 `verl/utils/logger/logger.py` 和 `gen_logger.py` 静态确认 file backend 不依赖 W&B，未运行 GPU 训练。
 
 ### 2026-08-06 - 参数化 GroundingSuite 20k 数据混合配额
 

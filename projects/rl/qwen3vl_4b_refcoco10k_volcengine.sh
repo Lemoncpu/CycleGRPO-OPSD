@@ -62,7 +62,7 @@ RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_LOG="${RUN_LOG:-${RUN_ROOT}/train_${RUN_STAMP}.log}"
 # Keep Ray's object store and spill files on the local tmpfs.  RUN_ROOT is on
 # the persistent workspace mount, which can be nearly full independently.
-RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/tmp/cgrpo-ray-${UID:-$(id -u)}}"
+RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/dev/shm/cgrpo-ray-${UID:-$(id -u)}}"
 
 if [[ ! -d "${REPO_DIR}" ]]; then
     echo "Repository directory not found: ${REPO_DIR}" >&2
@@ -309,6 +309,7 @@ export MODELSCOPE_CACHE="${CACHE_DIR}/modelscope"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_DIR="${RUN_ROOT}/wandb"
+TRAINER_LOGGERS="${TRAINER_LOGGERS:-[\"file\",\"wandb\"]}"
 export RAY_TMPDIR="${RAY_SHORT_ROOT}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
@@ -335,6 +336,7 @@ echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
 echo "Checkpoint directory: ${CHECKPOINT_DIR}"
 echo "Checkpoint retention limit: ${SAVE_LIMIT}"
+echo "Trainer loggers: ${TRAINER_LOGGERS}"
 echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
 echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
 echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
@@ -407,4 +409,4 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     trainer.save_limit="${SAVE_LIMIT}" \
     trainer.save_checkpoint_path="${CHECKPOINT_DIR}" \
     trainer.find_last_checkpoint="${RESUME}" \
-    'trainer.logger=["file","wandb"]'
+    "trainer.logger=${TRAINER_LOGGERS}"
