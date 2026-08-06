@@ -232,14 +232,14 @@ mkdir -p \
     "${CACHE_DIR}/hf_datasets" \
     "${CACHE_DIR}/modelscope"
 
-if [[ "${RAY_SHORT_ROOT}" != /tmp/* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
-    echo "RAY_SHORT_ROOT must be a /tmp path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
+if [[ "${RAY_SHORT_ROOT}" != /* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+    echo "RAY_SHORT_ROOT must be an absolute path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
     exit 1
 fi
 
 if [[ -L "${RAY_SHORT_ROOT}" ]]; then
     echo "RAY_SHORT_ROOT must be a real local directory, not a symlink: ${RAY_SHORT_ROOT}" >&2
-    echo "Use a new short /tmp path; old launchers linked this path to RUN_ROOT." >&2
+    echo "Use a new short path on a local filesystem; old launchers linked this path to RUN_ROOT." >&2
     exit 1
 fi
 mkdir -p "${RAY_SHORT_ROOT}"

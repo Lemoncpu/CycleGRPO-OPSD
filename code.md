@@ -111,7 +111,7 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
-`/tmp/cgrpo-ray-<uid>`。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
+`/tmp/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
 符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
@@ -545,6 +545,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2 节训练入口的 `MAX_STEPS` 行为。
 - 行为：在 `set -u` 下安全展开可选的 `TRAINER_MAX_STEPS_ARG` 数组；`MAX_STEPS` 为空时不再触发 unbound variable，且不会把空参数传给 Hydra。设置正整数时仍传入相同的 `trainer.max_steps` 覆盖。
 - 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`，并用最小 Bash `set -u` 测试覆盖空数组和设置数组两种展开结果；未在本机运行 GPU/Ray/FSDP 训练。
+
+### 2026-08-06 - 允许将 Ray 临时目录置于短路径本地数据盘
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节 Ray 临时目录约束。
+- 行为：`RAY_SHORT_ROOT` 不再限定在 `/tmp`，接受长度不超过 32 的绝对、非符号链接目录；默认值仍为 `/tmp/cgrpo-ray-<uid>`。根分区空间不足时可显式设为本地数据盘短路径（如 `/data5/ray-<uid>`），仍保留 95% 文件系统使用率检查以符合 Ray object spill 的要求。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`；未在本机运行 Ray。
 
 ### 2026-08-06 - 参数化 GroundingSuite 20k 数据混合配额
 
