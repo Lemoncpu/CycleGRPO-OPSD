@@ -155,12 +155,14 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 
 ### 2.4 GroundingSuite 类型均衡 20k 受控训练数据
 
-`projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py` 将五份已转换的 parquet 固定混合为
-20,000 条图像/mask CycleGRPO 数据：7,000 条 RefCOCO 单实例 (`refcoco_cycle`)、5,000 条
+`projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py` 将五份已转换的 parquet 混合为
+20,000 条图像/mask CycleGRPO 数据；默认配方是 7,000 条 RefCOCO 单实例 (`refcoco_cycle`)、5,000 条
 gRefCOCO 多实例 union mask (`grefcoco_cycle`)、4,000 条 COCO-Stuff 语义区域
 (`cocostuff_cycle`)、2,000 条 PACO-LVIS 真 part mask (`paco_part_cycle`) 和 2,000 条
 gRefCOCO no-target (`gres_no_target`)。这些比例分别为 Single 35%、Multi 25%、Stuff 20%、
-Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做数据分布受控消融。
+Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做数据分布受控消融。可通过
+`--single-count`、`--multi-count`、`--stuff-count`、`--part-count` 与 `--no-target-count` 覆盖各配额，
+但五项之和必须为 20,000；未传入时保持默认配方。
 
 `prepare_paco_lvis_part_cycle_dataset.py` 只接受 `id != obj_ann_id` 的 PACO annotation，并且每张图
 最多选一个 part，因而不会把 parent object mask 混入 Part 配额或让少数密集标注图主导。PACO-LVIS
@@ -422,7 +424,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
 - `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask，限制每图一个 part，编码为 `paco_part_cycle` parquet 与 part-category manifest。
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并记录区域面积范围和类别直方图。
-- `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后固定抽取 Single/Multi/Stuff/Part/no-target 的 `7k/5k/4k/2k/2k`，随机打散为一个 20k parquet 和可复现实验 manifest。
+- `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后按可配置的 Single/Multi/Stuff/Part/no-target 配额抽取，要求总数为 20k；默认 `7k/5k/4k/2k/2k`，随机打散为 parquet 和可复现实验 manifest。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
 - `prepare_gres_rl_dataset.py`、`prepare_more_gres_rl_dataset.py`、`prepare_res_rl_dataset.py`、`prepare_reasonseg_rl_dataset.py`：不同 referring segmentation 数据转统一 schema。
@@ -533,6 +535,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ```
 
 ## 8. 变更日志
+
+### 2026-08-06 - 参数化 GroundingSuite 20k 数据混合配额
+
+- 代码：修改 `projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py`。
+- 文档：更新第 2.4、5.3 节。
+- 行为：混合器新增 Single、Multi、Stuff、Part 与 no-target 五个可选计数参数，要求总数恒为 20,000；默认 `7k/5k/4k/2k/2k` 保持不变。可用于生成 `8k/4k/4k/3k/1k` 等受控配方，manifest 记录实际配额。
+- 验证：执行 Python 语法编译、默认/自定义配额参数解析与 20k 总数校验；本机没有服务器侧 parquet、CUDA 或 VQ-SAM2 权重，未执行完整 token 编码。
 
 ### 2026-08-01 - 增加 GroundingSuite 类型均衡 20k 图像/mask 训练数据
 
