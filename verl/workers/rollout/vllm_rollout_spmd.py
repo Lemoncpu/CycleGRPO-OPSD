@@ -181,6 +181,19 @@ class vLLMRollout(BaseRollout):
     def update_sampling_params(self, **kwargs):
         old_values = {}
         for key, value in kwargs.items():
+            if key == "caption_blocked_token_ids":
+                blocked_ids = [int(token_id) for token_id in (value or [])]
+                if not blocked_ids or not hasattr(self.sampling_params, "logit_bias"):
+                    continue
+                try:
+                    old_values["logit_bias"] = self.sampling_params.logit_bias
+                    logit_bias = dict(self.sampling_params.logit_bias or {})
+                    for token_id in blocked_ids:
+                        logit_bias[token_id] = -100.0
+                    self.sampling_params.logit_bias = logit_bias
+                except AttributeError:
+                    old_values.pop("logit_bias", None)
+                continue
             # eos_token_id 在新版 vllm 是只读的，映射到可写的 stop_token_ids
             if key == "eos_token_id":
                 ids = value if isinstance(value, (list, tuple)) else [value]

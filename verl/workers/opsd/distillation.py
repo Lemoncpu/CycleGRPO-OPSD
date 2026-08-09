@@ -82,6 +82,7 @@ def chunked_weighted_jsd_loss(
     entropy_weight_beta: float,
     token_chunk_size: int,
     blocked_token_ids: Optional[torch.Tensor] = None,
+    extra_token_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Return the original weighted generalized-JSD without full-response fp32 tensors.
 
@@ -105,6 +106,8 @@ def chunked_weighted_jsd_loss(
         raise ValueError("temperature must be positive.")
     if entropy_weight_beta < 0.0:
         raise ValueError("entropy_weight_beta must be non-negative.")
+    if extra_token_weight is not None and extra_token_weight.shape != response_mask.shape:
+        raise ValueError("extra_token_weight must have shape [batch, tokens].")
 
     batch_size, response_length, _ = student_logits.shape
     token_mask = response_mask.float()
@@ -134,6 +137,8 @@ def chunked_weighted_jsd_loss(
     ).clamp_min(1.0)
     weights = token_mask * confidence / confidence_mean.clamp_min(1e-6)
     weights = weights * sample_weight.float().unsqueeze(-1)
+    if extra_token_weight is not None:
+        weights = weights * extra_token_weight.float()
 
     log_student_weight = math.log(1.0 - beta)
     log_teacher_weight = math.log(beta)
@@ -180,6 +185,11 @@ def chunked_weighted_jsd_loss(
             0 if blocked_token_ids is None else blocked_token_ids.numel(),
             device=student_logits.device,
             dtype=torch.float32,
+        ),
+        "extra_weighted_token_count": (
+            torch.zeros((), device=student_logits.device, dtype=torch.float32)
+            if extra_token_weight is None
+            else ((extra_token_weight.float() > 1.0) * token_mask).sum()
         ),
     }
     if not torch.isfinite(loss_numerator):

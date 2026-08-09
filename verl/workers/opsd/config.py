@@ -39,6 +39,7 @@ class CaptionSafetyConfig:
     enabled: bool = True
     max_response_tokens: int = 256
     force_regenerate: bool = True
+    block_special_token_vocab: bool = True
 
     def post_init(self):
         if self.max_response_tokens <= 0:
@@ -137,6 +138,42 @@ class TeacherAnalysisConfig:
 
 
 @dataclass
+class GroundednessConfig:
+    """Conservative visual fact checks for target-bearing cycle captions."""
+
+    enabled: bool = False
+    teacher_must_be_frozen: bool = True
+    max_claims: int = 8
+    max_claim_chars: int = 160
+    max_new_tokens: int = 96
+    temperature: float = 0.0
+    unsupported_penalty: float = 0.25
+    contradicted_penalty: float = 0.75
+    min_checked_claims: int = 1
+    min_groundedness_score: float = 0.85
+    min_distill_caption_score: float = 0.65
+    no_target_enabled: bool = False
+    token_jsd_enabled: bool = False
+    token_jsd_multiplier: float = 1.0
+
+    def post_init(self):
+        if self.max_claims <= 0 or self.max_claim_chars <= 0 or self.max_new_tokens <= 0:
+            raise ValueError("groundedness claim and response limits must be positive.")
+        if self.temperature < 0.0:
+            raise ValueError("groundedness.temperature must be non-negative.")
+        if self.unsupported_penalty < 0.0 or self.contradicted_penalty < 0.0:
+            raise ValueError("groundedness penalties must be non-negative.")
+        if self.min_checked_claims <= 0:
+            raise ValueError("groundedness.min_checked_claims must be positive.")
+        if not 0.0 <= self.min_groundedness_score <= 1.0:
+            raise ValueError("groundedness.min_groundedness_score must be in [0, 1].")
+        if not 0.0 <= self.min_distill_caption_score <= 1.0:
+            raise ValueError("groundedness.min_distill_caption_score must be in [0, 1].")
+        if self.token_jsd_multiplier < 0.0:
+            raise ValueError("groundedness.token_jsd_multiplier must be non-negative.")
+
+
+@dataclass
 class OPSDConfig:
     enabled: bool = False
     localization_rollouts: int = 6
@@ -154,6 +191,7 @@ class OPSDConfig:
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     teacher_confidence: TeacherConfidenceConfig = field(default_factory=TeacherConfidenceConfig)
     teacher_analysis: TeacherAnalysisConfig = field(default_factory=TeacherAnalysisConfig)
+    groundedness: GroundednessConfig = field(default_factory=GroundednessConfig)
 
     def post_init(self):
         if self.localization_rollouts <= 0:
@@ -167,7 +205,22 @@ class OPSDConfig:
         if self.segmentation_anchor_kl_coef < 0:
             raise ValueError("segmentation_anchor_kl_coef must be non-negative.")
         self.teacher_confidence.post_init()
+        self.groundedness.post_init()
         if self.enabled and self.routing.enabled and not self.pixel_iou.enabled:
             raise ValueError("OPSD three-route training requires pixel_iou.enabled=true.")
         if self.enabled and self.routing.enabled and not self.ema_teacher.enabled:
             raise ValueError("OPSD three-route training requires ema_teacher.enabled=true.")
+        if self.enabled and self.groundedness.enabled and not self.routing.enabled:
+            raise ValueError("groundedness requires routing.enabled=true.")
+        if self.enabled and self.groundedness.enabled and not self.ema_teacher.enabled:
+            raise ValueError("groundedness requires ema_teacher.enabled=true.")
+        if (
+            self.enabled
+            and self.groundedness.enabled
+            and self.groundedness.teacher_must_be_frozen
+            and self.ema_teacher.enabled
+            and self.ema_teacher.decay != 1.0
+        ):
+            raise ValueError(
+                "groundedness requires a frozen initial teacher; set ema_teacher.decay=1.0."
+            )

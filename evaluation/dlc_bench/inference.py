@@ -11,6 +11,7 @@ import os
 import copy
 import base64
 import io
+import re
 
 import numpy as np
 import torch
@@ -19,7 +20,12 @@ from PIL import Image
 from pycocotools import mask as mask_utils
 from pycocotools.coco import COCO
 from tqdm import tqdm
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import (
+    AutoProcessor,
+    LogitsProcessor,
+    LogitsProcessorList,
+    Qwen3VLForConditionalGeneration,
+)
 from torchvision.transforms.functional import to_pil_image
 import hydra
 
@@ -37,6 +43,19 @@ DLC_CAPTION_MAX_NEW_TOKENS = 192
 REGION_DESCRIPTION_PROMPT = (
     "Provide a detailed factual description of this region {SEG}."
 )
+
+
+class ForbidTokenIdsLogitsProcessor(LogitsProcessor):
+    """Prevent SAMTok mask/object-reference tokens in caption responses."""
+
+    def __init__(self, token_ids):
+        self.token_ids = sorted({int(token_id) for token_id in token_ids})
+
+    def __call__(self, input_ids, scores):
+        valid_ids = [token_id for token_id in self.token_ids if 0 <= token_id < scores.shape[-1]]
+        if valid_ids:
+            scores[:, valid_ids] = torch.finfo(scores.dtype).min
+        return scores
 
 
 class DirectResize:
@@ -185,6 +204,14 @@ def main():
     ).cuda().eval()
 
     processor = AutoProcessor.from_pretrained(args.model_path)
+    blocked_token_ids = [
+        int(token_id)
+        for token, token_id in processor.tokenizer.get_vocab().items()
+        if re.fullmatch(r"<\|(?:mt_(?:start|end|\d+)|object_ref(?:_[^|]+)?)\|>", str(token))
+    ]
+    caption_logits_processor = LogitsProcessorList(
+        [ForbidTokenIdsLogitsProcessor(blocked_token_ids)]
+    )
 
     # Build vq-sam2 model
     # Use absolute path for hydra config
@@ -219,6 +246,8 @@ def main():
     img_ids = list(coco.imgs.keys())
     num_anns = len(coco.anns)
     pbar = tqdm(total=num_anns)
+    generated_response_tokens = 0
+    generated_blocked_tokens = 0
 
     for img_id in img_ids:
         ann_ids = select_ann(coco, img_id)
@@ -394,6 +423,7 @@ def main():
                     max_new_tokens=DLC_CAPTION_MAX_NEW_TOKENS,
                     do_sample=False,
                     top_p=1.0,
+                    logits_processor=caption_logits_processor,
                 )
 
             generated_ids_trimmed = [
@@ -406,6 +436,15 @@ def main():
             outputs = output_text[0].replace('<|im_end|>', '').strip()
             print(outputs)  # Print model output for this image
 
+            generated_response_tokens += int(generated_ids_trimmed[0].numel())
+            if blocked_token_ids:
+                generated_blocked_tokens += int(
+                    torch.isin(
+                        generated_ids_trimmed[0],
+                        torch.tensor(blocked_token_ids, device=generated_ids_trimmed[0].device),
+                    ).sum().item()
+                )
+
             model_outputs[ann_id] = outputs
             pbar.update(1)
     pbar.close()
@@ -414,7 +453,19 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w") as file:
         json.dump(model_outputs, file, indent=4, ensure_ascii=False)
+    stats_path = f"{output_path}.stats.json"
+    with open(stats_path, "w") as file:
+        json.dump(
+            {
+                "samples": len(model_outputs),
+                "caption_special_token_count": generated_blocked_tokens,
+                "caption_special_token_rate": generated_blocked_tokens / max(generated_response_tokens, 1),
+            },
+            file,
+            indent=2,
+        )
     print(f"Saved predictions: {output_path}")
+    print(f"Saved caption generation stats: {stats_path}")
 
 
 if __name__ == "__main__":

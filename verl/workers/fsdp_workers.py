@@ -452,6 +452,7 @@ class FSDPWorker(Worker):
         self.role = role
         self._cache = {}
         self._caption_distillation_blocked_token_ids: Optional[torch.Tensor] = None
+        self._caption_generation_blocked_token_ids_cache: Optional[list[int]] = None
 
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
@@ -824,6 +825,18 @@ class FSDPWorker(Worker):
                 f"{len(token_ids)} SAMTok/object-reference caption vocabulary tokens."
             )
         return self._caption_distillation_blocked_token_ids
+
+    def _caption_generation_blocked_token_ids(self, task: Optional[str]) -> list[int]:
+        """Return caption-only forbidden ids without changing localization sampling."""
+        if task not in {"caption", "opsd_regenerate", "opsd_groundedness", "opsd_teacher_analysis"}:
+            return []
+        if not self.config.opsd.caption_safety.block_special_token_vocab:
+            return []
+        if self._caption_generation_blocked_token_ids_cache is None:
+            self._caption_generation_blocked_token_ids_cache = caption_blocked_special_token_ids(
+                self.tokenizer.get_vocab()
+            )
+        return self._caption_generation_blocked_token_ids_cache
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1885,6 +1898,11 @@ class FSDPWorker(Worker):
                 entropy_weight_beta=config.entropy_weight_beta,
                 token_chunk_size=config.token_chunk_size,
                 blocked_token_ids=blocked_token_ids,
+                extra_token_weight=(
+                    micro_batch.batch["groundedness_token_weight"][:, :response_length]
+                    if "groundedness_token_weight" in micro_batch.batch
+                    else None
+                ),
             )
             scaled_loss = (
                 loss_numerator
@@ -1903,6 +1921,9 @@ class FSDPWorker(Worker):
             )
             metric_values["opsd/distill_blocked_vocab_size"].append(
                 float(distillation_metrics["blocked_vocab_size"])
+            )
+            metric_values["opsd/distill_extra_weighted_token_count"].append(
+                float(distillation_metrics["extra_weighted_token_count"])
             )
             # Release full-vocabulary outputs before preparing the next micro-batch.
             del scaled_loss, loss_numerator, student_logits, teacher_logits
@@ -1926,6 +1947,9 @@ class FSDPWorker(Worker):
                 else self.tokenizer.pad_token_id,
             }
         )
+        prompts.meta_info["caption_blocked_token_ids"] = self._caption_generation_blocked_token_ids(
+            prompts.meta_info.get("task")
+        )
         prompts = self.teacher_rollout_sharding_manager.preprocess_data(prompts)
         output = self.rollout.generate_sequences(prompts=prompts)
         output = self.teacher_rollout_sharding_manager.postprocess_data(output)
@@ -1944,6 +1968,9 @@ class FSDPWorker(Worker):
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        prompts.meta_info["caption_blocked_token_ids"] = self._caption_generation_blocked_token_ids(
+            prompts.meta_info.get("task")
+        )
 
         prompts = self.rollout_sharding_manager.preprocess_data(prompts)
         # prompts.batch: ['attention_mask', 'input_ids', 'position_ids']

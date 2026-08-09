@@ -57,6 +57,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | C2: 非对称梯度投影 | 关闭 | 仍可显式启用；实测 caption/seg cosine 接近 0，投影对更新方向影响很小 |
 | 高置信 teacher gate | 开启 | regenerate 要求 `teacher R_Ci>=0.65` 且归一化改善 `>=0.30`；JSD 仅接收 `R_Ci>=0.65` 的 mid route |
 | C: JSD 特殊词表屏蔽 | 开启 | teacher/student JSD 同时禁止 `mt_*` 和 `object_ref_*` token |
+| groundedness verifier | 入口默认开启 | frozen teacher 以全图和 GT target crop 核验所有有目标 cycle caption；no-target 不参与 |
 | teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
@@ -316,6 +317,8 @@ mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：
 
 C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。非对称梯度投影仍保留为可选诊断：`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。当前服务器日志的 cosine 仅约 `-0.004` 到 `-0.018`，故入口默认关闭它。高置信 gate 新增 `opsd/regenerate_validated_candidate_count`、`opsd/regenerate_confident_candidate_{count,rate}`、`opsd/regenerate_confident_target_acceptance_rate`、`opsd/distillation_route_count`、`opsd/distillation_confident_{count,rate}` 与 `opsd/distillation_confident_R_Ci_mean`，必须同时检查这些项，避免阈值过严而使辅助 loss 静默为空。原有 anchor、projection、JSD finite 检查行为不变。
 
+当前 groundedness 受控消融在 pixel-IoU 路由之后增加一次 frozen initial teacher verifier。对所有有目标 cycle caption，teacher 只看全图和 GT target crop，输出最多 8 个必须是原 caption 字面子串的 claim，并标记 `supported`、`contradicted`、`unsupported` 或 `uncertain`。解析失败、没有有效 claim 和 `uncertain` 不产生惩罚；caption reward 仅减去 `0.25*unsupported_rate + 0.75*contradicted_rate`，不改变 pixel-IoU 或 segmentation reward。`R_Ci` low route 的 regenerate CE 要求 verifier score 至少 `0.85`；mid route 的 privileged JSD 同时要求 `R_Ci>=0.65`（`groundedness.min_distill_caption_score`）和 verifier score 至少 `0.85`，即使历史 `teacher_confidence` gate 被关闭也不会放宽该 groundedness 边界。原始 caption GRPO 保持不变。verifier 记录到 checkpoint 根目录的 `caption_groundedness.jsonl`，并输出 coverage、parse failure、claim rate 和 penalty 指标。no-target 样本继续由原 GRES 拒识 reward 处理。当前首版只建立 `groundedness_token_mask` 和可选 extra JSD weight 接口，`token_jsd_enabled=false`，不直接产生 token-level groundedness 梯度；这是当前论文循环目标之外的 caption factuality 辅助消融。为兼容 GRES no-target 与 cycle caption 共同组成的 actor batch、避免将特权 verdict 传给主 PPO worker，verifier 记录和 token mask 会在 reward/JSD 均消费完成后、任一 actor batch 更新前从 cycle caption batch 移除。
+
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
 当 captioner 和 segmenter 都启用时，trainer 不分别 optimizer step，而是：
@@ -385,12 +388,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分 |
 | `workers/actor/dp_actor.py` | log-prob 前向、动态 micro-batch、PPO loss、独立 caption anchor KL、梯度累积和 optimizer step |
 | `workers/critic/dp_critic.py` | GAE/PPO 可选 value model；GRPO 主配置通常不启用 critic |
-| `workers/rollout/vllm_rollout_spmd.py` | SPMD vLLM engine、采样参数、视觉输入和 response tensor 构造 |
+| `workers/rollout/vllm_rollout_spmd.py` | SPMD vLLM engine、采样参数、视觉输入和 response tensor 构造；caption task 动态以 logit bias 屏蔽 SAMTok/object-reference vocabulary |
 | `workers/sharding_manager/fsdp_vllm.py` | FSDP 参数与 vLLM engine 同步/offload |
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
-| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate 与 distillation 配置及边界校验 |
+| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 与 groundedness 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
+| `workers/opsd/groundedness.py` | teacher verifier JSON 的保守解析、claim/penalty 汇总，以及 optional token-span 对齐；解析不确定时 fail closed 为零辅助梯度 |
 | `workers/opsd/mask_iou.py` | 严格 token 解析、原始 GT 转换、批量 mask 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
@@ -487,7 +491,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
-| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt 与 192-token 上限 |
+| `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt、192-token 上限和 caption-only special-token logits blocker，另写 `.stats.json` 记录 leak rate |
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
 评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
@@ -515,6 +519,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对原始 GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
 20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
 21. **C 当前同时处理 special-token 支持集、reference anchor、teacher 特权信息形态和共享梯度冲突。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 以 segmentation anchor KL 约束全部 cycle localization response，并可用非对称梯度投影移除 caption-side gradient 中与 localization gradient 冲突的分量；两者都不把 `seg_answer` 作为 student CE target，保持单 actor 的 cycle-only 训练信号。投影会额外保留一份本 rank 的 caption gradient，因此增加约一个 FSDP gradient shard 的显存；系数和冲突率必须通过 10-step RefCOCO/GroundingSuite 消融验证。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
+22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -854,3 +859,18 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、5.6 节的 DLC 推理协议。
 - 行为：DLC 的正向 caption 指令保留 `Provide a detailed factual description of this region {SEG}.`，移除此前加入的 `mask tokens`、`JSON` 和 `reasoning` 等负向格式词。实际推理中，96/100 个样本将这些词解释为输出格式提示，主动生成 `mask_2d` JSON 而非自然语言描述。zoom-in 图仍被声明为同一 region 的放大视图，192-token 上限保持不变。此前产生的 DLC prediction JSON 无效，必须重新生成。
 - 验证：执行该文件的 Python 语法检查和 `git diff --check`。本机没有 DLC 数据、Qwen3-VL/SAMTok 权重或 CUDA，未实际运行生成或 judge。
+
+### 2026-08-09 - 增加 caption groundedness verifier 与 caption 生成 special-token 屏蔽
+
+- 代码：新增 `verl/workers/opsd/groundedness.py`；修改 `verl/workers/opsd/{__init__,config}.py`、`routing.py`、`distillation.py`、`verl/workers/rollout/vllm_rollout_spmd.py`、`verl/workers/fsdp_workers.py`、`verl/trainer/ray_trainer.py`、`verl/workers/reward/function.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`evaluation/dlc_bench/inference.py` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 2.2、3.6、5.2、5.6、6 节及模块清单。
+- 行为：caption、regenerate、privileged groundedness teacher 和 DLC 生成均动态屏蔽 SAMTok mask/object-reference response vocabulary；segmentation rollout 不受影响。frozen initial teacher 使用全图 + GT target crop 对全部有目标 cycle caption 输出原文 claim 的结构化 groundedness verdict；明确 unsupported/contradicted claim 进入 caption reward 惩罚，并过滤不可靠 regenerate CE/JSD teacher target。verifier 结果写入 `caption_groundedness.jsonl`，no-target 保留原拒识分支。首版只启用整句 reward 惩罚，token-level JSD extra weight 接口默认关闭。
+- 论文边界：该功能是 caption factuality 的额外受控辅助消融，不是论文原始 CycleGRPO 的 pixel-IoU/cycle objective，也没有增加 RefCOCO CE 或改变 segmentation loss。
+- 验证：所有修改 Python 文件通过 `python3 -m py_compile`，训练入口通过 `bash -n`，`git diff --check` 通过；本机 `python3 -m unittest tests.test_opsd_core` 因未安装 `torch` 无法运行，尚未进行服务器 Ray/FSDP/vLLM smoke training。
+
+### 2026-08-09 - 修复 groundedness 与 GRES mixed batch 的合并边界
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 3.6 节 groundedness 路由与 batch 生命周期说明。
+- 行为：groundedness 启用时，mid-route privileged JSD 无条件要求 `R_Ci>=0.65`，不再依赖可关闭的历史 `teacher_confidence` 开关。cycle caption 的 verifier-only non-tensor verdict 与 token mask 在 reward/JSD 已消费后、主 PPO actor 更新前移除，防止与 GRES no-target 合并时 `DataProto.concat` 因两侧字段不对齐失败，并避免特权日志传给 actor worker；segmentation 和 caption PPO 行为不变。
+- 验证：修改涉及的 Python 文件已通过 `python3 -m py_compile`，训练 shell 已通过 `bash -n`，`git diff --check` 通过；groundedness parser stdlib smoke test 通过。本机 `python3 -m unittest tests.test_opsd_core` 仍因未安装 `torch` 无法导入，未运行 Ray/FSDP/vLLM 10-step smoke test。

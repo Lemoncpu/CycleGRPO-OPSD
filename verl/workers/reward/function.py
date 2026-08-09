@@ -161,6 +161,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
         mask_token_accuracy = data.non_tensor_batch.get("mask_token_accuracy") if task == 'segmentation' else None
         seg_ground_truth = data.non_tensor_batch.get("seg_ground_truth")
         cap_ground_truth = data.non_tensor_batch.get("cap_ground_truth")
+        groundedness = data.non_tensor_batch.get("groundedness")
         for i in range(len(data)):
             cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
             valid_response_ids = response_ids[i][:cur_response_length]
@@ -181,6 +182,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     # "gt_masks": masks[i] if task == 'segmentation' else None,
                     "cap_ground_truth": cap_ground_truth[i] if cap_ground_truth is not None else None,
                     "seg_ground_truth": seg_ground_truth[i] if task == 'segmentation' else None,
+                    "groundedness": groundedness[i] if groundedness is not None and task == 'caption' else None,
                     "extra_info": data.non_tensor_batch["extra_info"][i] if "extra_info" in data.non_tensor_batch else None,
                     # "cap_images": cap_images[i] if task == 'segmentation' else None,
                     # "cap_responses": cap_responses[i] if task == 'segmentation' else None,

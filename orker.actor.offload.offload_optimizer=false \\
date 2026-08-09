@@ -20,7 +20,6 @@ PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
-CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB="${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB:-true}"
 EMA_TEACHER_ENABLED="${EMA_TEACHER_ENABLED:-true}"
 TEACHER_ANALYSIS_ENABLED="${TEACHER_ANALYSIS_ENABLED:-true}"
 # Caption rollouts should be short natural descriptions. This cap also bounds
@@ -45,13 +44,6 @@ SEGMENTATION_ANCHOR_KL_COEF="${SEGMENTATION_ANCHOR_KL_COEF:-0.05}"
 # not materially alter updates and is disabled for the high-confidence teacher run.
 ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-false}"
 JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
-GROUNDEDNESS_ENABLED="${GROUNDEDNESS_ENABLED:-true}"
-GROUNDEDNESS_MAX_CLAIMS="${GROUNDEDNESS_MAX_CLAIMS:-8}"
-GROUNDEDNESS_MAX_NEW_TOKENS="${GROUNDEDNESS_MAX_NEW_TOKENS:-96}"
-GROUNDEDNESS_UNSUPPORTED_PENALTY="${GROUNDEDNESS_UNSUPPORTED_PENALTY:-0.25}"
-GROUNDEDNESS_CONTRADICTED_PENALTY="${GROUNDEDNESS_CONTRADICTED_PENALTY:-0.75}"
-GROUNDEDNESS_MIN_SCORE="${GROUNDEDNESS_MIN_SCORE:-0.85}"
-GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE="${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE:-0.65}"
 TEACHER_CONFIDENCE_ENABLED="${TEACHER_CONFIDENCE_ENABLED:-true}"
 REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
 REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
@@ -103,10 +95,8 @@ for bool_name in \
     ROUTING_ENABLED \
     CAPTION_SAFETY_ENABLED \
     CAPTION_SAFETY_FORCE_REGENERATE \
-    CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB \
     EMA_TEACHER_ENABLED \
-    TEACHER_ANALYSIS_ENABLED \
-    GROUNDEDNESS_ENABLED; do
+    TEACHER_ANALYSIS_ENABLED; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
         echo "${bool_name} must be true or false: ${bool_value}" >&2
@@ -128,37 +118,6 @@ if [[ "${ROUTING_ENABLED}" == "true" && "${EMA_TEACHER_ENABLED}" != "true" ]]; t
     echo "ROUTING_ENABLED=true requires EMA_TEACHER_ENABLED=true." >&2
     exit 1
 fi
-
-if [[ "${GROUNDEDNESS_ENABLED}" == "true" && "${TEACHER_EMA_DECAY}" != "1.0" ]]; then
-    echo "GROUNDEDNESS_ENABLED=true requires TEACHER_EMA_DECAY=1.0." >&2
-    exit 1
-fi
-
-for groundedness_count_name in GROUNDEDNESS_MAX_CLAIMS GROUNDEDNESS_MAX_NEW_TOKENS; do
-    groundedness_count_value="${!groundedness_count_name}"
-    if [[ ! "${groundedness_count_value}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "${groundedness_count_name} must be a positive integer: ${groundedness_count_value}" >&2
-        exit 1
-    fi
-done
-
-for groundedness_penalty_name in GROUNDEDNESS_UNSUPPORTED_PENALTY GROUNDEDNESS_CONTRADICTED_PENALTY; do
-    groundedness_penalty_value="${!groundedness_penalty_name}"
-    if [[ ! "${groundedness_penalty_value}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
-        || ! awk -v value="${groundedness_penalty_value}" 'BEGIN { exit !(value >= 0) }'; then
-        echo "${groundedness_penalty_name} must be non-negative: ${groundedness_penalty_value}" >&2
-        exit 1
-    fi
-done
-
-for groundedness_score_name in GROUNDEDNESS_MIN_SCORE GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE; do
-    groundedness_score_value="${!groundedness_score_name}"
-    if [[ ! "${groundedness_score_value}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
-        || ! awk -v value="${groundedness_score_value}" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
-        echo "${groundedness_score_name} must be in [0, 1]: ${groundedness_score_value}" >&2
-        exit 1
-    fi
-done
 
 if [[ ! "${CAPTION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
     || ! awk -v value="${CAPTION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
@@ -365,14 +324,12 @@ echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok te
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
-echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
 echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
 echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
 echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADIENT_PROJECTION}"
 echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
-echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
@@ -434,24 +391,10 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.caption_safety.enabled="${CAPTION_SAFETY_ENABLED}" \
     worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
     worker.opsd.caption_safety.force_regenerate="${CAPTION_SAFETY_FORCE_REGENERATE}" \
-    worker.opsd.caption_safety.block_special_token_vocab="${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}" \
     worker.opsd.distillation.block_caption_special_token_vocab="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" \
     worker.opsd.ema_teacher.enabled="${EMA_TEACHER_ENABLED}" \
     worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
     worker.opsd.teacher_analysis.enabled="${TEACHER_ANALYSIS_ENABLED}" \
-    worker.opsd.groundedness.enabled="${GROUNDEDNESS_ENABLED}" \
-    worker.opsd.groundedness.teacher_must_be_frozen=true \
-    worker.opsd.groundedness.max_claims="${GROUNDEDNESS_MAX_CLAIMS}" \
-    worker.opsd.groundedness.max_new_tokens="${GROUNDEDNESS_MAX_NEW_TOKENS}" \
-    worker.opsd.groundedness.temperature=0.0 \
-    worker.opsd.groundedness.unsupported_penalty="${GROUNDEDNESS_UNSUPPORTED_PENALTY}" \
-    worker.opsd.groundedness.contradicted_penalty="${GROUNDEDNESS_CONTRADICTED_PENALTY}" \
-    worker.opsd.groundedness.min_checked_claims=1 \
-    worker.opsd.groundedness.min_groundedness_score="${GROUNDEDNESS_MIN_SCORE}" \
-    worker.opsd.groundedness.min_distill_caption_score="${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE}" \
-    worker.opsd.groundedness.no_target_enabled=false \
-    worker.opsd.groundedness.token_jsd_enabled=false \
-    worker.opsd.groundedness.token_jsd_multiplier=1.0 \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \

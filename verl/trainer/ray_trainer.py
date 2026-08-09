@@ -50,8 +50,11 @@ from ..workers.reward import FunctionRewardManager
 from ..workers.opsd import (
     caption_safety_reason,
     build_privileged_teacher_images,
+    disabled_groundedness,
     distillation_weight,
     format_privileged_prompt,
+    groundedness_token_mask,
+    parse_groundedness_verdict,
     regenerate_weight,
     teacher_caption_is_safe,
     uses_original_grpo,
@@ -921,11 +924,21 @@ class RayPPOTrainer:
             dtype=object,
         )
 
-    def _build_opsd_prompt_batch(self, caption_batch: DataProto, indices: list[int], mode: str) -> DataProto:
+    def _build_opsd_prompt_batch(
+        self,
+        caption_batch: DataProto,
+        indices: list[int],
+        mode: str,
+        caption_overrides: Optional[list[str]] = None,
+    ) -> DataProto:
+        if caption_overrides is not None and len(caption_overrides) != len(indices):
+            raise ValueError("caption_overrides must align with privileged prompt indices.")
         records = []
         dataset = self.train_dataloader.dataset
-        for index in indices:
-            context = caption_batch.non_tensor_batch["privileged_context"][index]
+        for position, index in enumerate(indices):
+            context = dict(caption_batch.non_tensor_batch["privileged_context"][index])
+            if caption_overrides is not None:
+                context["student_caption"] = caption_overrides[position]
             prompt_text = format_privileged_prompt(context, mode=mode)
             original_media = caption_batch.non_tensor_batch["multi_modal_data"][index]
             original_images = original_media.get("images", [])
@@ -933,7 +946,11 @@ class RayPPOTrainer:
                 raise ValueError("OPSD privileged teacher prompts require an image.")
             scene = process_image(original_images[0], None, None)
             teacher_media = {
-                "images": build_privileged_teacher_images(scene, context),
+                "images": build_privileged_teacher_images(
+                    scene,
+                    context,
+                    include_reconstruction=(mode != "groundedness"),
+                ),
             }
             records.append(
                 dataset.preprocess_opsd_prompt(
@@ -951,6 +968,173 @@ class RayPPOTrainer:
             "parent_index": np.array(indices, dtype=object),
         }
         return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(caption_batch.meta_info))
+
+    def _generate_groundedness_verification(
+        self, caption_batch: DataProto
+    ) -> dict[str, float]:
+        """Verify target-bearing captions with frozen privileged visual evidence."""
+        config = self.config.worker.opsd.groundedness
+        rows = [disabled_groundedness() for _ in range(len(caption_batch))]
+        token_masks = torch.zeros_like(caption_batch.batch["response_mask"], dtype=torch.bool)
+        eligible = [
+            index
+            for index, source in enumerate(caption_batch.non_tensor_batch["source"])
+            if str(source) != "gres_no_target" or config.no_target_enabled
+        ]
+        metrics = {
+            "opsd/groundedness_coverage": 0.0,
+            "opsd/groundedness_parse_failure_rate": 0.0,
+            "opsd/unsupported_claim_rate": 0.0,
+            "opsd/contradicted_claim_rate": 0.0,
+            "opsd/groundedness_penalty": 0.0,
+        }
+        if not config.enabled or not eligible:
+            caption_batch.non_tensor_batch["groundedness"] = np.array(rows, dtype=object)
+            caption_batch.batch["groundedness_token_mask"] = token_masks
+            return metrics
+
+        prompts = self._build_opsd_prompt_batch(caption_batch, eligible, mode="groundedness")
+        prompts.meta_info.update(
+            {
+                "n": 1,
+                "temperature": config.temperature,
+                "top_p": 1.0,
+                "max_tokens": config.max_new_tokens,
+                "task": "opsd_groundedness",
+            }
+        )
+        prompts, pad_size = pad_dataproto_to_divisor(prompts, self.actor_rollout_ref_wg.world_size)
+        self.actor_rollout_ref_wg.prepare_teacher_rollout_engine()
+        output = self.actor_rollout_ref_wg.generate_sequences_with_teacher(prompts)
+        self.actor_rollout_ref_wg.release_teacher_rollout_engine()
+        output = unpad_dataproto(output, pad_size)
+
+        response_lengths = torch.sum(output.batch["response_mask"], dim=-1)
+        valid_parse = []
+        unsupported_rates = []
+        contradicted_rates = []
+        penalties = []
+        for output_index, caption_index in enumerate(eligible):
+            response_ids = output.batch["responses"][output_index][: int(response_lengths[output_index].item())]
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+            caption_ids = caption_batch.batch["responses"][caption_index]
+            caption_length = int(torch.sum(caption_batch.batch["response_mask"][caption_index]).item())
+            caption_text = self.tokenizer.decode(
+                caption_ids[:caption_length], skip_special_tokens=False
+            )
+            verdict = parse_groundedness_verdict(
+                response_text,
+                caption_text,
+                max_claims=config.max_claims,
+                max_claim_chars=config.max_claim_chars,
+                unsupported_penalty=config.unsupported_penalty,
+                contradicted_penalty=config.contradicted_penalty,
+                min_checked_claims=config.min_checked_claims,
+            )
+            rows[caption_index] = verdict
+            aligned_mask = groundedness_token_mask(
+                caption_ids[:caption_length].tolist(), self.tokenizer, verdict["claims"]
+            )
+            if aligned_mask:
+                token_masks[caption_index, : len(aligned_mask)] = torch.tensor(
+                    aligned_mask, dtype=torch.bool
+                )
+            if verdict["parse_ok"]:
+                valid_parse.append(verdict)
+                checked = max(int(verdict["checked_claim_count"]), 1)
+                unsupported_rates.append(verdict["unsupported_count"] / checked)
+                contradicted_rates.append(verdict["contradicted_count"] / checked)
+                penalties.append(float(verdict["penalty"]))
+
+        parsed_count = len(valid_parse)
+        metrics["opsd/groundedness_coverage"] = parsed_count / max(len(eligible), 1)
+        metrics["opsd/groundedness_parse_failure_rate"] = 1.0 - metrics["opsd/groundedness_coverage"]
+        if parsed_count:
+            metrics["opsd/unsupported_claim_rate"] = float(np.mean(unsupported_rates))
+            metrics["opsd/contradicted_claim_rate"] = float(np.mean(contradicted_rates))
+            metrics["opsd/groundedness_penalty"] = float(np.mean(penalties))
+        caption_batch.non_tensor_batch["groundedness"] = np.array(rows, dtype=object)
+        caption_batch.batch["groundedness_token_mask"] = token_masks
+        self._write_groundedness_records(caption_batch)
+        return metrics
+
+    def _write_groundedness_records(self, caption_batch: DataProto) -> None:
+        """Persist parsed verifier evidence for later caption-drift analysis."""
+        path = os.path.join(
+            self.config.trainer.save_checkpoint_path, "caption_groundedness.jsonl"
+        )
+        os.makedirs(self.config.trainer.save_checkpoint_path, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as file:
+            for index, verdict in enumerate(caption_batch.non_tensor_batch["groundedness"]):
+                if not verdict.get("enabled", False):
+                    continue
+                response_length = int(torch.sum(caption_batch.batch["response_mask"][index]).item())
+                caption = self.tokenizer.decode(
+                    caption_batch.batch["responses"][index][:response_length],
+                    skip_special_tokens=False,
+                )
+                file.write(
+                    json.dumps(
+                        {
+                            "step": self.global_step,
+                            "sample_uid": str(caption_batch.non_tensor_batch["uid"][index]),
+                            "caption_index": int(caption_batch.non_tensor_batch["caption_index"][index]),
+                            "route": str(caption_batch.non_tensor_batch["route"][index]),
+                            "R_Ci": float(caption_batch.non_tensor_batch["R_Ci"][index]),
+                            "student_caption": caption,
+                            "groundedness": verdict,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+    def _verify_caption_texts(
+        self,
+        caption_batch: DataProto,
+        parent_indices: list[int],
+        captions: list[str],
+    ) -> list[dict[str, Any]]:
+        """Run the target-only verifier on teacher regenerate candidates."""
+        config = self.config.worker.opsd.groundedness
+        if not config.enabled or not captions:
+            return [disabled_groundedness() for _ in captions]
+        prompts = self._build_opsd_prompt_batch(
+            caption_batch,
+            parent_indices,
+            mode="groundedness",
+            caption_overrides=captions,
+        )
+        prompts.meta_info.update(
+            {
+                "n": 1,
+                "temperature": config.temperature,
+                "top_p": 1.0,
+                "max_tokens": config.max_new_tokens,
+                "task": "opsd_groundedness",
+            }
+        )
+        prompts, pad_size = pad_dataproto_to_divisor(prompts, self.actor_rollout_ref_wg.world_size)
+        self.actor_rollout_ref_wg.prepare_teacher_rollout_engine()
+        output = self.actor_rollout_ref_wg.generate_sequences_with_teacher(prompts)
+        self.actor_rollout_ref_wg.release_teacher_rollout_engine()
+        output = unpad_dataproto(output, pad_size)
+        response_lengths = torch.sum(output.batch["response_mask"], dim=-1)
+        verdicts = []
+        for output_index, caption in enumerate(captions):
+            response_ids = output.batch["responses"][output_index][: int(response_lengths[output_index].item())]
+            verdicts.append(
+                parse_groundedness_verdict(
+                    self.tokenizer.decode(response_ids, skip_special_tokens=False),
+                    caption,
+                    max_claims=config.max_claims,
+                    max_claim_chars=config.max_claim_chars,
+                    unsupported_penalty=config.unsupported_penalty,
+                    contradicted_penalty=config.contradicted_penalty,
+                    min_checked_claims=config.min_checked_claims,
+                )
+            )
+        return verdicts
 
     def _build_supervised_batch(
         self,
@@ -1010,6 +1194,8 @@ class RayPPOTrainer:
             "opsd/regenerate_confident_candidate_count": 0,
             "opsd/regenerate_confident_candidate_rate": 0.0,
             "opsd/regenerate_confident_target_acceptance_rate": 0.0,
+            "opsd/regenerate_grounded_candidate_count": 0,
+            "opsd/regenerate_grounded_candidate_rate": 0.0,
         }
         if not low_indices:
             return None, regen_metrics
@@ -1068,6 +1254,38 @@ class RayPPOTrainer:
         teacher_output = teacher_output[safe_indices]
         parent_indices = parent_indices[safe_indices]
         decoded = [decoded[index] for index in safe_indices]
+
+        groundedness_config = self.config.worker.opsd.groundedness
+        candidate_verdicts = self._verify_caption_texts(
+            caption_batch,
+            [int(index) for index in parent_indices],
+            decoded,
+        )
+        grounded_keep = []
+        for candidate_index, (parent_index, verdict) in enumerate(
+            zip(parent_indices, candidate_verdicts)
+        ):
+            source = str(caption_batch.non_tensor_batch["source"][int(parent_index)])
+            is_no_target = source == "gres_no_target"
+            if (
+                not groundedness_config.enabled
+                or is_no_target
+                or (
+                    verdict.get("parse_ok", False)
+                    and float(verdict.get("groundedness_score", 0.0))
+                    >= groundedness_config.min_groundedness_score
+                )
+            ):
+                grounded_keep.append(candidate_index)
+        regen_metrics["opsd/regenerate_grounded_candidate_count"] = len(grounded_keep)
+        regen_metrics["opsd/regenerate_grounded_candidate_rate"] = len(grounded_keep) / max(
+            len(decoded), 1
+        )
+        if not grounded_keep:
+            return None, regen_metrics
+        teacher_output = teacher_output[grounded_keep]
+        parent_indices = parent_indices[grounded_keep]
+        decoded = [decoded[index] for index in grounded_keep]
 
         def repeat_parent_field(name, default=None):
             source = caption_batch.non_tensor_batch.get(name)
@@ -1177,6 +1395,7 @@ class RayPPOTrainer:
             "opsd/distillation_confident_count": 0,
             "opsd/distillation_confident_rate": 0.0,
             "opsd/distillation_confident_R_Ci_mean": 0.0,
+            "opsd/distill_grounded_rate": 0.0,
         }
         if not mid_indices:
             return None, distill_metrics
@@ -1188,6 +1407,31 @@ class RayPPOTrainer:
                 if float(caption_batch.non_tensor_batch["R_Ci"][index])
                 >= confidence_config.distill_min_caption_score
             ]
+        groundedness_config = self.config.worker.opsd.groundedness
+        if groundedness_config.enabled:
+            # A GT-crop-conditioned distribution is only a useful auxiliary
+            # target once the actor caption has minimum cycle evidence. This
+            # gate is intentionally independent from the optional historical
+            # teacher-confidence ablation.
+            mid_indices = [
+                index
+                for index in mid_indices
+                if float(caption_batch.non_tensor_batch["R_Ci"][index])
+                >= groundedness_config.min_distill_caption_score
+            ]
+        groundedness_route_count = len(mid_indices)
+        groundedness_rows = caption_batch.non_tensor_batch.get("groundedness", [])
+        if groundedness_config.enabled:
+            mid_indices = [
+                index
+                for index in mid_indices
+                if bool(groundedness_rows[index].get("parse_ok", False))
+                and float(groundedness_rows[index].get("groundedness_score", 0.0))
+                >= groundedness_config.min_groundedness_score
+            ]
+            distill_metrics["opsd/distill_grounded_rate"] = len(mid_indices) / max(
+                groundedness_route_count, 1
+            )
         distill_metrics["opsd/distillation_confident_count"] = len(mid_indices)
         distill_metrics["opsd/distillation_confident_rate"] = len(mid_indices) / max(
             distill_metrics["opsd/distillation_route_count"], 1
@@ -1233,6 +1477,11 @@ class RayPPOTrainer:
         student.batch["teacher_attention_mask"] = teacher_attention_mask
         student.batch["teacher_position_ids"] = teacher_position_ids
         student.batch["distill_weight"] = weights
+        if groundedness_config.enabled and groundedness_config.token_jsd_enabled:
+            base_mask = student.batch["groundedness_token_mask"].to(dtype=torch.float32)
+            student.batch["groundedness_token_weight"] = 1.0 + (
+                groundedness_config.token_jsd_multiplier * base_mask
+            )
         student.non_tensor_batch["teacher_multi_modal_data"] = teacher_prompts.non_tensor_batch[
             "multi_modal_data"
         ]
@@ -1501,6 +1750,10 @@ class RayPPOTrainer:
                             metrics["opsd/raw_gt_reference_rate"] = references.count("raw_gt") / max(
                                 len(references), 1
                             )
+                            groundedness_metrics = self._generate_groundedness_verification(
+                                cycle_cap_batch
+                            )
+                            metrics.update(groundedness_metrics)
                             teacher_diagnoses = self._generate_teacher_diagnoses(cycle_cap_batch)
                             self._write_teacher_diagnoses(teacher_diagnoses)
                             metrics["opsd/teacher_analysis_count"] = len(teacher_diagnoses)
@@ -1689,7 +1942,15 @@ class RayPPOTrainer:
 
                     seg_batch = cycle_seg_batch
 
-                # Concatenate non_cycle_batch and cycle_cap_batch into cap_batch
+                # Groundedness is fully consumed by the reward and optional
+                # auxiliary JSD batch. Keep it off every main PPO actor batch.
+                if cycle_cap_batch is not None:
+                    for key in ("groundedness_token_mask", "groundedness_token_weight"):
+                        if key in cycle_cap_batch.batch:
+                            cycle_cap_batch.batch.pop(key)
+                    cycle_cap_batch.non_tensor_batch.pop("groundedness", None)
+
+                # Concatenate non_cycle_batch and cycle_cap_batch into cap_batch.
                 if non_cycle_batch is not None and cycle_cap_batch is not None:
                     if "policy_loss_mask" in cycle_cap_batch.batch:
                         non_cycle_batch.batch["policy_loss_mask"] = torch.ones(
@@ -1715,6 +1976,7 @@ class RayPPOTrainer:
                         "caption_response_tokens",
                         "route_before_caption_safety",
                         "caption_forced_regenerate",
+                        "groundedness",
                         "representative_mask",
                         "best_mask",
                         "iou_mean",

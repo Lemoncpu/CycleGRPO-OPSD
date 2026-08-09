@@ -211,8 +211,9 @@ def build_privileged_teacher_images(
     *,
     padding_fraction: float = 0.15,
     max_crop_pixels: int = _PRIVILEGED_CROP_MAX_PIXELS,
+    include_reconstruction: bool = True,
 ) -> list[Image.Image]:
-    """Build teacher-only scene, GT-target, and reconstructed-target visual evidence."""
+    """Build teacher-only scene/target evidence, optionally including reconstruction."""
     if not 0.0 <= padding_fraction <= 1.0:
         raise ValueError("padding_fraction must be in [0, 1].")
     if max_crop_pixels <= 0:
@@ -224,16 +225,20 @@ def build_privileged_teacher_images(
     )
     box = _union_crop_box(
         target_mask,
-        reconstruction_mask,
+        reconstruction_mask if include_reconstruction else None,
         width=scene.width,
         height=scene.height,
         padding_fraction=padding_fraction,
     )
-    return [
+    evidence = [
         scene,
         _limit_crop_pixels(_masked_crop(scene, target_mask, box), max_crop_pixels),
-        _limit_crop_pixels(_masked_crop(scene, reconstruction_mask, box), max_crop_pixels),
     ]
+    if include_reconstruction:
+        evidence.append(
+            _limit_crop_pixels(_masked_crop(scene, reconstruction_mask, box), max_crop_pixels)
+        )
+    return evidence
 
 
 def _relative_position(target: dict[str, object], reconstruction: dict[str, object]) -> dict[str, object]:
@@ -294,16 +299,34 @@ def build_privileged_context(
 
 
 def format_privileged_prompt(context: dict[str, object], *, mode: str) -> str:
-    base = (
-        "You are improving an object caption with privileged visual evidence.\n"
+    caption = context.get("student_caption", "")
+    base = "You are improving an object caption with privileged visual evidence.\n"
+    if mode == "groundedness":
+        return base + (
+            "Image 1 is the full scene. Image 2 isolates the intended object.\n"
+            f"Student caption: {caption}\n"
+            "Extract at most 8 literal substrings from the student caption that make visual claims. "
+            "For each claim, classify it as supported, contradicted, unsupported, or uncertain. "
+            "Use supported only when Image 2 or directly visible scene evidence proves it. "
+            "Use unsupported when the caption adds an unverified detail. Use uncertain for ambiguity. "
+            "A relation such as right, behind, background, or nearby is supported only when both the "
+            "target and a named reference are visibly verifiable. Do not require background details.\n"
+            "Output only JSON: {\"claims\":[{\"text\":\"literal caption substring\",\"type\":"
+            "appearance|part|count|relation|context|other\",\"verdict\":"
+            "supported|contradicted|unsupported|uncertain\"}],\"overall\":"
+            "supported|partially_supported|unsupported\"}."
+        )
+    base += (
         "Image 1 is the full scene. Image 2 isolates the intended object. "
         "Image 3 isolates the object or area recovered from the student caption.\n"
-        f"Student caption: {context.get('student_caption', '')}\n"
+        f"Student caption: {caption}\n"
     )
     if mode == "regenerate":
         return base + (
-            "Write one corrected, detailed, factual caption for the intended object. "
-            "Use visible attributes that distinguish it from the recovered object or area. "
+            "Write one concise factual caption for the isolated target only. "
+            "Include only attributes directly visible in Image 2. Do not infer hidden parts, brands, "
+            "materials, background, or spatial relations unless directly visible and necessary to identify "
+            "the target. Use Image 3 only to avoid confusing the target with the recovered area. "
             "Output only the caption. Never mention images, crops, scores, coordinates, or this analysis."
         )
     if mode == "distill":
