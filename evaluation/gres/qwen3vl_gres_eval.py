@@ -1,24 +1,19 @@
 import argparse
-import copy
 import math
 import os
 import time
 import torch
-import torchvision
 import tqdm
 from pycocotools import mask as mask_utils
 import numpy as np
-import random
 import re
 from PIL import Image
 import json
-import uuid
 import hydra
 
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 
-from qwen_vl_utils import process_vision_info
 from torchvision.transforms.functional import to_pil_image
 
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
@@ -37,9 +32,36 @@ class DirectResize:
         img = to_pil_image(image, mode='RGB')
         return np.array(img.resize((self.target_length, self.target_length)))
 
-def load_dataset(split='val'):
-    refer_api = G_REFER('./data/ref_seg/grefs/coco2014/train2014', './data/ref_seg/grefs/grefs(unc).json', './data/ref_seg/grefs/instances.json')
-    
+def _decode_annotation(annotation, height, width):
+    segmentation = annotation.get("segmentation", []) if annotation else []
+    if not segmentation:
+        return np.zeros((height, width), dtype=np.uint8)
+    if isinstance(segmentation, dict):
+        if isinstance(segmentation.get("counts"), list):
+            rle = mask_utils.frPyObjects(segmentation, height, width)
+        else:
+            rle = segmentation
+        decoded = mask_utils.decode(rle)
+    else:
+        polygons = [p for p in segmentation if len(p) >= 6 and len(p) % 2 == 0]
+        if not polygons:
+            return np.zeros((height, width), dtype=np.uint8)
+        decoded = mask_utils.decode(mask_utils.merge(mask_utils.frPyObjects(polygons, height, width)))
+    if decoded.ndim == 3:
+        decoded = decoded.any(axis=2)
+    return (decoded > 0).astype(np.uint8)
+
+
+def _encode_mask(binary_mask):
+    rle = mask_utils.encode(np.asfortranarray(binary_mask.astype(np.uint8)))
+    rle["counts"] = rle["counts"].decode("utf-8")
+    return rle
+
+
+def load_dataset(grefs_file, instances_file, image_root, split="val", output_file=None):
+    """Convert official gRefCOCO annotations into inference-ready records."""
+    refer_api = G_REFER(image_root, grefs_file, instances_file)
+
     ref_ids_val = refer_api.getRefIds(split=split)
     images_ids_val = refer_api.getImgIds(ref_ids=ref_ids_val)
     refs_val = refer_api.loadRefs(ref_ids=ref_ids_val)
@@ -48,8 +70,7 @@ def load_dataset(split='val'):
     loaded_images = refer_api.loadImgs(image_ids=images_ids_val)
     for item in loaded_images:
         item = item.copy()
-        # item["file_name"] = os.path.join('./data/ref_seg/grefs/coco2014/train2014', item["file_name"])
-        item["file_name"] = os.path.join('<PATH_TO_COCO2014>/train2014', item["file_name"])
+        item["file_name"] = os.path.join(image_root, item["file_name"])
 
         refer_seg_ds["images"].append(item)
     refer_seg_ds["annotations"] = refer_api.Anns  # anns_val
@@ -82,61 +103,21 @@ def load_dataset(split='val'):
 
         anno_masks = []
         for i, ann_id in enumerate(sampled_ann_ids):
-            no_target = ann_id == [-1]
-            if no_target:  # no target
-                m = np.zeros((image_info["height"], image_info["width"], 1))
-            elif len(ann_id) > 1:  # multi target / already merged ?
-                m = []
-                for sub_ann_id in ann_id:
-                    sub_mask_info = refer_seg_ds["annotations"][sub_ann_id]["segmentation"]
-                    if len(sub_mask_info) == 0:
-                        sub_m = np.zeros((image_info["height"], image_info["width"], 1))
-                    else:
-                        if isinstance(sub_mask_info, dict):
-                            if isinstance(sub_mask_info["counts"], list):
-                                # convert to compressed RLE
-                                rle = mask_utils.frPyObjects(sub_mask_info, image_info["height"], image_info["width"])
-                        else:
-                            # filter out invalid polygons (< 3 points)
-                            polygons = [poly for poly in sub_mask_info if len(poly) % 2 == 0 and len(poly) >= 6]
-                            if len(polygons) == 0:
-                                continue  # ignore this instance
-                            rle = mask_utils.frPyObjects(polygons, image_info["height"], image_info["width"])
-                        sub_m = mask_utils.decode(rle)
-                        if sub_m.ndim < 3:
-                            assert sub_m.ndim == 2
-                            sub_m = sub_m[..., np.newaxis]
-                    sub_m = np.sum(sub_m, axis=2)
-                    m.append(sub_m)
-                m = np.sum(m, axis=0)[..., np.newaxis]
-            else:
-                assert len(ann_id) == 1 and ann_id[0] != -1
-                mask_info = refer_seg_ds["annotations"][ann_id[0]]["segmentation"]
-                if len(mask_info) == 0:
-                    m = np.zeros((image_info["height"], image_info["width"], 1))
-                else:
-                    if isinstance(mask_info, dict):
-                        if isinstance(mask_info["counts"], list):
-                            # convert to compressed RLE
-                            rle = mask_utils.frPyObjects(mask_info, image_info["height"], image_info["width"])
-                    else:
-                        # filter out invalid polygons (< 3 points)
-                        polygons = [poly for poly in mask_info if len(poly) % 2 == 0 and len(poly) >= 6]
-                        if len(polygons) == 0:
-                            continue  # ignore this instance
-                        rle = mask_utils.frPyObjects(polygons, image_info["height"], image_info["width"])
-                    m = mask_utils.decode(rle)
-                    if m.ndim < 3:
-                        assert m.ndim == 2
-                        m = m[..., np.newaxis]
-            m = np.sum(m, axis=2)
-            anno_masks.append(m)   
+            ann_ids = ann_id if isinstance(ann_id, list) else [ann_id]
+            mask = np.zeros((image_info["height"], image_info["width"]), dtype=np.uint8)
+            for sub_ann_id in ann_ids:
+                if sub_ann_id == -1:
+                    continue
+                mask |= _decode_annotation(
+                    refer_seg_ds["annotations"].get(sub_ann_id),
+                    image_info["height"], image_info["width"],
+                )
+            anno_masks.append(mask)
 
         for sent, binary_mask in zip(sents, anno_masks):
             assert len(binary_mask.shape) == 2
             binary_mask = (binary_mask > 0).astype(np.uint8)
-            rle = mask_utils.encode(np.array(binary_mask[:, :, None], order="F", dtype="uint8"))[0]
-            rle["counts"] = rle["counts"].decode("utf-8")
+            rle = _encode_mask(binary_mask)
 
             all_items.append({
                 "image": image_path,
@@ -144,9 +125,12 @@ def load_dataset(split='val'):
                 "segmentation": rle,
             })
     
-    with open(f'./data/PaDT-MLLM/RefCOCO/grefcoco_{split}.json', 'w') as f:
+    if output_file is None:
+        raise ValueError("output_file is required")
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    with open(output_file, 'w') as f:
         json.dump(all_items, f)
-    print(f"Saved at ./data/PaDT-MLLM/RefCOCO/grefcoco_{split}.json")
+    print(f"Saved {len(all_items)} GRES samples at {output_file}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='GRES')
@@ -168,8 +152,17 @@ def parse_args():
         help='save path')
     parser.add_argument(
         '--dataset',
-        default='./data/PaDT-MLLM/RefCOCO/grefcoco_val.json',
-        help='Specify a ref dataset')
+        default=None,
+        help='Prepared JSON dataset; created with --prepare-dataset when omitted.')
+    parser.add_argument('--grefs-file', default=None,
+                        help='Official gRefCOCO refs JSON, e.g. grefs(unc).json.')
+    parser.add_argument('--instances-file', default=None,
+                        help='COCO instances JSON used by gRefCOCO.')
+    parser.add_argument('--image-root', default=None,
+                        help='Directory containing COCO train2014 images.')
+    parser.add_argument('--split', default='val', choices=('train', 'val', 'testA', 'testB'))
+    parser.add_argument('--prepare-dataset', action='store_true',
+                        help='Build the inference JSON from official gRefCOCO annotations and exit.')
     parser.add_argument('--task_id', '--task-id', type=int, default=0,
                         help='Shard index for this process (0 .. num_tasks-1).')
     parser.add_argument('--num_tasks', '--num-tasks', type=int, default=1,
@@ -178,6 +171,8 @@ def parse_args():
                         help='CUDA device to bind this process to. Default -1 => use task_id.')
     parser.add_argument('--metric_only', '--metric-only', action='store_true',
                         help='Skip inference; just compute the metric over existing save_dir.')
+    parser.add_argument('--metrics-file', default=None,
+                        help='Optional JSON path for the aggregate GRES metrics.')
     args = parser.parse_args()
     return args
 
@@ -272,9 +267,6 @@ def fix_mt_format_comprehensive(text):
     return text
 
 
-from projects.vlm.tokenmask.evaluation.utils import Summary, AverageMeter, intersectionAndUnionGPU
-
-
 def _iter_json_records(json_file_path):
     """Yield dict records from JSON/JSONL/concatenated JSON content."""
     with open(json_file_path, "r", encoding="utf-8") as f:
@@ -331,18 +323,19 @@ def _iter_json_records(json_file_path):
 
 
 def metric(args):
-    inter_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
-    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
-    g_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
-    nt_tp_meter = AverageMeter("NT_TP", ":6.3f", Summary.SUM)
-    nt_tn_meter = AverageMeter("NT_TN", ":6.3f", Summary.SUM)
-    nt_fp_meter = AverageMeter("NT_FP", ":6.3f", Summary.SUM)
-    nt_fn_meter = AverageMeter("NT_FN", ":6.3f", Summary.SUM)
+    intersection = 0
+    union = 0
+    target_ious = []
+    all_ious = []
+    no_target_correct = 0
+    no_target_total = 0
+    target_correct = 0
+    target_total = 0
 
-    for json_file in os.listdir(f"{args.save_dir}"):
-        if not (json_file.endswith(".json") or json_file.endswith(".jsonl")):
+    for json_file in os.listdir(args.save_dir):
+        if not json_file.startswith("case_") or not json_file.endswith(".json"):
             continue
-        json_file_path = os.path.join(f"{args.save_dir}", json_file)
+        json_file_path = os.path.join(args.save_dir, json_file)
         records = _iter_json_records(json_file_path)
         if not records:
             print(f"[warn] skip unreadable/empty file: {json_file_path}")
@@ -352,85 +345,71 @@ def metric(args):
             if "pred_masks" not in json_data or "gt_masks" not in json_data:
                 continue
 
-            pred_mask = rle_to_mask([json_data["pred_masks"]])[0]
-            gt_mask = rle_to_mask([json_data["gt_masks"]])[0]
-
-            pred_mask = torch.from_numpy(pred_mask).int().cuda()
-            gt_mask = torch.from_numpy(gt_mask).int().cuda()
-
-            if gt_mask.sum() < 1.0:  # empty target
-                if pred_mask.sum() < 1.0:
-                    # true positive
-                    nt_tp_meter.update(1.0)
-                    g_iou_meter.update(1.0)
-                else:
-                    inter_i, union_i, _ = intersectionAndUnionGPU(pred_mask.contiguous().clone(), gt_mask.contiguous().clone(), K=2, ignore_index=255)
-                    inter_i = inter_i.cpu().numpy()
-                    union_i = union_i.cpu().numpy()
-                    nt_fn_meter.update(1.0)
-                    g_iou_meter.update(0.0)
-                    union_meter.update(union_i)
+            pred_mask = rle_to_mask([json_data["pred_masks"]])[0].astype(bool)
+            gt_mask = rle_to_mask([json_data["gt_masks"]])[0].astype(bool)
+            inter = int(np.logical_and(pred_mask, gt_mask).sum())
+            current_union = int(np.logical_or(pred_mask, gt_mask).sum())
+            is_target = bool(gt_mask.any())
+            is_predicted = bool(pred_mask.any())
+            if is_target:
+                target_total += 1
+                target_correct += int(is_predicted)
+                intersection += inter
+                union += current_union
+                iou = inter / current_union if current_union else 0.0
+                target_ious.append(iou)
             else:
-                if pred_mask.sum() < 1.0:
-                    nt_fp_meter.update(1.0)
-                else:
-                    nt_tn_meter.update(1.0)
-                try:
-                    inter_i, union_i, _ = intersectionAndUnionGPU(pred_mask.contiguous().clone(), gt_mask.contiguous().clone(), K=2, ignore_index=255)
-                except Exception:
-                    print("pred_mask.shape: ", pred_mask.shape)
-                    print("gt_mask.shape: ", gt_mask.shape)
-                    continue
-                inter_i = inter_i.cpu().numpy()
-                union_i = union_i.cpu().numpy()
-                this_giou = inter_i / (union_i + 1e-8)
-                inter_meter.update(inter_i)
-                union_meter.update(union_i)
-                g_iou_meter.update(this_giou)
+                no_target_total += 1
+                no_target_correct += int(not is_predicted)
+                iou = 1.0 if not is_predicted else 0.0
+                # Match the original GRES protocol: an empty-target false
+                # positive increases cIoU's union, while a correct rejection
+                # has no foreground pixels to contribute.
+                if is_predicted:
+                    union += current_union
+            all_ious.append(iou)
+
+    metrics = {
+        "samples": len(all_ious),
+        "no_target_samples": no_target_total,
+        "target_samples": target_total,
+        "N_acc": 100.0 * no_target_correct / no_target_total if no_target_total else 0.0,
+        "T_acc": 100.0 * target_correct / target_total if target_total else 0.0,
+        "gIoU": 100.0 * sum(all_ious) / len(all_ious) if all_ious else 0.0,
+        "cIoU": 100.0 * intersection / union if union else 0.0,
+        "mIoU_target": 100.0 * sum(target_ious) / len(target_ious) if target_ious else 0.0,
+    }
+    if args.metrics_file:
+        os.makedirs(os.path.dirname(os.path.abspath(args.metrics_file)), exist_ok=True)
+        with open(args.metrics_file, "w", encoding="utf-8") as file:
+            json.dump(metrics, file, indent=2)
+    print(json.dumps(metrics, indent=2))
+    return metrics
         
-    # inter_meter.all_reduce()
-    # union_meter.all_reduce()
-    # g_iou_meter.all_reduce()
-    # nt_tp_meter.all_reduce()
-    # nt_tn_meter.all_reduce()
-    # nt_fp_meter.all_reduce()
-    # nt_fn_meter.all_reduce()
-
-    N_acc = nt_tp_meter.sum / (nt_tp_meter.sum + nt_fn_meter.sum)  # for gt is empty, pred is empty
-    T_acc = nt_tn_meter.sum / (nt_tn_meter.sum + nt_fp_meter.sum)  # for gt is target, pred is target
-    g_iou = g_iou_meter.avg[1]
-    c_iou = (inter_meter.sum / (union_meter.sum + 1e-10))[1]
-    log_stats = {}
-    log_stats["N_acc"] = round(N_acc * 100, 2)
-    log_stats["T_acc"] = round(T_acc * 100, 2)
-    log_stats["g_iou"] = round(g_iou * 100, 2)
-    log_stats["c_iou"] = round(c_iou * 100, 2)
-    print(log_stats)
-        
-def maybe_metric(all_data_dict, args):
-    """Compute the GRES metric once EVERY shard has written its {case_id}.json.
-
-    Called by each shard at exit; only the last one to finish sees all files and
-    runs metric() (which reads the whole save_dir). metric() only prints, so even
-    a duplicate trigger is harmless.
-    """
-    want = [d["case_id"] for d in all_data_dict]
-    n_done = sum(os.path.exists(os.path.join(args.save_dir, f"{c}.json")) for c in want)
-    if n_done < len(want):
-        print(f"[task {args.task_id}] metric skipped: {n_done}/{len(want)} done, "
-              f"other shards still running.")
-        return
-    print(f"[task {args.task_id}] all {len(want)} samples done -> computing metric")
-    metric(args)
-
-
 def main():
     args = parse_args()
+
+    if args.prepare_dataset:
+        required = ("dataset", "grefs_file", "instances_file", "image_root")
+        missing = [name for name in required if not getattr(args, name)]
+        if missing:
+            raise ValueError(f"Missing required preparation arguments: {', '.join(missing)}.")
+        for name in ("grefs_file", "instances_file", "image_root"):
+            path = getattr(args, name)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"GRES {name.replace('_', ' ')} not found: {path}")
+        load_dataset(args.grefs_file, args.instances_file, args.image_root, args.split, args.dataset)
+        return args
 
     # metric-only: skip all model loading, just score existing predictions.
     if args.metric_only:
         metric(args)
         return args
+
+    if not args.dataset:
+        raise ValueError("--dataset is required for GRES inference; run with --prepare-dataset first.")
+    if not os.path.isfile(args.dataset):
+        raise FileNotFoundError(f"GRES dataset not found: {args.dataset}")
 
     # ---- multi-GPU data parallelism: bind this process to one GPU ----
     gpu_id = args.task_id if args.gpu_id < 0 else args.gpu_id
@@ -447,7 +426,8 @@ def main():
     # build vq-sam2 model
     CODEBOOK_SIZE = 256
     CODEBOOK_DEPTH = 2
-    with hydra.initialize(version_base=None, config_path='../../projects/transformers/vq_sam2/sam2/sam2_configs'):
+    config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../projects/transformers/vq_sam2/sam2/sam2_configs"))
+    with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
         sam2_config = SAM2Config(
             cfg_path="sam2.1_hiera_l.yaml",
             ckpt_path=args.sam2_path,
@@ -463,7 +443,9 @@ def main():
     vq_sam2 = VQ_SAM2(vq_sam2_config).to(device).eval()
 
     state = torch.load(args.vq_sam2_path, map_location="cpu")
-    vq_sam2.load_state_dict(state)
+    if "state_dict" in state:
+        state = state["state_dict"]
+    vq_sam2.load_state_dict({key.removeprefix("hf_model."): value for key, value in state.items()})
 
     sam2_image_processor = DirectResize(1024)
 
@@ -488,9 +470,6 @@ def main():
     count = 0
     for data_dict in tqdm.tqdm(all_data_dict[_start_:_end_]):
         image_path = data_dict['image']
-        # image_path = image_path.replace('data/ref_seg/grefs/coco2014/train2014', 'data/coco/train2014')
-        image_path = image_path.replace('./data/ref_seg/grefs/coco2014/train2014', '<PATH_TO_COCO2014>/train2014')
-        
         phrase = data_dict['phrase']
         rle = data_dict['segmentation']
         case_id = data_dict['case_id']
@@ -498,14 +477,15 @@ def main():
         try:
             image = load_image_with_retry(image_path)
         except Exception as e:
-            print(f"skip {image_path} after retries: {e}")
-            continue
+            raise RuntimeError(f"Could not read GRES image {image_path}: {e}") from e
 
         ori_width, ori_height = image.size
 
         if rle['size'][0] != ori_height or rle['size'][1] != ori_width:
-            print("skip this cases!!!!!!!!!!!!!!!!!!!!!!!!")
-            continue
+            raise ValueError(
+                f"GRES annotation/image size mismatch for {image_path}: "
+                f"RLE={rle['size']}, image={[ori_height, ori_width]}"
+            )
 
         # gt_masks = rle_to_mask([rle])
         # output_image = visualize(image, gt_masks, ["gt"])
@@ -514,7 +494,8 @@ def main():
 
         question = f"Please segment {phrase} in this image."
         
-        if os.path.exists(f"{args.save_dir}/{case_id}.json"):
+        output_path = os.path.join(args.save_dir, f"case_{case_id}.json")
+        if os.path.exists(output_path):
             print("file exists.............")
             continue
 
@@ -551,7 +532,7 @@ def main():
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         output_text = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated_ids_trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
         # print("User: ", phrase)
         print("Assistant: ", output_text)
@@ -564,7 +545,7 @@ def main():
 
             # exit(0)
 
-            with open(f"{args.save_dir}/{case_id}.json", 'w') as f:
+            with open(output_path, 'w') as f:
                 json.dump(prediction, f)
             continue
 
@@ -579,7 +560,7 @@ def main():
             zero_mask = mask_to_rle(zero_mask)
             prediction = {'gt_masks': rle, 'pred_masks': zero_mask[0]}
 
-            with open(f"{args.save_dir}/{case_id}.json", 'w') as f:
+            with open(output_path, 'w') as f:
                 json.dump(prediction, f)
             continue
 
@@ -598,6 +579,11 @@ def main():
             remap_quant_ids.append(remap_chunk_quant_ids_error_handle)
 
         batch_size = len(remap_quant_ids)
+        if batch_size == 0:
+            zero_mask = mask_to_rle(np.zeros((1, ori_height, ori_width), dtype=np.uint8))
+            with open(output_path, 'w') as f:
+                json.dump({'gt_masks': rle, 'pred_masks': zero_mask[0]}, f)
+            continue
         sam2_image = np.array(image)
         sam2_image = sam2_image_processor.apply_image(sam2_image)
         sam2_pixel_values = torch.from_numpy(sam2_image).permute(2, 0, 1).contiguous()
@@ -620,11 +606,9 @@ def main():
 
         _pred_masks = mask_to_rle(_pred_masks)
         prediction = {'gt_masks': rle, 'pred_masks': _pred_masks[0]}
-        with open(f"{args.save_dir}/{case_id}.json", 'w') as f:
+        with open(output_path, 'w') as f:
             json.dump(prediction, f)
 
-    # once this shard is done, compute the metric iff all shards have finished
-    maybe_metric(all_data_dict, args)
     return args
 
 

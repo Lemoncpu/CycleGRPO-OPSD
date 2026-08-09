@@ -14,12 +14,17 @@ EVAL_ROOT=${EVAL_ROOT:-${REPO_DIR}/logs/refcoco10k_opsd/evaluation}
 REFCOCO_ROOT=${REFCOCO_ROOT:-${BASE_DIR}/refcoco-train2014-assets}
 GROUNDINGSUITE_ROOT=${GROUNDINGSUITE_ROOT:-${BASE_DIR}/GSEval}
 DLC_ROOT=${DLC_ROOT:-${BASE_DIR}/describe-anything/evaluation/DLC-Bench}
+GRES_ROOT=${GRES_ROOT:-${BASE_DIR}/grefcoco}
+GRES_REFS_FILE=${GRES_REFS_FILE:-$GRES_ROOT/grefs(unc).json}
+GRES_INSTANCES_FILE=${GRES_INSTANCES_FILE:-$GRES_ROOT/instances.json}
+GRES_IMAGE_ROOT=${GRES_IMAGE_ROOT:-$REFCOCO_ROOT/train2014}
+GRES_SPLIT=${GRES_SPLIT:-val}
 NUM_GPUS=${NUM_GPUS:-8}
 RAY_SHORT_ROOT=${RAY_SHORT_ROOT:-/tmp/cgrpo-export-${UID:-$(id -u)}}
 
 case "$ACTION" in
-    export|refcoco|groundingsuite|dlc|all) ;;
-    *) echo "Usage: $0 {export|refcoco|groundingsuite|dlc|all}" >&2; exit 2 ;;
+    export|refcoco|groundingsuite|gres|dlc|all) ;;
+    *) echo "Usage: $0 {export|refcoco|groundingsuite|gres|dlc|all}" >&2; exit 2 ;;
 esac
 
 if [[ "${CONDA_PREFIX:-}" != "$ENV_DIR" ]] && command -v conda >/dev/null 2>&1; then
@@ -94,10 +99,30 @@ run_dlc() {
         --output "$EVAL_ROOT/dlc_bench_predictions.json"
 }
 
+run_gres() {
+    require_hf_model
+    local split=${GRES_SPLIT}
+    local dataset=${GRES_DATASET:-$EVAL_ROOT/gres_${split}_samples.json}
+    local save_dir=$EVAL_ROOT/gres
+    [[ -f "$GRES_REFS_FILE" ]] || { echo "gRefCOCO refs file not found: $GRES_REFS_FILE" >&2; exit 1; }
+    [[ -f "$GRES_INSTANCES_FILE" ]] || { echo "gRefCOCO instances file not found: $GRES_INSTANCES_FILE" >&2; exit 1; }
+    [[ -d "$GRES_IMAGE_ROOT" ]] || { echo "gRefCOCO image root not found: $GRES_IMAGE_ROOT" >&2; exit 1; }
+    if [[ ! -f "$dataset" ]]; then
+        "$PYTHON_BIN" evaluation/gres/qwen3vl_gres_eval.py \
+            --prepare-dataset --grefs-file "$GRES_REFS_FILE" \
+            --instances-file "$GRES_INSTANCES_FILE" --image-root "$GRES_IMAGE_ROOT" \
+            --split "$split" --dataset "$dataset"
+    fi
+    VQ_SAM2_PATH="$TRAIN_MODEL_PATH/mask_tokenizer_256x2.pth" \
+    SAM2_PATH="$TRAIN_MODEL_PATH/sam2.1_hiera_large.pt" PYTHON_BIN="$PYTHON_BIN" \
+    bash evaluation/gres/run_gres_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$save_dir" "$dataset"
+}
+
 case "$ACTION" in
     export) run_export ;;
     refcoco) run_refcoco ;;
     groundingsuite) run_groundingsuite ;;
+    gres) run_gres ;;
     dlc) run_dlc ;;
-    all) run_export; run_refcoco; run_groundingsuite; run_dlc ;;
+    all) run_export; run_refcoco; run_groundingsuite; run_gres; run_dlc ;;
 esac

@@ -13,11 +13,17 @@ _VALID_OVERALL = {"supported", "partially_supported", "unsupported"}
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 
-def disabled_groundedness() -> dict[str, Any]:
-    """Return the neutral verdict used for no-target and failed verifier rows."""
+def disabled_groundedness(
+    *,
+    parse_failure_reason: str = "disabled",
+    discarded_claim_reasons: Optional[Mapping[str, int]] = None,
+) -> dict[str, Any]:
+    """Return a neutral verdict, retaining parser diagnostics when available."""
     return {
         "enabled": False,
         "parse_ok": False,
+        "parse_failure_reason": parse_failure_reason,
+        "discarded_claim_reasons": dict(discarded_claim_reasons or {}),
         "overall": None,
         "claims": [],
         "groundedness_score": 0.0,
@@ -67,42 +73,61 @@ def parse_groundedness_verdict(
     A claim is usable only when its text is a literal, non-empty substring of the
     original caption. Invalid claims are discarded rather than guessed or repaired.
     """
-    neutral = disabled_groundedness()
     if max_claims <= 0 or min_checked_claims <= 0:
         raise ValueError("max_claims and min_checked_claims must be positive.")
     if unsupported_penalty < 0 or contradicted_penalty < 0:
         raise ValueError("groundedness penalties must be non-negative.")
     payload = _extract_json_object(text)
     if payload is None:
-        return neutral
+        return disabled_groundedness(parse_failure_reason="no_json_object")
     overall = payload.get("overall")
     if overall not in _VALID_OVERALL:
-        return neutral
+        return disabled_groundedness(parse_failure_reason="invalid_overall")
     raw_claims = payload.get("claims")
     if not isinstance(raw_claims, list):
-        return neutral
+        return disabled_groundedness(parse_failure_reason="claims_not_list")
 
     claims = []
+    discarded_claim_reasons: dict[str, int] = {}
+
+    def discard(reason: str) -> None:
+        discarded_claim_reasons[reason] = discarded_claim_reasons.get(reason, 0) + 1
+
     for raw_claim in raw_claims[:max_claims]:
         if not isinstance(raw_claim, Mapping):
+            discard("claim_not_mapping")
             continue
         claim_text = raw_claim.get("text")
         claim_type = raw_claim.get("type")
         verdict = raw_claim.get("verdict")
-        if (
-            not isinstance(claim_text, str)
-            or not claim_text.strip()
-            or len(claim_text) > max_claim_chars
-            or claim_text not in caption
-            or claim_type not in _VALID_TYPES
-            or verdict not in _VALID_VERDICTS
-        ):
+        if not isinstance(claim_text, str) or not claim_text.strip():
+            discard("claim_missing_or_empty_text")
+            continue
+        if len(claim_text) > max_claim_chars:
+            discard("claim_text_too_long")
+            continue
+        if claim_text not in caption:
+            discard("claim_not_literal_substring")
+            continue
+        if claim_type not in _VALID_TYPES:
+            discard("claim_invalid_type")
+            continue
+        if verdict not in _VALID_VERDICTS:
+            discard("claim_invalid_verdict")
             continue
         claims.append({"text": claim_text, "type": claim_type, "verdict": verdict})
 
+    if not claims:
+        return disabled_groundedness(
+            parse_failure_reason="no_valid_claims",
+            discarded_claim_reasons=discarded_claim_reasons,
+        )
     checked = sum(claim["verdict"] in {"supported", "unsupported", "contradicted"} for claim in claims)
     if checked < min_checked_claims:
-        return neutral
+        return disabled_groundedness(
+            parse_failure_reason="insufficient_checked_claims",
+            discarded_claim_reasons=discarded_claim_reasons,
+        )
     counts = {verdict: sum(claim["verdict"] == verdict for claim in claims) for verdict in _VALID_VERDICTS}
     unsupported_rate = counts["unsupported"] / checked
     contradicted_rate = counts["contradicted"] / checked
@@ -111,6 +136,8 @@ def parse_groundedness_verdict(
     return {
         "enabled": True,
         "parse_ok": True,
+        "parse_failure_reason": None,
+        "discarded_claim_reasons": discarded_claim_reasons,
         "overall": overall,
         "claims": claims,
         "groundedness_score": score,

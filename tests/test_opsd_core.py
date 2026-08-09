@@ -85,6 +85,7 @@ class OPSDCoreTest(unittest.TestCase):
             max_claims=8,
         )
         self.assertTrue(verdict["parse_ok"])
+        self.assertIsNone(verdict["parse_failure_reason"])
         self.assertEqual(verdict["supported_count"], 1)
         self.assertEqual(verdict["unsupported_count"], 1)
         self.assertEqual(verdict["contradicted_count"], 0)
@@ -93,7 +94,38 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertAlmostEqual(groundedness_penalty(verdict), 0.25 / 2)
         self.assertFalse(disabled_groundedness()["enabled"])
         self.assertEqual(groundedness_penalty(disabled_groundedness()), 0.0)
-        self.assertFalse(parse_groundedness_verdict("not json", caption, max_claims=8)["parse_ok"])
+        self.assertEqual(
+            parse_groundedness_verdict("not json", caption, max_claims=8)["parse_failure_reason"],
+            "no_json_object",
+        )
+
+    def test_groundedness_parser_reports_rejection_reasons(self):
+        caption = "A red cup with a silver handle."
+        invalid_overall = parse_groundedness_verdict(
+            '{"claims": [], "overall": "maybe"}', caption, max_claims=8
+        )
+        self.assertEqual(invalid_overall["parse_failure_reason"], "invalid_overall")
+        claims_not_list = parse_groundedness_verdict(
+            '{"claims": {}, "overall": "supported"}', caption, max_claims=8
+        )
+        self.assertEqual(claims_not_list["parse_failure_reason"], "claims_not_list")
+        rejected_claim = parse_groundedness_verdict(
+            '{"claims":[{"text":"blue saucer","type":"appearance","verdict":"supported"}],'
+            '"overall":"unsupported"}',
+            caption,
+            max_claims=8,
+        )
+        self.assertEqual(rejected_claim["parse_failure_reason"], "no_valid_claims")
+        self.assertEqual(
+            rejected_claim["discarded_claim_reasons"]["claim_not_literal_substring"], 1
+        )
+        uncertain_only = parse_groundedness_verdict(
+            '{"claims":[{"text":"red cup","type":"appearance","verdict":"uncertain"}],'
+            '"overall":"partially_supported"}',
+            caption,
+            max_claims=8,
+        )
+        self.assertEqual(uncertain_only["parse_failure_reason"], "insufficient_checked_claims")
 
     def test_groundedness_token_mask_fails_closed_when_claim_cannot_align(self):
         class FakeTokenizer:

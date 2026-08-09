@@ -124,7 +124,7 @@ Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。训练 checkpoint 中的
 `actor/model_world_size_8_rank_*.pt` 是 FSDP shard，`actor/huggingface/` 只包含配置和
 processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑只加载 actor model shard 并导出
-标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite` 和 `dlc` action 使用独立 CUDA
+标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite`、`gres` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
@@ -132,7 +132,7 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root`、其 `assets/`、
 `unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
 `COCO_train2014_000000123456.jpg` 名称；无法
-解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
+解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。GRES 读取官方 `grefs(unc).json` 和 `instances.json`，以 `GRES_IMAGE_ROOT` 定位 COCO `train2014`；launcher 仅在全部 case 预测写完后汇总，输出 `N_acc`（no-target 拒识）、`T_acc`（有目标检测）、gIoU 和 cIoU。cIoU 按原协议累计有目标区域以及 no-target 的误检像素，正确的空预测不增加 union。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
 单独配置可用凭据。DLC caption inference 对全局图和可选 zoom-in 图使用与训练相同的正向 caption 指令
 `Provide a detailed factual description of this region {SEG}.`；评测 prompt 不出现 `mask`、`token`、`JSON` 或
 `reasoning` 等 segmentation 格式词，以免 SAMTok 将描述请求误解为定位请求。生成上限固定为 192 token。此协议是评测条件的一部分，比较任何 checkpoint 前都必须以同一版本重新推理。
@@ -317,7 +317,7 @@ mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：
 
 C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。非对称梯度投影仍保留为可选诊断：`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。当前服务器日志的 cosine 仅约 `-0.004` 到 `-0.018`，故入口默认关闭它。高置信 gate 新增 `opsd/regenerate_validated_candidate_count`、`opsd/regenerate_confident_candidate_{count,rate}`、`opsd/regenerate_confident_target_acceptance_rate`、`opsd/distillation_route_count`、`opsd/distillation_confident_{count,rate}` 与 `opsd/distillation_confident_R_Ci_mean`，必须同时检查这些项，避免阈值过严而使辅助 loss 静默为空。原有 anchor、projection、JSD finite 检查行为不变。
 
-当前 groundedness 受控消融在 pixel-IoU 路由之后增加一次 frozen initial teacher verifier。对所有有目标 cycle caption，teacher 只看全图和 GT target crop，输出最多 8 个必须是原 caption 字面子串的 claim，并标记 `supported`、`contradicted`、`unsupported` 或 `uncertain`。解析失败、没有有效 claim 和 `uncertain` 不产生惩罚；caption reward 仅减去 `0.25*unsupported_rate + 0.75*contradicted_rate`，不改变 pixel-IoU 或 segmentation reward。`R_Ci` low route 的 regenerate CE 要求 verifier score 至少 `0.85`；mid route 的 privileged JSD 同时要求 `R_Ci>=0.65`（`groundedness.min_distill_caption_score`）和 verifier score 至少 `0.85`，即使历史 `teacher_confidence` gate 被关闭也不会放宽该 groundedness 边界。原始 caption GRPO 保持不变。verifier 记录到 checkpoint 根目录的 `caption_groundedness.jsonl`，并输出 coverage、parse failure、claim rate 和 penalty 指标。no-target 样本继续由原 GRES 拒识 reward 处理。当前首版只建立 `groundedness_token_mask` 和可选 extra JSD weight 接口，`token_jsd_enabled=false`，不直接产生 token-level groundedness 梯度；这是当前论文循环目标之外的 caption factuality 辅助消融。为兼容 GRES no-target 与 cycle caption 共同组成的 actor batch、避免将特权 verdict 传给主 PPO worker，verifier 记录和 token mask 会在 reward/JSD 均消费完成后、任一 actor batch 更新前从 cycle caption batch 移除。
+当前 groundedness 受控消融在 pixel-IoU 路由之后增加一次 frozen initial teacher verifier。对所有有目标 cycle caption，teacher 只看全图和 GT target crop，输出最多 8 个必须是原 caption 字面子串的 claim，并标记 `supported`、`contradicted`、`unsupported` 或 `uncertain`。解析失败、没有有效 claim 和 `uncertain` 不产生惩罚；caption reward 仅减去 `0.25*unsupported_rate + 0.75*contradicted_rate`，不改变 pixel-IoU 或 segmentation reward。`R_Ci` low route 的 regenerate CE 要求 verifier score 至少 `0.85`；mid route 的 privileged JSD 同时要求 `R_Ci>=0.65`（`groundedness.min_distill_caption_score`）和 verifier score 至少 `0.85`，即使历史 `teacher_confidence` gate 被关闭也不会放宽该 groundedness 边界。原始 caption GRPO 保持不变。verifier 记录到 checkpoint 根目录的 `caption_groundedness.jsonl`，并输出 coverage、parse failure、claim rate 和 penalty 指标。除成功 verdict 外，该文件每个 global step 还保留至多 8 条失败记录，包括 `no_json_object`、`invalid_overall`、`claims_not_list`、`no_valid_claims` 或 `insufficient_checked_claims`，各 claim 丢弃原因以及截断到 2048 字符的原始 verifier 输出；这些字段仅用于诊断，不会进入 reward、CE 或 JSD。no-target 样本继续由原 GRES 拒识 reward 处理。当前首版只建立 `groundedness_token_mask` 和可选 extra JSD weight 接口，`token_jsd_enabled=false`，不直接产生 token-level groundedness 梯度；这是当前论文循环目标之外的 caption factuality 辅助消融。为兼容 GRES no-target 与 cycle caption 共同组成的 actor batch、避免将特权 verdict 传给主 PPO worker，verifier 记录和 token mask 会在 reward/JSD 均消费完成后、任一 actor batch 更新前从 cycle caption batch 移除。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -423,7 +423,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `reward_function/tg_reward.py` | temporal grounding 可组合奖励库 |
 | `reward_function/llm_judge_reward.py` | 可选外部 vLLM caption judge 客户端，不属于无外部 judge 的主闭环 |
 
-`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。
+`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
@@ -450,7 +450,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 文件 | 职责 |
 |---|---|
-| `qwen3vl_4b_volcengine.sh` | export-only FSDP actor 转 HF safetensors，并顺序启动标准 RefCOCO、GroundingSuite mask GIoU 与 DLC-Bench prediction 生成；设置服务器路径、Conda、缓存和 Ray 地址隔离 |
+| `qwen3vl_4b_volcengine.sh` | export-only FSDP actor 转 HF safetensors，并顺序启动标准 RefCOCO、GroundingSuite mask GIoU、GRES/gRefCOCO 与 DLC-Bench prediction 生成；设置服务器路径、Conda、缓存和 Ray 地址隔离 |
 
 ### 5.4 `projects/transformers/`：模型定义
 
@@ -486,7 +486,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 解码 mask token、保存 shard、计算 gIoU/cIoU/N-acc；shell 多 GPU 分片 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算 gIoU/cIoU/N-acc/T-acc；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
@@ -519,7 +519,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对原始 GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
 20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
 21. **C 当前同时处理 special-token 支持集、reference anchor、teacher 特权信息形态和共享梯度冲突。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 以 segmentation anchor KL 约束全部 cycle localization response，并可用非对称梯度投影移除 caption-side gradient 中与 localization gradient 冲突的分量；两者都不把 `seg_answer` 作为 student CE target，保持单 actor 的 cycle-only 训练信号。投影会额外保留一份本 rank 的 caption gradient，因此增加约一个 FSDP gradient shard 的显存；系数和冲突率必须通过 10-step RefCOCO/GroundingSuite 消融验证。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
-22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
+22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。若 `groundedness_parse_failure_rate` 高，先读取同文件每 step 最多 8 条、原始输出限 2048 字符的失败记录，按 `parse_failure_reason` 和 `discarded_claim_reasons` 定位 prompt、长度或字面 span 问题；这些诊断记录不能被误作有效 verifier verdict。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
+23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -874,3 +875,18 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.6 节 groundedness 路由与 batch 生命周期说明。
 - 行为：groundedness 启用时，mid-route privileged JSD 无条件要求 `R_Ci>=0.65`，不再依赖可关闭的历史 `teacher_confidence` 开关。cycle caption 的 verifier-only non-tensor verdict 与 token mask 在 reward/JSD 已消费后、主 PPO actor 更新前移除，防止与 GRES no-target 合并时 `DataProto.concat` 因两侧字段不对齐失败，并避免特权日志传给 actor worker；segmentation 和 caption PPO 行为不变。
 - 验证：修改涉及的 Python 文件已通过 `python3 -m py_compile`，训练 shell 已通过 `bash -n`，`git diff --check` 通过；groundedness parser stdlib smoke test 通过。本机 `python3 -m unittest tests.test_opsd_core` 仍因未安装 `torch` 无法导入，未运行 Ray/FSDP/vLLM 10-step smoke test。
+
+### 2026-08-09 - 将 GRES/gRefCOCO 接入统一离线评测入口
+
+- 代码：修改 `evaluation/gres/qwen3vl_gres_eval.py`、`evaluation/gres/run_gres_multigpu.sh` 和 `projects/eval/qwen3vl_4b_volcengine.sh`。
+- 文档：更新第 2.2、5.3.1、5.6、6 节及 GRES 模块职责。
+- 行为：新增 `gres` action。评测入口接收官方 gRefCOCO refs/instances 与 COCO 图像根，先生成 split 固定的 inference JSON，再以当前 Conda Python 进行多 GPU 分片推理。预测按 `case_<id>.json` 可恢复保存；所有 case 完成后才汇总 `N_acc`、`T_acc`、gIoU、cIoU 和 target mIoU 到独立 `gres_metrics.json`。metric-only 不依赖 CUDA，并保持原 GRES 对 no-target 误检计入 cIoU union 的语义；缺图或尺寸不匹配会使 shard 显式失败。
+- 论文边界：这是新增 GRES/gRefCOCO 下游评测入口，不改变训练、reward、数据配方或论文 CycleGRPO 优化目标。
+- 验证：`python3 -m py_compile evaluation/gres/qwen3vl_gres_eval.py`、`bash -n evaluation/gres/run_gres_multigpu.sh`、`bash -n projects/eval/qwen3vl_4b_volcengine.sh` 和 `git diff --check` 通过；本机无 GRES/COCO 数据、CUDA 或模型，未运行端到端 benchmark。
+
+### 2026-08-09 - 记录 groundedness verifier 解析失败原因
+
+- 代码：修改 `verl/workers/opsd/groundedness.py`、`verl/trainer/ray_trainer.py` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 3.6 节、关键注意事项 22 及本变更日志。
+- 行为：groundedness parser 在不改变 reward 或路由语义的前提下，为失败 verdict 标记顶层解析原因并统计无效 claim 的具体原因。`caption_groundedness.jsonl` 继续完整记录成功 verdict，并且每个 global step 额外写入最多 8 条失败样本，含学生 caption、解析原因、claim 丢弃统计和最多 2048 字符的 verifier 原始输出；no-target/全局禁用行不写入。诊断数据仅保留在 trainer driver 的短暂 batch 生命周期中，不传递至 actor PPO 更新。
+- 验证：`python3 -m py_compile verl/workers/opsd/groundedness.py verl/trainer/ray_trainer.py tests/test_opsd_core.py`、groundedness parser stdlib smoke test 与 `git diff --check`；完整 `tests/test_opsd_core.py` 仍依赖本机未安装的 PyTorch，未运行 Ray/FSDP/vLLM smoke training。

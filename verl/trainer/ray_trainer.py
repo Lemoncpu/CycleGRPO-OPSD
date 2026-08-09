@@ -1031,6 +1031,10 @@ class RayPPOTrainer:
                 contradicted_penalty=config.contradicted_penalty,
                 min_checked_claims=config.min_checked_claims,
             )
+            # Preserve malformed output on the driver for a bounded debug log.
+            if not verdict["parse_ok"]:
+                verdict = dict(verdict)
+                verdict["raw_response"] = response_text
             rows[caption_index] = verdict
             aligned_mask = groundedness_token_mask(
                 caption_ids[:caption_length].tolist(), self.tokenizer, verdict["claims"]
@@ -1059,33 +1063,48 @@ class RayPPOTrainer:
         return metrics
 
     def _write_groundedness_records(self, caption_batch: DataProto) -> None:
-        """Persist parsed verifier evidence for later caption-drift analysis."""
+        """Persist parsed verdicts and a bounded sample of parser failures."""
         path = os.path.join(
             self.config.trainer.save_checkpoint_path, "caption_groundedness.jsonl"
         )
         os.makedirs(self.config.trainer.save_checkpoint_path, exist_ok=True)
+        failure_records_written = 0
+        max_failure_records_per_step = 8
         with open(path, "a", encoding="utf-8") as file:
             for index, verdict in enumerate(caption_batch.non_tensor_batch["groundedness"]):
-                if not verdict.get("enabled", False):
+                parsed = bool(verdict.get("parse_ok", False))
+                parse_failure = not parsed and verdict.get("parse_failure_reason") not in {
+                    None,
+                    "disabled",
+                }
+                if not parsed and not parse_failure:
+                    continue
+                if parse_failure and failure_records_written >= max_failure_records_per_step:
                     continue
                 response_length = int(torch.sum(caption_batch.batch["response_mask"][index]).item())
                 caption = self.tokenizer.decode(
                     caption_batch.batch["responses"][index][:response_length],
                     skip_special_tokens=False,
                 )
+                logged_verdict = dict(verdict)
+                raw_response = str(logged_verdict.pop("raw_response", ""))
+                record = {
+                    "step": self.global_step,
+                    "sample_uid": str(caption_batch.non_tensor_batch["uid"][index]),
+                    "caption_index": int(caption_batch.non_tensor_batch["caption_index"][index]),
+                    "route": str(caption_batch.non_tensor_batch["route"][index]),
+                    "R_Ci": float(caption_batch.non_tensor_batch["R_Ci"][index]),
+                    "student_caption": caption,
+                    "groundedness": logged_verdict,
+                }
+                if parse_failure:
+                    record["parse_ok"] = False
+                    record["parse_failure_reason"] = verdict.get("parse_failure_reason")
+                    record["discarded_claim_reasons"] = verdict.get("discarded_claim_reasons", {})
+                    record["verifier_response"] = raw_response[:2048]
+                    failure_records_written += 1
                 file.write(
-                    json.dumps(
-                        {
-                            "step": self.global_step,
-                            "sample_uid": str(caption_batch.non_tensor_batch["uid"][index]),
-                            "caption_index": int(caption_batch.non_tensor_batch["caption_index"][index]),
-                            "route": str(caption_batch.non_tensor_batch["route"][index]),
-                            "R_Ci": float(caption_batch.non_tensor_batch["R_Ci"][index]),
-                            "student_caption": caption,
-                            "groundedness": verdict,
-                        },
-                        ensure_ascii=False,
-                    )
+                    json.dumps(record, ensure_ascii=False)
                     + "\n"
                 )
 
