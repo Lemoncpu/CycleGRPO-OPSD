@@ -160,13 +160,13 @@ mask、两个 code，并在校验元素数量后展平为 SAMTok token。
 ### 2.4 GroundingSuite 类型均衡 20k 受控训练数据
 
 `projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py` 将五份已转换的 parquet 混合为
-20,000 条图像/mask CycleGRPO 数据；默认配方是 7,000 条 RefCOCO 单实例 (`refcoco_cycle`)、5,000 条
+可配置总量的图像/mask CycleGRPO 数据；默认配方是 20,000 条：7,000 条 RefCOCO 单实例 (`refcoco_cycle`)、5,000 条
 gRefCOCO 多实例 union mask (`grefcoco_cycle`)、4,000 条 COCO-Stuff 语义区域
 (`cocostuff_cycle`)、2,000 条 PACO-LVIS 真 part mask (`paco_part_cycle`) 和 2,000 条
 gRefCOCO no-target (`gres_no_target`)。这些比例分别为 Single 35%、Multi 25%、Stuff 20%、
 Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做数据分布受控消融。可通过
-`--single-count`、`--multi-count`、`--stuff-count`、`--part-count` 与 `--no-target-count` 覆盖各配额，
-但五项之和必须为 20,000；未传入时保持默认配方。
+`--single-count`、`--multi-count`、`--stuff-count`、`--part-count` 与 `--no-target-count` 覆盖各配额；
+五项之和决定输出总量且必须为正，未传入时保持默认 20,000 条配方。
 
 `prepare_dam_cycle_dataset.py` 将 Describe Anything 的 `mask_rle + caption` region
 转换为当前 CycleGRPO 图像/mask parquet。`cocostuff_cycle` 直接读取 DAM
@@ -385,7 +385,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约、Qwen3-VL 复合 processor 的自动加载回退、GRES empty-target 指标语义与 GT 面积分桶，以及 GRES 训练时的 no-target mask-token 拒识奖励 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约、Qwen3-VL 复合 processor 的自动加载回退、GRES empty-target 指标语义与 GT 面积分桶、GRES 训练时的 no-target mask-token 拒识奖励，以及可配置的五路混合总量 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -445,7 +445,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask，限制每图一个 part，编码为 `paco_part_cycle` parquet 与 part-category manifest。
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并记录区域面积范围和类别直方图。
 - `prepare_dam_cycle_dataset.py`：从 DAM `COCOStuff`/`PACO` 的 `mask_rle + caption` annotation 构造 DAM-backed `cocostuff_cycle` 或 `paco_part_cycle` parquet；PACO 与官方 part annotation 交叉校验，caption 写入独立 manifest。
-- `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后按可配置的 Single/Multi/Stuff/Part/no-target 配额抽取，要求总数为 20k；默认 `7k/5k/4k/2k/2k`，随机打散为 parquet 和可复现实验 manifest。
+- `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后按可配置的 Single/Multi/Stuff/Part/no-target 配额抽取，输出总量由五项之和决定；默认 `7k/5k/4k/2k/2k`，随机打散为 parquet 和可复现实验 manifest。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
 - `prepare_gres_rl_dataset.py`、`prepare_more_gres_rl_dataset.py`、`prepare_res_rl_dataset.py`、`prepare_reasonseg_rl_dataset.py`：不同 referring segmentation 数据转统一 schema。
@@ -954,3 +954,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：保留原始两项 `no_target_accuracy + no_repeat_score` 及其数值：完整拒识为 `1.0`，无 mask 但未写 `No target.` 为 `0.2`，其余为 `0.0`。`gres_no_target` 现在调用适用于 SAMTok 的 `no_target_check`，任何完整或残缺的 `<|mt_start|>`、`<|mt_####|>`、`<|mt_end|>` 都使拒识准确性为零；此前误用 bbox 检查，mask-token 幻觉不会被处罚。bbox helper 保留供历史 bbox 代码，当前 GRES mask 训练不再调用它。
 - 论文边界：这是对现有 GRES no-target reward 实现的格式语义修正，不增加额外 reward 项、不改变 CycleGRPO pixel-IoU、caption/segmentation loss、OPSD 辅助项或数据配方。
 - 验证：新增 unit test 覆盖正确拒识、缺少拒识文本的无 mask 输出，以及完整/残缺 mask-token 输出；待在项目 Conda 环境运行该测试和 10-step prompt-aligned C2 smoke training，检查 `reward/no_target_accuracy` 与 GRES N-acc。
+
+### 2026-08-10 - 允许五路 CycleGRPO 混合器生成 25k 等可配置总量
+
+- 代码：修改 `projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py`，新增 `tests/test_balanced_cycle_dataset.py`。
+- 文档：更新第 2.4、5.1、5.3 节的混合器总量契约。
+- 行为：五个 `--*-count` 配额不再被硬编码为总和 20,000；任意正总量均可导出，manifest 的 `total` 与行数断言均使用实际配额和。默认未变，仍为 `7k/5k/4k/2k/2k`。该修改仅允许 controlled scaling，例如同 35/25/20/10/10 比例的 25k `8750/6250/5000/2500/2500`，不改变抽样、随机 seed、正样本 caption 清除或训练算法。
+- 论文边界：这是当前受控数据配方工具的规模参数化，不属于论文固定约 20k DenseWorld 设置；实验报告须同时记录总量和五路比例。
+- 验证：新增 unit test 覆盖 25k 配额与空配额拒绝；待在项目 Conda 环境运行该测试、检查 25k manifest 的 source counts，并在训练前确认传入的 gRefCOCO positive parquet 为 `single_fraction=0.0` 导出的 true multi-only 数据。

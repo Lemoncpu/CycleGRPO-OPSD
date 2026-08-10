@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a configurable 20k Single/Multi/Stuff/Part/no-target CycleGRPO mixture."""
+"""Build a configurable Single/Multi/Stuff/Part/no-target CycleGRPO mixture."""
 
 import argparse
 import json
@@ -77,8 +77,8 @@ def mixture_counts(args: argparse.Namespace) -> dict[str, int]:
     }
     if any(count < 0 for count in counts.values()):
         raise ValueError(f"Mixture counts must be non-negative: {counts}")
-    if sum(counts.values()) != 20_000:
-        raise ValueError(f"Mixture counts must sum to 20000, got {sum(counts.values())}: {counts}")
+    if sum(counts.values()) <= 0:
+        raise ValueError(f"Mixture counts must sum to a positive total, got {counts}")
     return counts
 
 
@@ -112,7 +112,7 @@ def main() -> None:
     combined = [row for role in counts for row in selected[role]]
     random.Random(args.seed).shuffle(combined)
     if len(combined) != sum(counts.values()):
-        raise AssertionError(f"Expected 20k rows, got {len(combined)}")
+        raise AssertionError(f"Expected {sum(counts.values())} rows, got {len(combined)}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     Dataset.from_list(combined).to_parquet(str(args.output))
