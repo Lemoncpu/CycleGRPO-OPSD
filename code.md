@@ -132,7 +132,7 @@ processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑
 12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root`、其 `assets/`、
 `unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
 `COCO_train2014_000000123456.jpg` 名称；无法
-解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。GRES 读取官方 `grefs(unc).json` 和 `instances.json`，以 `GRES_IMAGE_ROOT` 定位 COCO `train2014`；launcher 仅在全部 case 预测写完后汇总，输出 `N_acc`（no-target 拒识）、`T_acc`（有目标检测）、gIoU 和 cIoU。cIoU 按原协议累计有目标区域以及 no-target 的误检像素，正确的空预测不增加 union。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
+解析或读取的图像会立即令对应 shard 失败，不会经过多次退避后静默跳过并产生不完整结果。GRES 读取官方 `grefs(unc).json` 和 `instances.json`，以 `GRES_IMAGE_ROOT` 定位 COCO `train2014`；launcher 仅在全部 case 预测写完后汇总，输出 `N_acc`（no-target 拒识）、`T_acc`（有目标检测）、gIoU 和 cIoU。cIoU 按原协议累计有目标区域以及 no-target 的误检像素，正确的空预测不增加 union。无需重新推理即可用 `qwen3vl_gres_eval.py --metric-only --subset-report-file` 基于同一 case 编号和官方标注写出 JSONL 子集报告：精确的 no-target/single-instance/multi-instance 及基于 GT 面积的 small/medium/large；该模式要求完整 case 文件，并验证已保存的 `gres_<split>_samples.json` 与官方 refs 的顺序一致。DLC-Bench action 只产出 prediction JSON，最终语言 judge 需要
 单独配置可用凭据。DLC caption inference 对全局图和可选 zoom-in 图使用与训练相同的正向 caption 指令
 `Provide a detailed factual description of this region {SEG}.`；评测 prompt 不出现 `mask`、`token`、`JSON` 或
 `reasoning` 等 segmentation 格式词，以免 SAMTok 将描述请求误解为定位请求。生成上限固定为 192 token。此协议是评测条件的一部分，比较任何 checkpoint 前都必须以同一版本重新推理。
@@ -381,7 +381,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约，以及 Qwen3-VL 复合 processor 的自动加载回退 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约、Qwen3-VL 复合 processor 的自动加载回退，以及 GRES empty-target 指标语义与 GT 面积分桶 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -496,7 +496,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算 gIoU/cIoU/N-acc/T-acc；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器与 GT 面积分桶；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
@@ -530,7 +530,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
 21. **C 当前同时处理 special-token 支持集、reference anchor、teacher 特权信息形态和共享梯度冲突。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 以 segmentation anchor KL 约束全部 cycle localization response，并可用非对称梯度投影移除 caption-side gradient 中与 localization gradient 冲突的分量；两者都不把 `seg_answer` 作为 student CE target，保持单 actor 的 cycle-only 训练信号。投影会额外保留一份本 rank 的 caption gradient，因此增加约一个 FSDP gradient shard 的显存；系数和冲突率必须通过 10-step RefCOCO/GroundingSuite 消融验证。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
 22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。若 `groundedness_parse_failure_rate` 高，先读取同文件每 step 最多 8 条、原始输出限 2048 字符的失败记录，按 `parse_failure_reason` 和 `discarded_claim_reasons` 定位 prompt、长度或字面 span 问题；这些诊断记录不能被误作有效 verifier verdict。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
-23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。
+23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -914,3 +914,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.4 节及本变更日志。
 - 行为：新导出的 `gres_no_target` 样本将输入从显式 no-target 指令改为 `Please segment {expression} in this image.`，与 RefCOCO/GRES 推理的用户指令一致；输出目标仍是 `No target.`，并继续使用未改动的原始 no-target accuracy + no-repeat reward。正样本仍不写入 referring expression，cycle prompt、分割 reward、OPSD/C2 辅助项和评测协议均不变。旧 parquet 已包含旧 prompt，不能用于这个受控消融。
 - 验证：对转换器执行无缓存语法解析和常量断言，并执行 `git diff --check`；本机没有 PyTorch、datasets、服务器标注/图像或 CUDA，未运行 VQ-SAM2 parquet 导出和 8-GPU training。
+
+### 2026-08-10 - 增加 GRES 离线子集指标汇总
+
+- 代码：修改 `evaluation/gres/qwen3vl_gres_eval.py`，新增 `evaluation/gres/subset_metrics.py` 和 `tests/test_gres_subset_metrics.py`。
+- 文档：更新第 2.2、5.6、关键注意事项 23 及本变更日志。
+- 行为：metric-only evaluator 可通过 `--subset-report-file` 写出 JSONL。它重建与保存 `gres_<split>_samples.json` 完全一致的官方 case 顺序，逐条验证 phrase 对齐和预测完整性，再按标注实例数输出 no-target/single-instance/multi-instance，按 GT 像素面积输出 small(<5%)/medium(5%-25%)/large(>=25%)；每行复用全量 GRES 的 cIoU、gIoU、T/N-acc 和 target mIoU 语义。该功能只读取已有 prediction 和标注，不加载模型、不改变推理、训练或论文目标。
+- 验证：新增纯 NumPy unit test 覆盖 empty-target cIoU 语义和面积边界；本机已通过 Python syntax 与 `git diff --check`，但本机 Python 未安装 NumPy，unit test 会显式 skip。仍需在项目 Conda 环境执行 unit test 与真实 server prediction 的 metric-only smoke test。

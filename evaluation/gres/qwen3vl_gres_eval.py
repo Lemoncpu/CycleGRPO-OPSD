@@ -19,6 +19,7 @@ from torchvision.transforms.functional import to_pil_image
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 
 from projects.vlm.tokenmask.evaluation.grefer import G_REFER
+from evaluation.gres.subset_metrics import GresMetricAccumulator, target_area_bucket
 
 
 class DirectResize:
@@ -173,6 +174,8 @@ def parse_args():
                         help='Skip inference; just compute the metric over existing save_dir.')
     parser.add_argument('--metrics-file', default=None,
                         help='Optional JSON path for the aggregate GRES metrics.')
+    parser.add_argument('--subset-report-file', default=None,
+                        help='Optional JSONL path for exact cardinality and target-area subset metrics.')
     args = parser.parse_args()
     return args
 
@@ -322,63 +325,148 @@ def _iter_json_records(json_file_path):
     return records
 
 
-def metric(args):
-    intersection = 0
-    union = 0
-    target_ious = []
-    all_ious = []
-    no_target_correct = 0
-    no_target_total = 0
-    target_correct = 0
-    target_total = 0
+def _case_id_from_filename(filename):
+    match = re.fullmatch(r"case_(\d+)\.json", filename)
+    return int(match.group(1)) if match else None
 
-    for json_file in os.listdir(args.save_dir):
-        if not json_file.startswith("case_") or not json_file.endswith(".json"):
-            continue
+
+def _annotation_ids(ref):
+    values = ref.get("ann_id", [])
+    if isinstance(values, int):
+        values = [values]
+    return [int(value) for value in values]
+
+
+def _build_subset_metadata(args):
+    """Rebuild the exact case order and cardinality from official GRES refs."""
+
+    missing = [
+        name
+        for name, value in (
+            ("--dataset", args.dataset),
+            ("--grefs-file", args.grefs_file),
+            ("--instances-file", args.instances_file),
+            ("--image-root", args.image_root),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "--subset-report-file requires " + ", ".join(missing) + " to verify case ordering."
+        )
+
+    refer_api = G_REFER(args.image_root, args.grefs_file, args.instances_file)
+    ref_ids = refer_api.getRefIds(split=args.split)
+    image_ids = refer_api.getImgIds(ref_ids=ref_ids)
+    refs = refer_api.loadRefs(ref_ids=ref_ids)
+    refs_by_image = {}
+    for ref in refs:
+        refs_by_image.setdefault(ref["image_id"], []).append(ref)
+
+    metadata = []
+    for image_info in refer_api.loadImgs(image_ids=image_ids):
+        for ref in refs_by_image.get(image_info["id"], []):
+            positive_count = sum(annotation_id >= 0 for annotation_id in _annotation_ids(ref))
+            target_type = (
+                "no_target" if positive_count == 0
+                else "single_instance" if positive_count == 1
+                else "multi_instance"
+            )
+            for sentence in ref.get("sentences", []):
+                phrase = sentence["sent"].strip().lower()
+                metadata.append({
+                    "ref_id": int(ref["ref_id"]),
+                    "phrase": phrase,
+                    "target_type": target_type,
+                    "annotation_instance_count": positive_count,
+                })
+
+    with open(args.dataset, "r", encoding="utf-8") as file:
+        dataset = json.load(file)
+    if len(metadata) != len(dataset):
+        raise RuntimeError(
+            f"GRES metadata/data length mismatch: rebuilt {len(metadata)}, dataset has {len(dataset)}."
+        )
+    for case_id, (item, item_metadata) in enumerate(zip(dataset, metadata)):
+        if str(item.get("phrase", "")).strip().lower() != item_metadata["phrase"]:
+            raise RuntimeError(
+                f"GRES case ordering mismatch at case_{case_id}: "
+                f"dataset={item.get('phrase')!r}, refs={item_metadata['phrase']!r}."
+            )
+    return metadata
+
+
+def _write_subset_report(path, accumulators):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        for grouping, subset in sorted(accumulators):
+            row = {"grouping": grouping, "subset": subset}
+            row.update(accumulators[(grouping, subset)].as_dict())
+            file.write(json.dumps(row) + "\n")
+
+
+def metric(args):
+    subset_metadata = _build_subset_metadata(args) if args.subset_report_file else None
+    metrics_accumulator = GresMetricAccumulator()
+    subset_accumulators = {}
+    observed_case_ids = set()
+
+    case_files = sorted(
+        (filename for filename in os.listdir(args.save_dir) if _case_id_from_filename(filename) is not None),
+        key=_case_id_from_filename,
+    )
+    for json_file in case_files:
+        case_id = _case_id_from_filename(json_file)
         json_file_path = os.path.join(args.save_dir, json_file)
         records = _iter_json_records(json_file_path)
         if not records:
             print(f"[warn] skip unreadable/empty file: {json_file_path}")
             continue
+        if subset_metadata is not None:
+            if case_id >= len(subset_metadata):
+                raise RuntimeError(f"Prediction case_{case_id} is outside the verified GRES dataset.")
+            if len(records) != 1:
+                raise RuntimeError(f"Subset reporting requires exactly one record in {json_file_path}.")
+            observed_case_ids.add(case_id)
 
         for json_data in records:
             if "pred_masks" not in json_data or "gt_masks" not in json_data:
+                if subset_metadata is not None:
+                    raise RuntimeError(f"Subset reporting requires pred_masks and gt_masks in {json_file_path}.")
                 continue
-
             pred_mask = rle_to_mask([json_data["pred_masks"]])[0].astype(bool)
             gt_mask = rle_to_mask([json_data["gt_masks"]])[0].astype(bool)
-            inter = int(np.logical_and(pred_mask, gt_mask).sum())
-            current_union = int(np.logical_or(pred_mask, gt_mask).sum())
-            is_target = bool(gt_mask.any())
-            is_predicted = bool(pred_mask.any())
-            if is_target:
-                target_total += 1
-                target_correct += int(is_predicted)
-                intersection += inter
-                union += current_union
-                iou = inter / current_union if current_union else 0.0
-                target_ious.append(iou)
-            else:
-                no_target_total += 1
-                no_target_correct += int(not is_predicted)
-                iou = 1.0 if not is_predicted else 0.0
-                # Match the original GRES protocol: an empty-target false
-                # positive increases cIoU's union, while a correct rejection
-                # has no foreground pixels to contribute.
-                if is_predicted:
-                    union += current_union
-            all_ious.append(iou)
+            metrics_accumulator.add(pred_mask, gt_mask)
 
-    metrics = {
-        "samples": len(all_ious),
-        "no_target_samples": no_target_total,
-        "target_samples": target_total,
-        "N_acc": 100.0 * no_target_correct / no_target_total if no_target_total else 0.0,
-        "T_acc": 100.0 * target_correct / target_total if target_total else 0.0,
-        "gIoU": 100.0 * sum(all_ious) / len(all_ious) if all_ious else 0.0,
-        "cIoU": 100.0 * intersection / union if union else 0.0,
-        "mIoU_target": 100.0 * sum(target_ious) / len(target_ious) if target_ious else 0.0,
-    }
+            if subset_metadata is None:
+                continue
+            metadata = subset_metadata[case_id]
+            expected_target = metadata["target_type"] != "no_target"
+            if expected_target != bool(gt_mask.any()):
+                raise RuntimeError(
+                    f"GT target mismatch for case_{case_id}: metadata={metadata['target_type']}, "
+                    f"mask_has_target={bool(gt_mask.any())}."
+                )
+            cardinality_key = ("target_cardinality", metadata["target_type"])
+            subset_accumulators.setdefault(cardinality_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+            if expected_target:
+                area_key = ("target_area", target_area_bucket(gt_mask))
+                subset_accumulators.setdefault(area_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+
+    if subset_metadata is not None:
+        expected_case_ids = set(range(len(subset_metadata)))
+        if observed_case_ids != expected_case_ids:
+            missing_case_ids = sorted(expected_case_ids - observed_case_ids)
+            extra_case_ids = sorted(observed_case_ids - expected_case_ids)
+            raise RuntimeError(
+                "GRES subset report requires complete predictions: "
+                f"missing={missing_case_ids[:10]} ({len(missing_case_ids)} total), "
+                f"extra={extra_case_ids[:10]} ({len(extra_case_ids)} total)."
+            )
+        _write_subset_report(args.subset_report_file, subset_accumulators)
+        print(f"Saved GRES subset metrics to {args.subset_report_file}")
+
+    metrics = metrics_accumulator.as_dict()
     if args.metrics_file:
         os.makedirs(os.path.dirname(os.path.abspath(args.metrics_file)), exist_ok=True)
         with open(args.metrics_file, "w", encoding="utf-8") as file:
