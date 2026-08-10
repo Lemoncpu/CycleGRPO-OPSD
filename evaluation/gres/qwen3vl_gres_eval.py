@@ -462,6 +462,11 @@ def metric(args):
             if expected_target:
                 area_key = ("target_area", target_area_bucket(gt_mask))
                 subset_accumulators.setdefault(area_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+                if metadata["annotation_instance_count"] == 2:
+                    two_instance_area_key = ("two_instance_target_area", target_area_bucket(gt_mask))
+                    subset_accumulators.setdefault(two_instance_area_key, GresMetricAccumulator()).add(
+                        pred_mask, gt_mask
+                    )
 
     if subset_metadata is not None:
         expected_case_ids = set(range(len(subset_metadata)))
