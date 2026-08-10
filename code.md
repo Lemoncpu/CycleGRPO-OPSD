@@ -186,8 +186,9 @@ caption 写入独立 JSONL manifest，供后续 DLC QA 使用。
 所有正样本只写入图像、目标 mask、由当前 SAMTok VQ-SAM2 编码出的 `seg_answer` 与从该 mask 构造的
 caption prompt；混合器在写出最终 parquet 前统一清除 RefCOCO、gRefCOCO、PACO 与 COCO-Stuff
 正样本继承的 `cap_answer`，因此不注入任何 referring expression 或人工 caption。gRefCOCO
-no-target 继续沿用已有 `gres_no_target` schema 与 rejection reward，
-其表达式是必须被拒识的 query。混合器写入 manifest，固定记录
+no-target 继续沿用已有 `gres_no_target` schema 与原有 rejection reward，其表达式是必须被拒识的 query；
+其训练输入使用标准 GRES/RefCOCO 评测同构的 `Please segment {expression} in this image.`，而不是显式
+提示模型当前样本必为 no-target。混合器写入 manifest，固定记录
 输入 parquet、seed、五类数量与最终 source counts；任一来源不足请求数量时 fail-fast。该数据配方是当前
 OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数据或方法公式的一部分。
 
@@ -906,3 +907,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.4、5.3 节，记录 DAM annotation 输入、PACO part 过滤、面积约束、输出 schema 与 caption manifest 边界。
 - 行为：从 DAM `COCOStuff` 或 `PACO` annotation 读取 `mask_rle`，解析实际图像并重新编码 VQ-SAM2 mask token，输出原有 `cocostuff_cycle`/`paco_part_cycle` source；PACO 仅保留与官方 `id != obj_ann_id` 交集且每图最多一个 part。`dam_source_id` 进入 parquet 仅用于离线关联，DAM caption 不进入 actor prompt，而写入独立 JSONL 供 DLC QA 构造。
 - 验证：执行新增脚本的 `python3 -m py_compile` 与 `git diff --check`；本机没有 DAM/COCO 图片、PyTorch/CUDA 或 SAMTok 权重，未执行实际 mask 编码和 parquet 导出。
+
+### 2026-08-10 - 对齐 gRefCOCO no-target 训练与 GRES 评测 prompt
+
+- 代码：修改 `projects/rl/datasets/prepare_grefcoco_cycle_dataset.py`。
+- 文档：更新第 2.4 节及本变更日志。
+- 行为：新导出的 `gres_no_target` 样本将输入从显式 no-target 指令改为 `Please segment {expression} in this image.`，与 RefCOCO/GRES 推理的用户指令一致；输出目标仍是 `No target.`，并继续使用未改动的原始 no-target accuracy + no-repeat reward。正样本仍不写入 referring expression，cycle prompt、分割 reward、OPSD/C2 辅助项和评测协议均不变。旧 parquet 已包含旧 prompt，不能用于这个受控消融。
+- 验证：对转换器执行无缓存语法解析和常量断言，并执行 `git diff --check`；本机没有 PyTorch、datasets、服务器标注/图像或 CUDA，未运行 VQ-SAM2 parquet 导出和 8-GPU training。

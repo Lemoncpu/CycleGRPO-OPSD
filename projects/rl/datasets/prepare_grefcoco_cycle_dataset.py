@@ -26,10 +26,9 @@ from projects.rl.datasets.prepare_refcoco_rl_dataset import (
 )
 
 
-NO_TARGET_PROMPT = (
-    '<image>\nLocate the region described as: "{expression}". '
-    'If no such region exists, reply exactly: No target.'
-)
+# Match the standard RefCOCO/GRES evaluation instruction. The no-target reward
+# still requires the response to reject the absent expression as "No target.".
+NO_TARGET_PROMPT = "<image>\nPlease segment {expression} in this image."
 
 
 def parse_args() -> argparse.Namespace:
