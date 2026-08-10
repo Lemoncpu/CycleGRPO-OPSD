@@ -307,6 +307,10 @@ localization:
 | `dam_grounding` / `tg_grounding` | 独立 grounding 任务，分别做 mask-token 或时间区间奖励 |
 | `gcg`、`psg` 等 | grounded caption/scene graph 的 token、短语、格式奖励或保留分支 |
 
+`gres_no_target` 的正确性项保持原来的 `1.0 / 0.2 / 0.0` 取值：响应必须含
+`No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或 `<|mt_end|>` 片段；任一
+完整或残缺 mask-token 都会使该项为 `0.0`。第二项仍是原有的非重复奖励。
+
 `tg_reward.py` 是可配置的 temporal grounding 奖励库，支持 tIoU、format、precision/recall/F1、C-Acc、caption judge 和长度惩罚；当前 `text2mask.py` 的主要视频路径只直接复用其中少量逻辑或保留了注释调用。
 
 ### 3.6 GRPO 与策略更新
@@ -381,7 +385,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约、Qwen3-VL 复合 processor 的自动加载回退，以及 GRES empty-target 指标语义与 GT 面积分桶 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` | 无 GPU 单元测试；分别覆盖 OPSD 核心契约、Qwen3-VL 复合 processor 的自动加载回退、GRES empty-target 指标语义与 GT 面积分桶，以及 GRES 训练时的 no-target mask-token 拒识奖励 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -942,3 +946,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.6 节及本变更日志。
 - 行为：离线子集汇总额外从官方 `instances.json` 重建每个 two-instance reference 的两个原 annotation mask，并验证其 union 与保存 case GT 一致。JSONL 增加全体成员召回、small/large member 的平均覆盖和 recall、both/one/none member hit rate，并分别以较小/较大成员面积比 `<0.2`、`0.2-0.5`、`>=0.5` 及掩码质心距离 `<0.25`、`0.25-0.5`、`>=0.5` 图像对角线分桶。成员命中默认要求预测覆盖该成员至少 50%，可由 `--two-instance-member-recall-threshold` 调整；union cIoU 同时保留，避免过大预测仅靠 recall 获得误导性结论。
 - 验证：新增 two-instance member coverage/geometry 的 NumPy unit test；仍需在项目 Conda 环境用已有完整 GRES prediction 运行 metric-only smoke test。
+
+### 2026-08-10 - 修正 GRES no-target 的 mask-token 拒识奖励
+
+- 代码：修改 `projects/rl/reward_function/text2mask.py`，新增 `tests/test_no_target_reward.py`。
+- 文档：更新第 3.5 节 `gres_no_target` 奖励契约和第 5.1 节测试清单。
+- 行为：保留原始两项 `no_target_accuracy + no_repeat_score` 及其数值：完整拒识为 `1.0`，无 mask 但未写 `No target.` 为 `0.2`，其余为 `0.0`。`gres_no_target` 现在调用适用于 SAMTok 的 `no_target_check`，任何完整或残缺的 `<|mt_start|>`、`<|mt_####|>`、`<|mt_end|>` 都使拒识准确性为零；此前误用 bbox 检查，mask-token 幻觉不会被处罚。bbox helper 保留供历史 bbox 代码，当前 GRES mask 训练不再调用它。
+- 论文边界：这是对现有 GRES no-target reward 实现的格式语义修正，不增加额外 reward 项、不改变 CycleGRPO pixel-IoU、caption/segmentation loss、OPSD 辅助项或数据配方。
+- 验证：新增 unit test 覆盖正确拒识、缺少拒识文本的无 mask 输出，以及完整/残缺 mask-token 输出；待在项目 Conda 环境运行该测试和 10-step prompt-aligned C2 smoke training，检查 `reward/no_target_accuracy` 与 GRES N-acc。

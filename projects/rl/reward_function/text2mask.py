@@ -1131,10 +1131,9 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             #     )
             elif source in ['gres_no_target']:
                 reward_input["ground_truth"] = 'No target.'
-                _, response_answer_content = extract_think_and_answer_robust(reward_input["response"])
-                _, gt_answer_content = extract_think_and_answer_robust(reward_input["ground_truth"])
-                # accuracy_score = no_target_check(response_answer_content, gt_answer_content)
-                accuracy_score = no_target_check_bbox(reward_input["response"], reward_input["ground_truth"])
+                # GRES is a mask-token task. A bbox-only check treats a hallucinated
+                # SAMTok mask as a valid refusal, so reject every mask-token fragment.
+                accuracy_score = no_target_check(reward_input["response"], reward_input["ground_truth"])
                 no_repeat_score = non_repeat_reward(reward_input["response"])
                 scores.append(
                     {
