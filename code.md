@@ -496,7 +496,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器与 GT 面积分桶；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量与 GT 面积分桶；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
@@ -921,3 +921,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、5.6、关键注意事项 23 及本变更日志。
 - 行为：metric-only evaluator 可通过 `--subset-report-file` 写出 JSONL。它重建与保存 `gres_<split>_samples.json` 完全一致的官方 case 顺序，逐条验证 phrase 对齐和预测完整性，再按标注实例数输出 no-target/single-instance/multi-instance，按 GT 像素面积输出 small(<5%)/medium(5%-25%)/large(>=25%)；每行复用全量 GRES 的 cIoU、gIoU、T/N-acc 和 target mIoU 语义。该功能只读取已有 prediction 和标注，不加载模型、不改变推理、训练或论文目标。
 - 验证：新增纯 NumPy unit test 覆盖 empty-target cIoU 语义和面积边界；本机已通过 Python syntax 与 `git diff --check`，但本机 Python 未安装 NumPy，unit test 会显式 skip。仍需在项目 Conda 环境执行 unit test 与真实 server prediction 的 metric-only smoke test。
+
+### 2026-08-10 - 细分 GRES multi-instance 标注数量
+
+- 代码：修改 `evaluation/gres/qwen3vl_gres_eval.py`、`evaluation/gres/subset_metrics.py` 和 `tests/test_gres_subset_metrics.py`。
+- 文档：更新第 5.6 节及本变更日志。
+- 行为：JSONL 子集报告对 `multi_instance` case 额外写出 `multi_annotation_count=2_instances/3_instances/4plus_instances`。数量来自官方 reference 的正 annotation id，不以可能相连或重叠的像素组件猜测实例数；全量指标和既有子集的计算不变。
+- 验证：补充 annotation 数量分桶的 NumPy unit test；仍需在项目 Conda 环境运行该测试与现有 GRES prediction 的 metric-only smoke test。

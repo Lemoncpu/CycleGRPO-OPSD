@@ -19,7 +19,11 @@ from torchvision.transforms.functional import to_pil_image
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 
 from projects.vlm.tokenmask.evaluation.grefer import G_REFER
-from evaluation.gres.subset_metrics import GresMetricAccumulator, target_area_bucket
+from evaluation.gres.subset_metrics import (
+    GresMetricAccumulator,
+    multi_instance_count_bucket,
+    target_area_bucket,
+)
 
 
 class DirectResize:
@@ -449,6 +453,12 @@ def metric(args):
                 )
             cardinality_key = ("target_cardinality", metadata["target_type"])
             subset_accumulators.setdefault(cardinality_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+            if metadata["target_type"] == "multi_instance":
+                multi_count_key = (
+                    "multi_annotation_count",
+                    multi_instance_count_bucket(metadata["annotation_instance_count"]),
+                )
+                subset_accumulators.setdefault(multi_count_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
             if expected_target:
                 area_key = ("target_area", target_area_bucket(gt_mask))
                 subset_accumulators.setdefault(area_key, GresMetricAccumulator()).add(pred_mask, gt_mask)

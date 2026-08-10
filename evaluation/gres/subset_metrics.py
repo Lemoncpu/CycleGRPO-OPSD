@@ -72,3 +72,17 @@ def target_area_bucket(gt_mask: np.ndarray) -> str:
     if area_ratio < 0.25:
         return "medium_5_to_25pct"
     return "large_ge_25pct"
+
+
+def multi_instance_count_bucket(annotation_instance_count: int) -> str:
+    """Bin exact positive annotation counts for multi-instance GRES references."""
+
+    if annotation_instance_count < 2:
+        raise ValueError(
+            "Multi-instance count buckets require at least two positive annotation instances."
+        )
+    if annotation_instance_count == 2:
+        return "2_instances"
+    if annotation_instance_count == 3:
+        return "3_instances"
+    return "4plus_instances"

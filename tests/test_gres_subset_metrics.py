@@ -6,7 +6,11 @@ except ModuleNotFoundError:  # pragma: no cover - local docs-only environments
     np = None
 
 if np is not None:
-    from evaluation.gres.subset_metrics import GresMetricAccumulator, target_area_bucket
+    from evaluation.gres.subset_metrics import (
+        GresMetricAccumulator,
+        multi_instance_count_bucket,
+        target_area_bucket,
+    )
 
 
 @unittest.skipIf(np is None, "NumPy is required by the GRES evaluator")
@@ -37,3 +41,11 @@ class TestGresSubsetMetrics(unittest.TestCase):
         self.assertEqual(target_area_bucket(small), "small_lt_5pct")
         with self.assertRaises(ValueError):
             target_area_bucket(np.zeros((2, 2), dtype=np.uint8))
+
+    def test_multi_instance_count_buckets(self):
+        self.assertEqual(multi_instance_count_bucket(2), "2_instances")
+        self.assertEqual(multi_instance_count_bucket(3), "3_instances")
+        self.assertEqual(multi_instance_count_bucket(4), "4plus_instances")
+        self.assertEqual(multi_instance_count_bucket(12), "4plus_instances")
+        with self.assertRaises(ValueError):
+            multi_instance_count_bucket(1)
