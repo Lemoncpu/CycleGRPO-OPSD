@@ -21,8 +21,12 @@ from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 from projects.vlm.tokenmask.evaluation.grefer import G_REFER
 from evaluation.gres.subset_metrics import (
     GresMetricAccumulator,
+    TwoInstanceDiagnosticAccumulator,
     multi_instance_count_bucket,
     target_area_bucket,
+    two_instance_area_balance_bucket,
+    two_instance_center_distance_bucket,
+    two_instance_diagnostic_sample,
 )
 
 
@@ -180,6 +184,8 @@ def parse_args():
                         help='Optional JSON path for the aggregate GRES metrics.')
     parser.add_argument('--subset-report-file', default=None,
                         help='Optional JSONL path for exact cardinality and target-area subset metrics.')
+    parser.add_argument('--two-instance-member-recall-threshold', type=float, default=0.5,
+                        help='Constituent coverage threshold for two-instance recall diagnostics.')
     args = parser.parse_args()
     return args
 
@@ -367,10 +373,16 @@ def _build_subset_metadata(args):
     for ref in refs:
         refs_by_image.setdefault(ref["image_id"], []).append(ref)
 
+    with open(args.instances_file, "r", encoding="utf-8") as file:
+        annotations = {int(item["id"]): item for item in json.load(file)["annotations"]}
+
     metadata = []
     for image_info in refer_api.loadImgs(image_ids=image_ids):
         for ref in refs_by_image.get(image_info["id"], []):
-            positive_count = sum(annotation_id >= 0 for annotation_id in _annotation_ids(ref))
+            positive_annotation_ids = [
+                annotation_id for annotation_id in _annotation_ids(ref) if annotation_id >= 0
+            ]
+            positive_count = len(positive_annotation_ids)
             target_type = (
                 "no_target" if positive_count == 0
                 else "single_instance" if positive_count == 1
@@ -383,6 +395,7 @@ def _build_subset_metadata(args):
                     "phrase": phrase,
                     "target_type": target_type,
                     "annotation_instance_count": positive_count,
+                    "annotation_ids": positive_annotation_ids,
                 })
 
     with open(args.dataset, "r", encoding="utf-8") as file:
@@ -397,7 +410,28 @@ def _build_subset_metadata(args):
                 f"GRES case ordering mismatch at case_{case_id}: "
                 f"dataset={item.get('phrase')!r}, refs={item_metadata['phrase']!r}."
             )
-    return metadata
+    return metadata, annotations
+
+
+def _two_instance_member_masks(metadata, annotations, gt_mask):
+    annotation_ids = metadata["annotation_ids"]
+    if len(annotation_ids) != 2:
+        raise RuntimeError(
+            f"Expected two positive annotation ids for ref {metadata['ref_id']}, got {annotation_ids}."
+        )
+    height, width = gt_mask.shape
+    member_masks = []
+    for annotation_id in annotation_ids:
+        annotation = annotations.get(annotation_id)
+        if annotation is None:
+            raise RuntimeError(f"Missing annotation {annotation_id} for ref {metadata['ref_id']}.")
+        member_masks.append(_decode_annotation(annotation, height, width).astype(bool))
+    reconstructed_union = np.logical_or(member_masks[0], member_masks[1])
+    if not np.array_equal(reconstructed_union, gt_mask):
+        raise RuntimeError(
+            f"Two-instance annotation union differs from case GT for ref {metadata['ref_id']}."
+        )
+    return member_masks
 
 
 def _write_subset_report(path, accumulators):
@@ -410,7 +444,12 @@ def _write_subset_report(path, accumulators):
 
 
 def metric(args):
-    subset_metadata = _build_subset_metadata(args) if args.subset_report_file else None
+    if not 0.0 < args.two_instance_member_recall_threshold <= 1.0:
+        raise ValueError(
+            "--two-instance-member-recall-threshold must be in (0, 1], "
+            f"got {args.two_instance_member_recall_threshold}."
+        )
+    subset_metadata, annotations = _build_subset_metadata(args) if args.subset_report_file else (None, None)
     metrics_accumulator = GresMetricAccumulator()
     subset_accumulators = {}
     observed_case_ids = set()
@@ -463,10 +502,35 @@ def metric(args):
                 area_key = ("target_area", target_area_bucket(gt_mask))
                 subset_accumulators.setdefault(area_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
                 if metadata["annotation_instance_count"] == 2:
+                    member_masks = _two_instance_member_masks(metadata, annotations, gt_mask)
+                    diagnostic_sample = two_instance_diagnostic_sample(
+                        pred_mask,
+                        member_masks,
+                        member_recall_threshold=args.two_instance_member_recall_threshold,
+                    )
                     two_instance_area_key = ("two_instance_target_area", target_area_bucket(gt_mask))
                     subset_accumulators.setdefault(two_instance_area_key, GresMetricAccumulator()).add(
                         pred_mask, gt_mask
                     )
+                    diagnostic_keys = (
+                        ("two_instance_member_recall", "all"),
+                        (
+                            "two_instance_area_balance",
+                            two_instance_area_balance_bucket(diagnostic_sample.small_to_large_area_ratio),
+                        ),
+                        (
+                            "two_instance_center_distance",
+                            two_instance_center_distance_bucket(diagnostic_sample.center_distance_diag),
+                        ),
+                    )
+                    for diagnostic_key in diagnostic_keys:
+                        accumulator = subset_accumulators.setdefault(
+                            diagnostic_key,
+                            TwoInstanceDiagnosticAccumulator(
+                                member_recall_threshold=args.two_instance_member_recall_threshold
+                            ),
+                        )
+                        accumulator.add(pred_mask, gt_mask, diagnostic_sample)
 
     if subset_metadata is not None:
         expected_case_ids = set(range(len(subset_metadata)))

@@ -8,8 +8,12 @@ except ModuleNotFoundError:  # pragma: no cover - local docs-only environments
 if np is not None:
     from evaluation.gres.subset_metrics import (
         GresMetricAccumulator,
+        TwoInstanceDiagnosticAccumulator,
         multi_instance_count_bucket,
         target_area_bucket,
+        two_instance_area_balance_bucket,
+        two_instance_center_distance_bucket,
+        two_instance_diagnostic_sample,
     )
 
 
@@ -49,3 +53,27 @@ class TestGresSubsetMetrics(unittest.TestCase):
         self.assertEqual(multi_instance_count_bucket(12), "4plus_instances")
         with self.assertRaises(ValueError):
             multi_instance_count_bucket(1)
+
+    def test_two_instance_member_diagnostics(self):
+        small_member = np.array([[1, 0, 0], [0, 0, 0], [0, 0, 0]])
+        large_member = np.array([[0, 0, 0], [0, 1, 1], [0, 1, 1]])
+        prediction = small_member.copy()
+        gt_mask = np.logical_or(small_member, large_member)
+        sample = two_instance_diagnostic_sample(
+            prediction,
+            [small_member, large_member],
+            member_recall_threshold=0.5,
+        )
+        self.assertEqual(sample.small_member_coverage, 1.0)
+        self.assertEqual(sample.large_member_coverage, 0.0)
+        self.assertTrue(sample.small_member_hit)
+        self.assertFalse(sample.large_member_hit)
+        self.assertEqual(two_instance_area_balance_bucket(sample.small_to_large_area_ratio), "moderate_0.2_to_0.5")
+        self.assertEqual(two_instance_center_distance_bucket(sample.center_distance_diag), "far_ge_0.5diag")
+
+        accumulator = TwoInstanceDiagnosticAccumulator(member_recall_threshold=0.5)
+        accumulator.add(prediction, gt_mask, sample)
+        metrics = accumulator.as_dict()
+        self.assertEqual(metrics["one_member_only_recall_at_threshold"], 100.0)
+        self.assertEqual(metrics["small_member_recall_at_threshold"], 100.0)
+        self.assertEqual(metrics["large_member_recall_at_threshold"], 0.0)

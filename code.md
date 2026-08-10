@@ -496,7 +496,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance x area 交叉分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
@@ -935,3 +935,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.6 节及本变更日志。
 - 行为：离线子集 JSONL 对精确含两个正 annotation 的 reference 额外输出 `two_instance_target_area=small_lt_5pct/medium_5_to_25pct/large_ge_25pct`，面积由现有 case 的 GT union mask 计算。它与总面积统计共用相同边界，不改变全量、cardinality 或 multi count 指标。
 - 验证：需以已有完整 GRES prediction 在项目 Conda 环境运行 metric-only，确认三类样本数之和等于 `2_instances` 样本数。
+
+### 2026-08-10 - 增加 GRES 两实例成员召回与几何诊断
+
+- 代码：修改 `evaluation/gres/qwen3vl_gres_eval.py`、`evaluation/gres/subset_metrics.py` 和 `tests/test_gres_subset_metrics.py`。
+- 文档：更新第 5.6 节及本变更日志。
+- 行为：离线子集汇总额外从官方 `instances.json` 重建每个 two-instance reference 的两个原 annotation mask，并验证其 union 与保存 case GT 一致。JSONL 增加全体成员召回、small/large member 的平均覆盖和 recall、both/one/none member hit rate，并分别以较小/较大成员面积比 `<0.2`、`0.2-0.5`、`>=0.5` 及掩码质心距离 `<0.25`、`0.25-0.5`、`>=0.5` 图像对角线分桶。成员命中默认要求预测覆盖该成员至少 50%，可由 `--two-instance-member-recall-threshold` 调整；union cIoU 同时保留，避免过大预测仅靠 recall 获得误导性结论。
+- 验证：新增 two-instance member coverage/geometry 的 NumPy unit test；仍需在项目 Conda 环境用已有完整 GRES prediction 运行 metric-only smoke test。
