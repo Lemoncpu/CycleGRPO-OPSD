@@ -168,6 +168,14 @@ Part 10%、no-target 10%，用于针对 GroundingSuite 的四类目标类型做�
 `--single-count`、`--multi-count`、`--stuff-count`、`--part-count` 与 `--no-target-count` 覆盖各配额，
 但五项之和必须为 20,000；未传入时保持默认配方。
 
+`prepare_dam_cycle_dataset.py` 将 Describe Anything 的 `mask_rle + caption` region
+转换为当前 CycleGRPO 图像/mask parquet。`cocostuff_cycle` 直接读取 DAM
+`COCOStuff/annotations.json`；`paco_part_cycle` 还必须与官方 PACO-LVIS train annotation
+中 `id != obj_ann_id` 的 part 交集，避免将 parent object 混入 Part source。两类 source
+默认每张图保留一个 region，并限制 mask 面积为图像的 1% 到 90%。输出保留原有
+`source`、RLE 和 SAMTok token schema，额外写入不进入 prompt 的 `dam_source_id`；DAM
+caption 写入独立 JSONL manifest，供后续 DLC QA 使用。
+
 `prepare_paco_lvis_part_cycle_dataset.py` 只接受 `id != obj_ann_id` 的 PACO annotation，并且每张图
 最多选一个 part，因而不会把 parent object mask 混入 Part 配额或让少数密集标注图主导。PACO-LVIS
 需要其对应的 COCO 2017 图像。`prepare_cocostuff_cycle_dataset.py` 只从官方
@@ -431,6 +439,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
 - `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask，限制每图一个 part，编码为 `paco_part_cycle` parquet 与 part-category manifest。
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并记录区域面积范围和类别直方图。
+- `prepare_dam_cycle_dataset.py`：从 DAM `COCOStuff`/`PACO` 的 `mask_rle + caption` annotation 构造 DAM-backed `cocostuff_cycle` 或 `paco_part_cycle` parquet；PACO 与官方 part annotation 交叉校验，caption 写入独立 manifest。
 - `prepare_balanced_cyclegrpo_dataset.py`：验证各 source 数量后按可配置的 Single/Multi/Stuff/Part/no-target 配额抽取，要求总数为 20k；默认 `7k/5k/4k/2k/2k`，随机打散为 parquet 和可复现实验 manifest。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转固定数量的单目标 CycleGRPO parquet；以 VQ-SAM2 编码 mask token，并保留原始 COCO RLE 供训练时真实 IoU 使用。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
@@ -890,3 +899,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.6 节、关键注意事项 22 及本变更日志。
 - 行为：groundedness parser 在不改变 reward 或路由语义的前提下，为失败 verdict 标记顶层解析原因并统计无效 claim 的具体原因。`caption_groundedness.jsonl` 继续完整记录成功 verdict，并且每个 global step 额外写入最多 8 条失败样本，含学生 caption、解析原因、claim 丢弃统计和最多 2048 字符的 verifier 原始输出；no-target/全局禁用行不写入。诊断数据仅保留在 trainer driver 的短暂 batch 生命周期中，不传递至 actor PPO 更新。
 - 验证：`python3 -m py_compile verl/workers/opsd/groundedness.py verl/trainer/ray_trainer.py tests/test_opsd_core.py`、groundedness parser stdlib smoke test 与 `git diff --check`；完整 `tests/test_opsd_core.py` 仍依赖本机未安装的 PyTorch，未运行 Ray/FSDP/vLLM smoke training。
+
+### 2026-08-10 - 增加 DAM-backed CycleGRPO 数据转换器
+
+- 代码：新增 `projects/rl/datasets/prepare_dam_cycle_dataset.py`。
+- 文档：更新第 2.4、5.3 节，记录 DAM annotation 输入、PACO part 过滤、面积约束、输出 schema 与 caption manifest 边界。
+- 行为：从 DAM `COCOStuff` 或 `PACO` annotation 读取 `mask_rle`，解析实际图像并重新编码 VQ-SAM2 mask token，输出原有 `cocostuff_cycle`/`paco_part_cycle` source；PACO 仅保留与官方 `id != obj_ann_id` 交集且每图最多一个 part。`dam_source_id` 进入 parquet 仅用于离线关联，DAM caption 不进入 actor prompt，而写入独立 JSONL 供 DLC QA 构造。
+- 验证：执行新增脚本的 `python3 -m py_compile` 与 `git diff --check`；本机没有 DAM/COCO 图片、PyTorch/CUDA 或 SAMTok 权重，未执行实际 mask 编码和 parquet 导出。
