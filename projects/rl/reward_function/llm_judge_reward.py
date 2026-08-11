@@ -44,10 +44,7 @@ import asyncio
 import os
 import random
 import re
-from typing import List, Optional
-
-from openai import AsyncOpenAI
-
+from typing import Any, List, Optional
 
 # =====================================================================
 # Prompt — reuse the one you already have in text2mask.py.
@@ -108,7 +105,7 @@ Answer:"""
 # =====================================================================
 # Global client pool (matches the multi-endpoint pattern you had before)
 # =====================================================================
-_ASYNC_CLIENTS: List[AsyncOpenAI] = []
+_ASYNC_CLIENTS: List[Any] = []
 _MODEL_NAMES: List[str] = []
 
 
@@ -127,6 +124,7 @@ def init_judge_clients(
         LLM_AS_A_JUDGE_MODEL   "qwen-judge"
     """
     global _ASYNC_CLIENTS, _MODEL_NAMES
+    from openai import AsyncOpenAI
 
     if _ASYNC_CLIENTS:
         return
@@ -286,3 +284,122 @@ def compute_caption_judge_rewards_batch(
             return loop.run_until_complete(_run_all())
         finally:
             loop.close()
+
+
+CAPTION_QA_PROMPT = """You evaluate a caption without seeing the image. Use only the caption text.
+
+Caption:
+{caption}
+
+Question:
+{question}
+
+Choices:
+{choices}
+
+Reply with exactly one option letter and nothing else."""
+
+
+def _parse_option(text: str, count: int) -> Optional[int]:
+    if not isinstance(text, str):
+        return None
+    match = re.fullmatch(r"\s*([A-Za-z])\s*[.)]?\s*", text)
+    if match is None:
+        return None
+    index = ord(match.group(1).upper()) - ord("A")
+    return index if 0 <= index < count else None
+
+
+async def _caption_qa_one(
+    client: Any,
+    model: str,
+    caption: str,
+    question: dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> tuple[float, bool]:
+    choices = question.get("choices")
+    if not isinstance(caption, str) or not caption.strip() or not isinstance(choices, list) or not choices:
+        return 0.0, True
+    rendered_choices = "\n".join(
+        f"{chr(ord('A') + index)}. {choice[0]}" for index, choice in enumerate(choices)
+    )
+    prompt = CAPTION_QA_PROMPT.format(
+        caption=caption.strip(), question=str(question.get("question", "")).strip(), choices=rendered_choices
+    )
+    try:
+        async with semaphore:
+            completion = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=4,
+            )
+        index = _parse_option(completion.choices[0].message.content, len(choices))
+        if index is None:
+            return 0.0, True
+        score = choices[index][1]
+        return float(score), False
+    except Exception as error:
+        print(f"[llm_judge_reward] caption QA call failed: {error}")
+        return 0.0, True
+
+
+def compute_caption_qa_rewards_batch(
+    responses: List[str],
+    qa_records: List[Optional[list[dict[str, Any]]]],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    max_concurrency: int,
+    timeout_seconds: float,
+) -> List[dict[str, float]]:
+    """Score every QA for each caption; failed questions contribute zero, never a penalty."""
+    if len(responses) != len(qa_records):
+        raise ValueError("caption QA responses and records length mismatch")
+    if not responses:
+        return []
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds, max_retries=0)
+
+    async def run_all():
+        semaphore = asyncio.Semaphore(max_concurrency)
+        tasks = []
+        owners = []
+        for owner, (response, questions) in enumerate(zip(responses, qa_records)):
+            for question in questions or []:
+                tasks.append(_caption_qa_one(client, model, response, question, semaphore))
+                owners.append(owner)
+        outcomes = await asyncio.gather(*tasks) if tasks else []
+        return aggregate_caption_qa_outcomes(len(responses), owners, outcomes)
+
+    try:
+        return asyncio.run(run_all())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(run_all())
+        finally:
+            loop.close()
+
+
+def aggregate_caption_qa_outcomes(
+    response_count: int, owners: List[int], outcomes: List[tuple[float, bool]]
+) -> List[dict[str, float]]:
+    """Average all questions for a caption; unparseable questions contribute zero."""
+    totals = [0.0] * response_count
+    counts = [0] * response_count
+    failures = [0] * response_count
+    for owner, (score, failed) in zip(owners, outcomes):
+        totals[owner] += score
+        counts[owner] += 1
+        failures[owner] += int(failed)
+    return [
+        {
+            "reward": totals[index] / counts[index] if counts[index] else 0.0,
+            "question_count": float(counts[index]),
+            "failure_count": float(failures[index]),
+        }
+        for index in range(response_count)
+    ]

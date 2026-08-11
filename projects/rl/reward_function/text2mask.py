@@ -22,6 +22,7 @@ _MODEL_CACHE = {'vq_sam2': None, 'sam2_image_processor': None}
 from projects.rl.reward_function.llm_judge_reward import (
     init_judge_clients,
     compute_caption_judge_rewards_batch,
+    compute_caption_qa_rewards_batch,
 )
 
 # 仅当 batch 含 LLM-as-a-judge source 时初始化。从 env vars 读 endpoint:
@@ -1055,6 +1056,22 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
         else:
             judge_reward_map = {}
 
+        qa_indices = [i for i, ri in enumerate(reward_inputs) if ri.get("caption_qa")]
+        if qa_indices:
+            settings = reward_inputs[qa_indices[0]]["caption_qa_settings"]
+            qa_results = compute_caption_qa_rewards_batch(
+                [reward_inputs[i]["response"] for i in qa_indices],
+                [reward_inputs[i]["caption_qa"] for i in qa_indices],
+                base_url=settings.judge_base_url,
+                api_key=settings.judge_api_key,
+                model=settings.judge_model,
+                max_concurrency=settings.max_concurrency,
+                timeout_seconds=settings.timeout_seconds,
+            )
+            qa_reward_map = dict(zip(qa_indices, qa_results))
+        else:
+            qa_reward_map = {}
+
         for i, reward_input in enumerate(reward_inputs):
             source = reward_input["source"]
 
@@ -1271,10 +1288,15 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 cap_validity_score = cap_no_bbox_no_chinese_score * cap_no_special_token_or_json_score
                 groundedness = reward_input.get("groundedness") or {}
                 groundedness_penalty_value = groundedness_penalty(groundedness)
+                qa_result = qa_reward_map.get(i, {"reward": 0.0, "question_count": 0.0, "failure_count": 0.0})
+                qa_settings = reward_input.get("caption_qa_settings")
+                qa_weight = qa_settings.reward_weight if qa_settings is not None else 0.0
+                qa_reward = qa_weight * qa_result["reward"]
                 cap_overall = (
                     (answer_content_no_repeat_score + 10 * iou_scores) * cap_validity_score
                     + cap_validity_score
                     - groundedness_penalty_value
+                    + qa_reward
                 )
                 scores.append(
                     {
@@ -1287,6 +1309,10 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                         "cap_groundedness_score": float(groundedness.get("groundedness_score", 0.0)),
                         "cap_unsupported_claim_count": int(groundedness.get("unsupported_count", 0)),
                         "cap_contradicted_claim_count": int(groundedness.get("contradicted_count", 0)),
+                        "cap_dlc_qa_reward": qa_reward,
+                        "cap_dlc_qa_raw_reward": qa_result["reward"],
+                        "cap_dlc_qa_question_count": qa_result["question_count"],
+                        "cap_dlc_qa_failure_count": qa_result["failure_count"],
                     }
                 )
 
@@ -1305,6 +1331,26 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
         from projects.rl.reward_function.tg_reward import tg_reward
         for reward_input in reward_inputs:
             source = reward_input["source"]
+            if source == "supervised_grounding":
+                iou_score = float(reward_input["iou_scores"] or 0.0)
+                format_score = float(bool(re.search(r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", reward_input["response"])))
+                no_repeat_score = non_repeat_reward(reward_input["response"])
+                scores.append({
+                    "seg_overall": 10 * iou_score + format_score + no_repeat_score,
+                    "seg_supervised_grounding_iou": iou_score,
+                    "seg_format": format_score,
+                    "seg_no_repeat_score": no_repeat_score,
+                })
+                continue
+            if source == "supervised_grounding_no_target":
+                no_target_score = no_target_check(reward_input["response"], "No target.")
+                no_repeat_score = non_repeat_reward(reward_input["response"])
+                scores.append({
+                    "seg_overall": no_target_score + no_repeat_score,
+                    "seg_supervised_grounding_no_target": no_target_score,
+                    "seg_no_repeat_score": no_repeat_score,
+                })
+                continue
             if source in ['tg_multi_merged']:
                 iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"]
                 format_score = temporal_list_format_reward(reward_input.get("response"))

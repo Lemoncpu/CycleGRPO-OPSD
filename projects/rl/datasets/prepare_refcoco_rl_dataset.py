@@ -176,6 +176,8 @@ def main() -> None:
                 "images": [str(image_path.resolve())],
                 "cap_problem": CAPTION_PROMPT.format(mask_token=mask_token),
                 "cap_answer": sentence_text(ref),
+                # Kept separately for direct grounding; the mixer clears cap_answer.
+                "grounding_query": sentence_text(ref),
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(binary_mask),

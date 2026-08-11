@@ -177,6 +177,8 @@ def main() -> None:
                 # Positive cycle records are image-and-mask only. Keeping the
                 # source expression would retain text supervision in the data.
                 "cap_answer": None,
+                "grounding_query": expression(ref),
+                "grounding_instance_count": len(annotation_ids(ref)),
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(binary_mask),
@@ -192,6 +194,8 @@ def main() -> None:
                 "images": [str(path.resolve())],
                 "cap_problem": NO_TARGET_PROMPT.format(expression=expression(ref)),
                 "cap_answer": None,
+                "grounding_query": expression(ref),
+                "grounding_instance_count": 0,
                 "seg_problem": None,
                 "seg_answer": "<answer>No target.</answer>",
                 "masks": None,

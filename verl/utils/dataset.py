@@ -416,6 +416,7 @@ class RLHFDataset(Dataset):
     def _build_gen_seg_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         is_video_sample = self.video_key in example
         media_token = "<video>" if is_video_sample else "<image>"
+        prompt_variant = example.get("localization_prompt_variant", "legacy")
         # 视频样本使用时间戳定位模板；图像样本沿用 bbox/mask 模板
         if is_video_sample:
             PROMPT_TEMPLATE = """{media_token}\nBased on the description below, locate the timestamp interval in the video where the event occurs:
@@ -425,6 +426,10 @@ class RLHFDataset(Dataset):
             PROMPT_TEMPLATE = """{media_token}\nAll spatial relationships are defined from the viewer's perspective, where 'front' means closer to the viewer and 'back' means farther from the viewer. Please provide the bounding box of the object the following statement describes:
         {description}
         Ensure that all details mentioned about the object are accurate. If a matching object is found, provide its bounding box in the format `[x1, y1, x2, y2]` where coordinates are normalized to [0, 1000]. If no matching object is found, output null."""
+        elif prompt_variant == "refcoco":
+            PROMPT_TEMPLATE = """{media_token}\nPlease segment {description} in this image."""
+        elif prompt_variant == "groundingsuite":
+            PROMPT_TEMPLATE = """{media_token}\nPlease carefully check the image and detect the object this sentence describes: {description}"""
         else:
             PROMPT_TEMPLATE = """{media_token}\nAll spatial relationships are defined from the viewer's perspective, where 'front' means closer to the viewer and 'back' means farther from the viewer. Please provide the segmentation mask of the object the following statement describes:
         {description}

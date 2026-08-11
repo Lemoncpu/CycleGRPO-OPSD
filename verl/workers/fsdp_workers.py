@@ -1467,6 +1467,13 @@ class FSDPWorker(Worker):
         pixel_config = self.config.opsd.pixel_iou
         for sample_uid, indices in sample_groups.items():
             first = indices[0]
+            if data.non_tensor_batch["source"][first] == "supervised_grounding_no_target":
+                # Direct no-target uses the established refusal reward.  It has no
+                # target mask token, so invoking the VQ-SAM2 decoder is both
+                # meaningless and unsafe for a text-only rejection rollout.
+                pixel_ious[indices] = 0.0
+                reference_sources[indices] = "not_applicable"
+                continue
             mm_data = media[first]
             if "images" not in mm_data or not mm_data["images"]:
                 # Video routes keep their existing temporal IoU implementation.

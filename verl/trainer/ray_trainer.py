@@ -59,6 +59,10 @@ from ..workers.opsd import (
     teacher_caption_is_safe,
     uses_original_grpo,
 )
+from ..workers.supervised_anchors import (
+    alternating_localization_prompt_variants,
+    direct_grounding_source,
+)
 from .config import PPOConfig
 from .core_algos import (
     AdvantageEstimator,
@@ -706,12 +710,19 @@ class RayPPOTrainer:
         batch: DataProto,
         rollout_count: Optional[int] = None,
         rollout_overrides: Optional[dict[str, Any]] = None,
+        seg_problem_overrides: Optional[list[str]] = None,
+        source_overrides: Optional[list[str]] = None,
+        localization_prompt_variant_overrides: Optional[list[str]] = None,
     ) -> DataProto:
 
         all_seg_problems = []
         gen_seg_batch_list = []
         for i in range(len(batch.non_tensor_batch['multi_modal_data'])):
-            seg_problem = self.tokenizer.decode(batch.batch['responses'][i], skip_special_tokens=True)
+            seg_problem = (
+                seg_problem_overrides[i]
+                if seg_problem_overrides is not None
+                else self.tokenizer.decode(batch.batch['responses'][i], skip_special_tokens=True)
+            )
             seg_mm_data = batch.non_tensor_batch['seg_multi_modal_data'][i]
             # Remove empty thinking tags if present
             seg_problem = re.sub(r'<think>\s*</think>\s*', '', seg_problem)
@@ -727,9 +738,18 @@ class RayPPOTrainer:
                 seg_problem = strip_temporal_priors(seg_problem)
             all_seg_problems.append(seg_problem)
             cap_mm_data = batch.non_tensor_batch['multi_modal_data'][i]
+            # Use both downstream image-localization phrasings for cycle captions.
+            # Direct no-target grounding passes an explicit RefCOCO/GRES variant so
+            # its prompt has positive cycle counterparts instead of standing alone.
+            prompt_variant = (
+                localization_prompt_variant_overrides[i]
+                if localization_prompt_variant_overrides is not None
+                else ("refcoco" if i % 2 == 0 else "groundingsuite")
+            )
             example = {'seg_problem': seg_problem,
+                        'localization_prompt_variant': prompt_variant,
                         'seg_ground_truth': batch.non_tensor_batch['seg_ground_truth'][i],
-                        'source': batch.non_tensor_batch['source'][i],
+                        'source': source_overrides[i] if source_overrides is not None else batch.non_tensor_batch['source'][i],
                         'masks': batch.non_tensor_batch['masks'][i],
                         'cap_ground_truth': batch.non_tensor_batch['cap_ground_truth'][i]}
             if 'images' in seg_mm_data:
@@ -841,6 +861,54 @@ class RayPPOTrainer:
         # gen_batch_output.non_tensor_batch.keys(): ['multi_modal_data', 'mask_token_accuracy', 'format_correct', 'iou_scores']
         return batch, gen_batch_output
 
+    def _make_direct_grounding_batch(self, cycle_batch: DataProto) -> Optional[DataProto]:
+        """Generate a separate human-query grounding GRPO batch.
+
+        The source batch contains G caption rollouts per original image. Keep one
+        row per original uid and assign fresh localization UIDs in the shared
+        helper, so these samples can never affect caption-cycle R_Ci grouping.
+        """
+        config = self.config.worker.supervised_anchors.direct_grounding
+        if not config.enabled or "grounding_query" not in cycle_batch.non_tensor_batch:
+            return None
+        seen_uids: set[str] = set()
+        indices, queries, sources = [], [], []
+        for index, (uid, source, query) in enumerate(
+            zip(
+                cycle_batch.non_tensor_batch["uid"],
+                cycle_batch.non_tensor_batch["source"],
+                cycle_batch.non_tensor_batch["grounding_query"],
+            )
+        ):
+            uid_text = str(uid)
+            if uid_text in seen_uids or not isinstance(query, str) or not query.strip():
+                continue
+            direct_source = direct_grounding_source(
+                source,
+                config.include_no_target,
+                config.include_positive_sources,
+            )
+            if direct_source is None:
+                continue
+            seen_uids.add(uid_text)
+            indices.append(index)
+            queries.append(query.strip())
+            sources.append(direct_source)
+        if not indices:
+            return None
+        direct_parent = cycle_batch[indices]
+        _, direct_batch = self._make_seg_batch_data_for_caption(
+            direct_parent,
+            rollout_count=config.rollouts,
+            seg_problem_overrides=queries,
+            source_overrides=sources,
+            localization_prompt_variant_overrides=alternating_localization_prompt_variants(
+                len(queries)
+            ),
+        )
+        direct_batch.non_tensor_batch["direct_grounding"] = np.ones(len(direct_batch), dtype=object)
+        return direct_batch
+
     def _merge_pixel_iou_metadata(self, caption_batch: DataProto, segmentation_batch: DataProto) -> None:
         caption_uids = segmentation_batch.non_tensor_batch["caption_uid"]
         contexts = segmentation_batch.non_tensor_batch["privileged_context"]
@@ -923,6 +991,46 @@ class RayPPOTrainer:
             [final_route_by_uid.get(str(uid), route) for uid, route in zip(caption_uids, segmentation_batch.non_tensor_batch["route"])],
             dtype=object,
         )
+
+    def _prepare_direct_grounding_advantage(
+        self, batch: DataProto, metrics: dict[str, Any], timing_raw: dict[str, Any]
+    ) -> DataProto:
+        """Score direct human-query grounding without entering OPSD routing."""
+        self._balance_batch(batch, metrics=metrics, logging_prefix="direct_grounding_seqlen")
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        with timer("direct_grounding_reward", timing_raw):
+            reward_ref = self.reward_fn.compute_reward.remote(self.global_step, batch, task="segmentation")
+        with timer("direct_grounding_old", timing_raw):
+            batch = batch.union(self.actor_rollout_ref_wg.compute_log_probs(batch))
+        if self.use_reference_policy:
+            with timer("direct_grounding_ref", timing_raw):
+                batch = batch.union(self.actor_rollout_ref_wg.compute_ref_log_probs(batch))
+        if self.use_critic:
+            with timer("direct_grounding_values", timing_raw):
+                batch = batch.union(self.critic_wg.compute_values(batch))
+        with timer("direct_grounding_adv", timing_raw):
+            reward_tensor, reward_metrics = ray.get(reward_ref)
+            batch.batch["token_level_scores"] = reward_tensor
+            metrics.update(
+                {
+                    f"reward/direct_grounding_{key}": value
+                    for key, value in reduce_metrics(reward_metrics).items()
+                }
+            )
+            if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                batch, kl_metrics = apply_kl_penalty(
+                    batch, self.kl_ctrl, self.config.algorithm.kl_penalty
+                )
+                metrics.update({f"direct_grounding_{key}": value for key, value in kl_metrics.items()})
+            else:
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+            )
+        return batch
 
     def _build_opsd_prompt_batch(
         self,
@@ -1697,6 +1805,7 @@ class RayPPOTrainer:
                 regenerate_batch = None
                 distillation_batch = None
                 seg_batch = None
+                direct_grounding_batch = None
                 if cycle_batch is not None and (
                     self.config.worker.actor.optimize_captioner or self.config.worker.actor.optimize_segmenter
                 ):
@@ -1705,11 +1814,51 @@ class RayPPOTrainer:
                         cycle_batch.meta_info["n"] = self.config.worker.opsd.localization_rollouts
                         self.actor_rollout_ref_wg.prepare_rollout_engine()
                         cycle_cap_batch, cycle_seg_batch = self._make_seg_batch_data_for_caption(cycle_batch)
+                        direct_batches = [
+                            direct_batch
+                            for parent_batch in (cycle_batch, non_cycle_batch)
+                            if parent_batch is not None
+                            for direct_batch in [self._make_direct_grounding_batch(parent_batch)]
+                            if direct_batch is not None
+                        ]
+                        if direct_batches:
+                            direct_grounding_batch = (
+                                direct_batches[0]
+                                if len(direct_batches) == 1
+                                else DataProto.concat(direct_batches)
+                            )
+                        direct_config = self.config.worker.supervised_anchors.direct_grounding
+                        if (
+                            non_cycle_batch is not None
+                            and direct_config.enabled
+                            and direct_config.include_no_target
+                            and direct_config.consume_no_target_caption
+                        ):
+                            # The direct segmentation rollout owns no-target updates.
+                            # Keeping the original caption PPO batch would train the
+                            # same RefCOCO/GRES-shaped prompt to emit only refusals.
+                            keep_indices = [
+                                index
+                                for index, source in enumerate(non_cycle_batch.non_tensor_batch["source"])
+                                if str(source) != "gres_no_target"
+                            ]
+                            non_cycle_batch = (
+                                non_cycle_batch[keep_indices] if keep_indices else None
+                            )
                         cycle_cap_batch.meta_info.pop("n", None)
                         self.actor_rollout_ref_wg.release_rollout_engine()
                         if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:
                             self.actor_rollout_ref_wg.prepare_mask_decoder()
                             cycle_seg_batch = self.actor_rollout_ref_wg.compute_pixel_mask_ious(cycle_seg_batch)
+                            if direct_grounding_batch is not None:
+                                # The decoder explicitly skips direct no-target groups; their
+                                # reward remains the established ``No target.`` refusal reward.
+                                direct_grounding_batch = self.actor_rollout_ref_wg.compute_pixel_mask_ious(
+                                    direct_grounding_batch
+                                )
+                                direct_grounding_batch.non_tensor_batch["iou_scores"] = (
+                                    direct_grounding_batch.non_tensor_batch["pixel_iou"].copy()
+                                )
                             self.actor_rollout_ref_wg.release_mask_decoder()
                             self._merge_pixel_iou_metadata(cycle_cap_batch, cycle_seg_batch)
                             route_values = list(cycle_cap_batch.non_tensor_batch["route"])
@@ -1961,6 +2110,16 @@ class RayPPOTrainer:
 
                     seg_batch = cycle_seg_batch
 
+                if direct_grounding_batch is not None and self.config.worker.actor.optimize_segmenter:
+                    direct_grounding_batch = self._prepare_direct_grounding_advantage(
+                        direct_grounding_batch, metrics, timing_raw
+                    )
+                    metrics["supervised_anchors/direct_grounding_rollouts"] = len(direct_grounding_batch)
+                    metrics["supervised_anchors/direct_grounding_prompt_count"] = (
+                        len(direct_grounding_batch)
+                        // self.config.worker.supervised_anchors.direct_grounding.rollouts
+                    )
+
                 # Groundedness is fully consumed by the reward and optional
                 # auxiliary JSD batch. Keep it off every main PPO actor batch.
                 if cycle_cap_batch is not None:
@@ -2016,7 +2175,8 @@ class RayPPOTrainer:
                     # Case 1: Both tasks - Use gradient accumulation for cap_batch and seg_batch
                     cap_batch_size = len(cap_batch) if cap_batch is not None else 0
                     seg_batch_size = len(seg_batch) if seg_batch is not None else 0
-                    total_size = cap_batch_size + seg_batch_size
+                    direct_grounding_size = len(direct_grounding_batch) if direct_grounding_batch is not None else 0
+                    total_size = cap_batch_size + seg_batch_size + direct_grounding_size
                     
                     cap_grad_weight = self.config.worker.opsd.caption_loss_weight
                     seg_grad_weight = self.config.worker.opsd.localization_loss_weight
@@ -2115,6 +2275,23 @@ class RayPPOTrainer:
                                 seg_batch.meta_info['global_batch_size_per_device'] = len(seg_batch) // self.actor_rollout_ref_wg.world_size
                                 seg_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(seg_batch)
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
+
+                            if direct_grounding_batch is not None and direct_grounding_size > 0:
+                                direct_grounding_batch.meta_info["grad_weight"] = (
+                                    self.config.worker.supervised_anchors.direct_grounding.loss_weight
+                                )
+                                direct_grounding_batch.meta_info["global_batch_size_per_device"] = (
+                                    len(direct_grounding_batch) // self.actor_rollout_ref_wg.world_size
+                                )
+                                direct_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(
+                                    direct_grounding_batch
+                                )
+                                actor_metrics.update(
+                                    {
+                                        f"direct_grounding_{key}": value
+                                        for key, value in reduce_metrics(direct_output.non_tensor_batch).items()
+                                    }
+                                )
 
                             if not projection_enabled:
                                 # Preserve the historical accumulation order when projection is disabled.

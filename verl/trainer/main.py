@@ -35,6 +35,11 @@ class Runner:
         # print config
         print(json.dumps(config.to_dict(), indent=2))
 
+        # Reward actors only receive RewardConfig. Copy this narrowly-scoped
+        # runtime dependency instead of exposing supervised anchors to reward
+        # functions through environment globals.
+        config.worker.reward.caption_qa = config.worker.supervised_anchors.caption_qa
+
         # instantiate tokenizer
         tokenizer = get_tokenizer(
             config.worker.actor.model.model_path,

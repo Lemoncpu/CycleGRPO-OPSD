@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import os
 import sys
 from abc import ABC, abstractmethod
@@ -33,6 +34,7 @@ from transformers import PreTrainedTokenizer
 
 from ...protocol import DataProto
 from .config import RewardConfig
+from projects.rl.datasets.generate_dam_caption_qa import validate_caption_qa_questions
 
 class RewardInput(TypedDict):
     response: str
@@ -153,6 +155,31 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
 class BatchFunctionRewardManager(FunctionRewardManager):
     reward_fn: BatchRewardFunction
 
+    def __init__(self, config: RewardConfig, tokenizer: PreTrainedTokenizer):
+        super().__init__(config, tokenizer)
+        self.caption_qa_by_id: dict[str, list[dict]] = {}
+        qa_config = config.caption_qa
+        if qa_config.enabled:
+            if not os.path.isfile(qa_config.qa_jsonl):
+                raise FileNotFoundError(f"Caption QA JSONL not found: {qa_config.qa_jsonl}")
+            with open(qa_config.qa_jsonl, encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    dam_id, source, questions = row.get("dam_source_id"), row.get("source"), row.get("questions")
+                    if not isinstance(dam_id, str) or not dam_id or source not in {"cocostuff_cycle", "paco_part_cycle"}:
+                        raise ValueError(f"Invalid caption QA row at {qa_config.qa_jsonl}:{line_number}")
+                    try:
+                        validate_caption_qa_questions(questions)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Invalid caption QA row at {qa_config.qa_jsonl}:{line_number}: {error}"
+                        ) from error
+                    if dam_id in self.caption_qa_by_id:
+                        raise ValueError(f"Duplicate caption QA dam_source_id {dam_id!r}")
+                    self.caption_qa_by_id[dam_id] = questions
+
     def compute_reward(self, step: int, data: DataProto, task: str) -> Tuple[torch.Tensor, dict[str, list[float]]]:
         # ['prompts', 'responses', 'input_ids', 'attention_mask', 'response_mask', 'position_ids']
         reward_inputs = []
@@ -162,6 +189,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
         seg_ground_truth = data.non_tensor_batch.get("seg_ground_truth")
         cap_ground_truth = data.non_tensor_batch.get("cap_ground_truth")
         groundedness = data.non_tensor_batch.get("groundedness")
+        dam_source_ids = data.non_tensor_batch.get("dam_source_id")
         for i in range(len(data)):
             cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
             valid_response_ids = response_ids[i][:cur_response_length]
@@ -175,7 +203,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     "response_length": cur_response_length,
                     "source": data.non_tensor_batch["source"][i],
                     "task": task,
-                    "iou_scores": data.non_tensor_batch["iou_scores"][i] if data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'tg_multi_merged', 'dam_cyclegrpo', None] else None,
+                    "iou_scores": data.non_tensor_batch["iou_scores"][i] if data.non_tensor_batch["source"][i] in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'tg_multi_merged', 'dam_cyclegrpo', 'supervised_grounding', 'supervised_grounding_no_target', None] else None,
                     "mask_token_accuracy": data.non_tensor_batch["mask_token_accuracy"][i] if task == 'segmentation' else None,
                     # "correct_mask": data.non_tensor_batch["correct_mask"][i], 
                     # "image": images[i]['images'][0] if task == 'segmentation' else None,
@@ -184,6 +212,11 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     "seg_ground_truth": seg_ground_truth[i] if task == 'segmentation' else None,
                     "groundedness": groundedness[i] if groundedness is not None and task == 'caption' else None,
                     "extra_info": data.non_tensor_batch["extra_info"][i] if "extra_info" in data.non_tensor_batch else None,
+                    "caption_qa": (
+                        self.caption_qa_by_id.get(str(dam_source_ids[i]))
+                        if task == "caption" and dam_source_ids is not None else None
+                    ),
+                    "caption_qa_settings": self.config.caption_qa if task == "caption" else None,
                     # "cap_images": cap_images[i] if task == 'segmentation' else None,
                     # "cap_responses": cap_responses[i] if task == 'segmentation' else None,
                 }

@@ -56,6 +56,20 @@ TEACHER_CONFIDENCE_ENABLED="${TEACHER_CONFIDENCE_ENABLED:-true}"
 REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
 REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
 DISTILL_MIN_CAPTION_SCORE="${DISTILL_MIN_CAPTION_SCORE:-0.65}"
+SUPERVISED_CAPTION_QA_ENABLED="${SUPERVISED_CAPTION_QA_ENABLED:-false}"
+CAPTION_QA_JSONL="${CAPTION_QA_JSONL:-}"
+CAPTION_QA_JUDGE_BASE_URL="${CAPTION_QA_JUDGE_BASE_URL:-}"
+CAPTION_QA_JUDGE_MODEL="${CAPTION_QA_JUDGE_MODEL:-}"
+CAPTION_QA_JUDGE_API_KEY="${CAPTION_QA_JUDGE_API_KEY:-EMPTY}"
+CAPTION_QA_MAX_CONCURRENCY="${CAPTION_QA_MAX_CONCURRENCY:-16}"
+CAPTION_QA_TIMEOUT_SECONDS="${CAPTION_QA_TIMEOUT_SECONDS:-60}"
+CAPTION_QA_REWARD_WEIGHT="${CAPTION_QA_REWARD_WEIGHT:-1.0}"
+DIRECT_GROUNDING_ENABLED="${DIRECT_GROUNDING_ENABLED:-true}"
+DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-2}"
+DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
+DIRECT_GROUNDING_INCLUDE_NO_TARGET="${DIRECT_GROUNDING_INCLUDE_NO_TARGET:-true}"
+DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES:-false}"
+DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-true}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SAVE_LIMIT="${SAVE_LIMIT:-20}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
@@ -106,13 +120,37 @@ for bool_name in \
     CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB \
     EMA_TEACHER_ENABLED \
     TEACHER_ANALYSIS_ENABLED \
-    GROUNDEDNESS_ENABLED; do
+    GROUNDEDNESS_ENABLED \
+    SUPERVISED_CAPTION_QA_ENABLED \
+    DIRECT_GROUNDING_ENABLED \
+    DIRECT_GROUNDING_INCLUDE_NO_TARGET \
+    DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES \
+    DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
         echo "${bool_name} must be true or false: ${bool_value}" >&2
         exit 1
     fi
 done
+
+if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    for caption_qa_required in CAPTION_QA_JSONL CAPTION_QA_JUDGE_BASE_URL CAPTION_QA_JUDGE_MODEL; do
+        if [[ -z "${!caption_qa_required}" ]]; then
+            echo "${caption_qa_required} is required when SUPERVISED_CAPTION_QA_ENABLED=true." >&2
+            exit 1
+        fi
+    done
+    if [[ ! -f "${CAPTION_QA_JSONL}" ]]; then
+        echo "CAPTION_QA_JSONL not found: ${CAPTION_QA_JSONL}" >&2
+        exit 1
+    fi
+fi
+
+if [[ ! "${DIRECT_GROUNDING_ROLLOUTS}" =~ ^[2-9][0-9]*$ ]] \
+    || [[ ! "${CAPTION_QA_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "DIRECT_GROUNDING_ROLLOUTS must be >=2 and CAPTION_QA_MAX_CONCURRENCY must be positive." >&2
+    exit 1
+fi
 
 if [[ "${ROUTING_ENABLED}" == "true" && "${OPSD_ENABLED}" != "true" ]]; then
     echo "ROUTING_ENABLED=true requires OPSD_ENABLED=true." >&2
@@ -374,6 +412,8 @@ echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADI
 echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
 echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
+echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
+echo "Direct referring grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, loss weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -452,6 +492,20 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.groundedness.no_target_enabled=false \
     worker.opsd.groundedness.token_jsd_enabled=false \
     worker.opsd.groundedness.token_jsd_multiplier=1.0 \
+    worker.supervised_anchors.caption_qa.enabled="${SUPERVISED_CAPTION_QA_ENABLED}" \
+    worker.supervised_anchors.caption_qa.qa_jsonl="${CAPTION_QA_JSONL}" \
+    worker.supervised_anchors.caption_qa.judge_base_url="${CAPTION_QA_JUDGE_BASE_URL}" \
+    worker.supervised_anchors.caption_qa.judge_model="${CAPTION_QA_JUDGE_MODEL}" \
+    worker.supervised_anchors.caption_qa.judge_api_key="${CAPTION_QA_JUDGE_API_KEY}" \
+    worker.supervised_anchors.caption_qa.max_concurrency="${CAPTION_QA_MAX_CONCURRENCY}" \
+    worker.supervised_anchors.caption_qa.timeout_seconds="${CAPTION_QA_TIMEOUT_SECONDS}" \
+    worker.supervised_anchors.caption_qa.reward_weight="${CAPTION_QA_REWARD_WEIGHT}" \
+    worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
+    worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
+    worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
+    worker.supervised_anchors.direct_grounding.include_no_target="${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" \
+    worker.supervised_anchors.direct_grounding.include_positive_sources="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}" \
+    worker.supervised_anchors.direct_grounding.consume_no_target_caption="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \

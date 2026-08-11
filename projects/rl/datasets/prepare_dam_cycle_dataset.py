@@ -196,6 +196,8 @@ def main() -> None:
                 "images": [str(image_path.resolve())],
                 "cap_problem": CAPTION_PROMPT.format(mask_token=mask_token),
                 "cap_answer": None,
+                # DAM captions stay in the sidecar QA manifest, never in the actor prompt.
+                "grounding_query": None,
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(candidate["mask"]),

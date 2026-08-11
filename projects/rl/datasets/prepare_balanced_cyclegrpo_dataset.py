@@ -7,15 +7,14 @@ import random
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset
-
+from projects.rl.datasets.generate_dam_caption_qa import validate_caption_qa_questions
 
 DEFAULT_COUNTS = {
-    "single": 7_000,
-    "multi": 5_000,
-    "stuff": 4_000,
+    "single": 8_000,
+    "multi": 4_000,
+    "stuff": 5_000,
     "part": 2_000,
-    "no_target": 2_000,
+    "no_target": 1_000,
 }
 
 
@@ -32,10 +31,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stuff-count", type=int, default=DEFAULT_COUNTS["stuff"])
     parser.add_argument("--part-count", type=int, default=DEFAULT_COUNTS["part"])
     parser.add_argument("--no-target-count", type=int, default=DEFAULT_COUNTS["no_target"])
+    parser.add_argument(
+        "--caption-qa-manifest",
+        type=Path,
+        default=None,
+        help="Accepted DAM QA JSONL. Its Stuff/PACO IDs are included before random fill.",
+    )
+    parser.add_argument("--qa-stuff-count", type=int, default=3_000)
+    parser.add_argument("--qa-part-count", type=int, default=2_000)
     return parser.parse_args()
 
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
+    from datasets import Dataset
+
     if not path.is_file():
         raise FileNotFoundError(path)
     return [dict(record) for record in Dataset.from_parquet(str(path))]
@@ -48,13 +57,72 @@ def select_rows(
     count: int,
     seed: int,
     name: str,
+    predicate: Any = None,
 ) -> list[dict[str, Any]]:
     candidates = [row for row in rows if row.get("source") == source]
+    if predicate is not None:
+        candidates = [row for row in candidates if predicate(row)]
     candidates.sort(key=lambda row: str(row.get("images", [""])[0]))
     random.Random(seed).shuffle(candidates)
     if len(candidates) < count:
         raise RuntimeError(f"{name} has {len(candidates)} rows for source {source!r}; need {count}.")
     return candidates[:count]
+
+
+def load_caption_qa_ids(path: Path | None) -> dict[str, set[str]]:
+    """Read accepted QA IDs and keep source membership explicit."""
+    result = {"cocostuff_cycle": set(), "paco_part_cycle": set()}
+    if path is None:
+        return result
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    seen: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            dam_id, source, questions = row.get("dam_source_id"), row.get("source"), row.get("questions")
+            if not isinstance(dam_id, str) or not dam_id:
+                raise ValueError(f"{path}:{line_number} is missing dam_source_id")
+            if dam_id in seen:
+                raise ValueError(f"{path}:{line_number} duplicates dam_source_id {dam_id!r}")
+            if source not in result:
+                raise ValueError(f"{path}:{line_number} has unsupported QA source {source!r}")
+            try:
+                validate_caption_qa_questions(questions)
+            except ValueError as error:
+                raise ValueError(f"{path}:{line_number} has invalid QA questions: {error}") from error
+            seen.add(dam_id)
+            result[source].add(dam_id)
+    return result
+
+
+def select_rows_with_required_ids(
+    rows: list[dict[str, Any]], *, source: str, count: int, required_ids: set[str], seed: int, name: str
+) -> list[dict[str, Any]]:
+    candidates = [row for row in rows if row.get("source") == source]
+    by_id = {row.get("dam_source_id"): row for row in candidates}
+    missing = sorted(required_ids - set(by_id))
+    if missing:
+        raise RuntimeError(f"{name} QA manifest ID is absent from source parquet: {missing[0]!r}")
+    if len(required_ids) > count:
+        raise RuntimeError(f"{name} has {len(required_ids)} required QA IDs; quota is only {count}.")
+    required = [by_id[dam_id] for dam_id in sorted(required_ids)]
+    remainder = [row for row in candidates if row.get("dam_source_id") not in required_ids]
+    remainder.sort(key=lambda row: str(row.get("images", [""])[0]))
+    random.Random(seed).shuffle(remainder)
+    if len(required) + len(remainder) < count:
+        raise RuntimeError(f"{name} has insufficient rows for quota {count}.")
+    return required + remainder[: count - len(required)]
+
+
+def assert_multi_rows(rows: list[dict[str, Any]]) -> None:
+    if any(int(row.get("grounding_instance_count", 0)) < 2 for row in rows):
+        raise RuntimeError(
+            "gRefCOCO multi quota requires grounding_instance_count >= 2; "
+            "re-export gRefCOCO with this converter before mixing."
+        )
 
 
 def strip_positive_caption_answers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -83,30 +151,52 @@ def mixture_counts(args: argparse.Namespace) -> dict[str, int]:
 
 
 def main() -> None:
+    from datasets import Dataset
+
     args = parse_args()
     counts = mixture_counts(args)
     ref_rows = load_rows(args.refcoco)
     gref_rows = load_rows(args.grefcoco)
     stuff_rows = load_rows(args.cocostuff)
     part_rows = load_rows(args.paco_parts)
+    qa_ids = load_caption_qa_ids(args.caption_qa_manifest)
+    if args.caption_qa_manifest is not None:
+        expected_qa = {
+            "cocostuff_cycle": args.qa_stuff_count,
+            "paco_part_cycle": args.qa_part_count,
+        }
+        actual_qa = {source: len(ids) for source, ids in qa_ids.items()}
+        if actual_qa != expected_qa:
+            raise RuntimeError(
+                "Caption QA manifest source counts must match the requested 3k Stuff / 2k PACO split: "
+                f"expected={expected_qa}, actual={actual_qa}."
+            )
 
     selected = {
         "single": select_rows(
             ref_rows, source="refcoco_cycle", count=counts["single"], seed=args.seed + 1, name="RefCOCO"
         ),
         "multi": select_rows(
-            gref_rows, source="grefcoco_cycle", count=counts["multi"], seed=args.seed + 2, name="gRefCOCO"
+            gref_rows,
+            source="grefcoco_cycle",
+            count=counts["multi"],
+            seed=args.seed + 2,
+            name="gRefCOCO multi",
+            predicate=lambda row: int(row.get("grounding_instance_count", 0)) >= 2,
         ),
-        "stuff": select_rows(
-            stuff_rows, source="cocostuff_cycle", count=counts["stuff"], seed=args.seed + 3, name="COCO-Stuff"
+        "stuff": select_rows_with_required_ids(
+            stuff_rows, source="cocostuff_cycle", count=counts["stuff"],
+            required_ids=qa_ids["cocostuff_cycle"], seed=args.seed + 3, name="COCO-Stuff"
         ),
-        "part": select_rows(
-            part_rows, source="paco_part_cycle", count=counts["part"], seed=args.seed + 4, name="PACO-LVIS"
+        "part": select_rows_with_required_ids(
+            part_rows, source="paco_part_cycle", count=counts["part"],
+            required_ids=qa_ids["paco_part_cycle"], seed=args.seed + 4, name="PACO-LVIS"
         ),
         "no_target": select_rows(
             gref_rows, source="gres_no_target", count=counts["no_target"], seed=args.seed + 5, name="gRefCOCO"
         ),
     }
+    assert_multi_rows(selected["multi"])
     for role in ("single", "multi", "stuff", "part"):
         selected[role] = strip_positive_caption_answers(selected[role])
     combined = [row for role in counts for row in selected[role]]
@@ -131,7 +221,9 @@ def main() -> None:
             for source in sorted({str(row["source"]) for row in combined})
         },
         "positive_cap_answer": None,
-        "no_target_expression_location": "cap_problem only",
+        "grounding_query": "preserved separately; never used as cap_answer",
+        "qa_manifest": str(args.caption_qa_manifest.resolve()) if args.caption_qa_manifest else None,
+        "qa_selected": {source: len(ids) for source, ids in qa_ids.items()},
     }
     manifest_path = args.output.with_suffix(".manifest.json")
     with manifest_path.open("w", encoding="utf-8") as file:

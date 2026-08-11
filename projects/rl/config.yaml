@@ -36,6 +36,23 @@ algorithm:
   filter_high: 0.99
 
 worker:
+  supervised_anchors:
+    caption_qa:
+      enabled: false
+      qa_jsonl: ""
+      judge_base_url: ""
+      judge_model: ""
+      judge_api_key: "EMPTY"
+      max_concurrency: 16
+      timeout_seconds: 60.0
+      reward_weight: 1.0
+    direct_grounding:
+      enabled: false
+      rollouts: 2
+      loss_weight: 0.25
+      include_no_target: true
+      include_positive_sources: true
+      consume_no_target_caption: false
   opsd:
     enabled: true
     localization_rollouts: 6

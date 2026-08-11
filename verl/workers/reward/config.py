@@ -19,6 +19,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..supervised_anchors import CaptionQAConfig
+
 
 @dataclass
 class RewardConfig:
@@ -36,6 +38,8 @@ class RewardConfig:
     mask_tokenizer_path: str = ""
     sam2_pretrained_weight: str = "Qwen/sam2.1_hiera_large.pt"
     sam2_config_dir_path: str = "../../projects/transformers/vq_sam2/sam2/sam2_configs"
+    # Filled from worker.supervised_anchors by trainer.main before reward actors start.
+    caption_qa: CaptionQAConfig = field(default_factory=CaptionQAConfig)
 
     def post_init(self):
         if self.reward_function is not None:  # support custom reward function, e.g., ./math.py:main

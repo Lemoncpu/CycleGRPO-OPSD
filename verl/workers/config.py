@@ -22,6 +22,7 @@ from .critic import CriticConfig
 from .reward import RewardConfig
 from .rollout import RolloutConfig
 from .opsd import OPSDConfig
+from .supervised_anchors import SupervisedAnchorsConfig
 
 
 __all__ = [
@@ -49,6 +50,7 @@ class WorkerConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     opsd: OPSDConfig = field(default_factory=OPSDConfig)
+    supervised_anchors: SupervisedAnchorsConfig = field(default_factory=SupervisedAnchorsConfig)
 
     def post_init(self):
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
@@ -58,3 +60,10 @@ class WorkerConfig:
         self.ref.use_torch_compile = self.actor.use_torch_compile
         if self.opsd.enabled and self.actor.ulysses_size != 1:
             raise ValueError("OPSD privileged distillation currently requires actor.ulysses_size=1.")
+        self.supervised_anchors.post_init()
+        if self.supervised_anchors.direct_grounding.enabled and (
+            not self.opsd.enabled or not self.opsd.pixel_iou.enabled
+        ):
+            raise ValueError("direct_grounding requires OPSD pixel_iou.enabled=true.")
+        if self.supervised_anchors.direct_grounding.enabled and not self.actor.optimize_segmenter:
+            raise ValueError("direct_grounding requires actor.optimize_segmenter=true.")
