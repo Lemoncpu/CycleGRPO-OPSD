@@ -55,7 +55,7 @@ class CaptionQAConfig:
 @dataclass
 class DirectGroundingConfig:
     enabled: bool = False
-    rollouts: int = 2
+    rollouts: int = 6
     loss_weight: float = 0.25
     include_no_target: bool = True
     include_positive_sources: bool = True
@@ -67,6 +67,11 @@ class DirectGroundingConfig:
             raise ValueError("direct_grounding.rollouts must be at least 2 for GRPO.")
         if self.loss_weight < 0:
             raise ValueError("direct_grounding.loss_weight must be non-negative.")
+        if self.consume_no_target_caption:
+            raise ValueError(
+                "direct_grounding.consume_no_target_caption must be false: "
+                "direct grounding is additive to main no-target caption GRPO."
+            )
 
 
 @dataclass

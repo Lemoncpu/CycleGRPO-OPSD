@@ -1828,24 +1828,6 @@ class RayPPOTrainer:
                                 if len(direct_batches) == 1
                                 else DataProto.concat(direct_batches)
                             )
-                        direct_config = self.config.worker.supervised_anchors.direct_grounding
-                        if (
-                            non_cycle_batch is not None
-                            and direct_config.enabled
-                            and direct_config.include_no_target
-                            and direct_config.consume_no_target_caption
-                        ):
-                            # The direct segmentation rollout owns no-target updates.
-                            # Keeping the original caption PPO batch would train the
-                            # same RefCOCO/GRES-shaped prompt to emit only refusals.
-                            keep_indices = [
-                                index
-                                for index, source in enumerate(non_cycle_batch.non_tensor_batch["source"])
-                                if str(source) != "gres_no_target"
-                            ]
-                            non_cycle_batch = (
-                                non_cycle_batch[keep_indices] if keep_indices else None
-                            )
                         cycle_cap_batch.meta_info.pop("n", None)
                         self.actor_rollout_ref_wg.release_rollout_engine()
                         if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:

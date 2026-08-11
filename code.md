@@ -268,7 +268,7 @@ OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数�
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。当前火山引擎入口启用 `direct_grounding.consume_no_target_caption=true` 时，会在 direct segmentation rollout 构造后从 non-cycle caption PPO batch 移除这些 no-target row，避免同一 `Please segment ...` prompt 只在 caption task 中被奖励为拒识。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`，默认以原始 CycleGRPO 的外层 caption GRPO 更新，且不进入内层 localization rollout。只有显式开启 direct grounding 后才会额外构造独立 batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -300,11 +300,16 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
 启用 `worker.supervised_anchors.direct_grounding` 时，trainer 从 cycle 与 non-cycle 子批的每个原始 UID
-只取一次 `grounding_query`，另建 `K=2` text-to-mask rollout group。`include_positive_sources` 控制 RefCOCO/gRefCOCO
+只取一次 `grounding_query`，另建 `K=6` text-to-mask rollout group。`include_positive_sources` 控制 RefCOCO/gRefCOCO
 人工 expression，`include_label_sources` 独立控制 COCO-Stuff/PACO-LVIS 的类别模板 query，`include_no_target`
 控制 `gres_no_target`。无论来源，direct group 的 query 均按偶/奇 index 在 RefCOCO/GRES `Please segment {query} in this image.`
-与 GroundingSuite `Please carefully check ...` 模板之间 1:1 交替。当前火山引擎 prompt-alignment 默认仅保留
-no-target query，确保拒识训练也覆盖与正 cycle 完全相同的两种外层 instruction。`consume_no_target_caption=true` 会移除它原先的 caption PPO 更新，因此 direct segmentation group 是 no-target 唯一的策略梯度来源；使用 `K=2` 时该 group 可能因两个空响应奖励相同而无优势，要求稳健 GRES 拒识时应保留原 caption PPO。其 UID、优势和日志均独立；正例 direct anchor 用原始 RLE IoU，no-target 跳过无 target mask 的 VQ-SAM2 解码并使用原有拒识语义。direct no-target 不写 `segmentation_anchor_kl_mask`，避免 frozen SAMTok 的 mask-token policy 与正确空响应冲突。该 batch 不调用 cycle 的 `R_Ci` 合并函数，因而不会改变 caption cycle 的低/中/高路由、teacher regenerate 或 JSD。
+与 GroundingSuite `Please carefully check ...` 模板之间 1:1 交替。火山引擎入口默认关闭整个 direct-grounding
+anchor，因此默认 no-target 只保留原始外层 caption GRPO；所有 direct source 都必须由实验命令显式选择。即使 no-target
+被选入 direct batch，`consume_no_target_caption` 也强制为 `false`，使 `K=6` 拒识辅助不会替换主 `G=6` caption
+GRPO。其 UID、优势和日志均独立；正例 direct anchor 用原始 RLE IoU，no-target 跳过无 target mask 的 VQ-SAM2
+解码并使用原有拒识语义。direct no-target 不写 `segmentation_anchor_kl_mask`，避免 frozen SAMTok 的 mask-token policy
+与正确空响应冲突。该 batch 不调用 cycle 的 `R_Ci` 合并函数，因而不会改变 caption cycle 的低/中/高路由、teacher
+regenerate 或 JSD。
 
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
@@ -388,8 +393,12 @@ optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` �
 
 这保证单一模型被两个方向联合优化。
 
-direct-grounding 启用时，其 GRPO loss 在 cycle localization 后、同一次 optimizer step 前累积，权重为
-`worker.supervised_anchors.direct_grounding.loss_weight`（generic YAML 默认 `0.25`）。当前火山引擎 prompt-alignment 入口将 no-target-only group 设为 `0.5`，并关闭 positive expression sources；这是为了使其与 `0.5` 的 cycle localization 梯度权重对称。该 no-target 组仍使用人工 expression，因此属于受控的 GRES 任务对齐，不是 image-mask-only CycleGRPO 的核心奖励或纯 on-policy self-distillation。
+direct-grounding 显式启用时，其 GRPO loss 在 cycle localization 后、同一次 optimizer step 前累积，权重为
+`worker.supervised_anchors.direct_grounding.loss_weight`（generic YAML 默认 `0.25`）。火山引擎入口默认关闭该外部
+supervised anchor，保证 no-target 保留原始 CycleGRPO 外层 GRPO 和两项拒识 reward。若实验显式启用 no-target direct
+group，它会额外使用独立 `K=6` group；`consume_no_target_caption=true` 已由配置校验拒绝，避免 no-target 仅依赖
+direct rollout 而在同组正确拒识相同的情况下产生零 GRPO advantage。direct query 使用人工 expression 或类别模板，属于受控外部监督，不是 image-mask-only
+CycleGRPO 的核心奖励或纯 on-policy self-distillation。
 
 ## 4. SAMTok / VQ-SAM2 实现
 
@@ -1067,3 +1076,19 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：新导出的 RefCOCO/gRefCOCO/no-target 保留类型化人工 query；COCO-Stuff 写入由官方 91 类 semantic PNG value 映射的 `the {label}`；PACO 写入 `the {part} of the {parent}`，并合并同图同标签的 part mask。`include_label_sources=false` 默认保持旧训练不变；显式启用时 Stuff/PACO 与人工 query 一样进入独立 `K=2` pixel-IoU direct grounding batch，仍不进入 caption prompt、cycle `R_Ci`、OPSD route 或 teacher target。混合器的 `--require-grounding-query` 用于确保新五路 parquet 没有静默漏掉 direct 监督。
 - 论文边界：类别模板 query 是从原始 semantic/part 标签确定性构造的额外监督，不是 GroundingSuite 训练数据、人工 referring expression 或原始 CycleGRPO 的 image-mask-only objective；COCO 全图 caption 仍不与单个 region mask 配对。
 - 验证：`python3 -m py_compile` 覆盖转换器、anchor/trainer 与测试，`python3 -m unittest tests.test_grounding_queries tests.test_balanced_cycle_dataset tests.test_supervised_anchors`（17 tests）、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 通过。本机无 PACO/COCO 图像、SAMTok/VQ-SAM2、CUDA 与 Ray/vLLM，尚未执行 25k re-export 或 8-GPU smoke training。
+
+### 2026-08-11 - 默认保留原始 CycleGRPO 的 GRES no-target 路径
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 3.3、3.4、3.6 节和本变更日志。
+- 行为：火山引擎入口的 direct-grounding 默认从启用的 no-target-only 替换式辅助，改为完全关闭；`include_no_target=false`、`consume_no_target_caption=false`。因此 `gres_no_target` 默认只走原始的外层 caption `G` rollout、原有 `No target.` + no-repeat reward 和 GRPO，不进入 cycle `K` localization，也不会被 direct `K=2` batch 替代。RefCOCO/gRefCOCO/Stuff/PACO direct supervision 以及 no-target instruction-alignment 仍可通过环境变量显式启用，属于外部监督消融。
+- 论文边界：这恢复原始 CycleGRPO 对 no-target 的训练拓扑；现有 SAMTok mask-token 拒识检查仍是本仓库的格式修复，不新增 reward 项。
+- 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、针对默认值的静态断言和 `git diff --check`。
+
+### 2026-08-11 - 将 direct grounding 固定为附加的 K=6 监督采样
+
+- 代码：修改 `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.3、3.4、3.6 节和本变更日志。
+- 行为：direct grounding 的 generic YAML、dataclass 与火山引擎入口默认 rollout 数统一为 `K=6`。它继续在主 cycle `G=6,K=6` rollout 完成后以新 UID 独立生成并在同一 optimizer step 累积梯度；不会进入或修改 cycle `R_Ci`、路由、teacher 或主奖励。`gres_no_target` 由 source 显式映射为 `supervised_grounding_no_target`，其 direct reward 仅是既有无 mask `No target.` 拒识正确性加 non-repeat，VQ-SAM2/像素 IoU 对该组明确跳过。移除 trainer 中曾按 `consume_no_target_caption` 删除主 no-target PPO row 的实现，并在 shell/config 校验中拒绝该旧替换式设置，因此 direct 对所有 source 均只能是额外监督。
+- 论文边界：direct K=6 是外部 query-to-mask supervised anchor 的采样规模调整，不属于原始 CycleGRPO 的 image-mask-only cycle；保留主 no-target outer-caption GRPO 则与原始训练拓扑一致。
+- 验证：`python3 -m unittest tests.test_supervised_anchors`、受影响 Python 文件的 `python3 -m py_compile`、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check`。

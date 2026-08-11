@@ -48,7 +48,7 @@ worker:
       reward_weight: 1.0
     direct_grounding:
       enabled: false
-      rollouts: 2
+      rollouts: 6
       loss_weight: 0.25
       include_no_target: true
       include_positive_sources: true

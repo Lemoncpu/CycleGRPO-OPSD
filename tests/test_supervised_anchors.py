@@ -36,6 +36,13 @@ class SupervisedAnchorsTest(unittest.TestCase):
             CaptionQAConfig(enabled=True).post_init()
         with self.assertRaisesRegex(ValueError, "at least 2"):
             DirectGroundingConfig(enabled=True, rollouts=1).post_init()
+        with self.assertRaisesRegex(ValueError, "must be false"):
+            DirectGroundingConfig(enabled=True, consume_no_target_caption=True).post_init()
+
+    def test_direct_grounding_defaults_to_six_additive_rollouts(self):
+        config = DirectGroundingConfig()
+        self.assertEqual(config.rollouts, 6)
+        self.assertFalse(config.consume_no_target_caption)
 
     def test_direct_grounding_keeps_no_target_out_of_cycle_sources(self):
         self.assertEqual(direct_grounding_source("refcoco_cycle", True), "supervised_grounding")
