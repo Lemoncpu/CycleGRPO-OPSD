@@ -14,6 +14,7 @@ assert _CONFIG_SPEC.loader is not None
 _CONFIG_SPEC.loader.exec_module(_CONFIG_MODULE)
 CaptionQAConfig = _CONFIG_MODULE.CaptionQAConfig
 DirectGroundingConfig = _CONFIG_MODULE.DirectGroundingConfig
+aligned_direct_prompt_count = _CONFIG_MODULE.aligned_direct_prompt_count
 alternating_localization_prompt_variants = _CONFIG_MODULE.alternating_localization_prompt_variants
 direct_grounding_source = _CONFIG_MODULE.direct_grounding_source
 
@@ -79,6 +80,13 @@ class SupervisedAnchorsTest(unittest.TestCase):
             ["refcoco", "groundingsuite", "refcoco", "groundingsuite", "refcoco", "groundingsuite"],
         )
         self.assertEqual(alternating_localization_prompt_variants(0), [])
+
+    def test_direct_grounding_prompt_count_is_world_size_aligned(self):
+        self.assertEqual(aligned_direct_prompt_count(12, 8), 8)
+        self.assertEqual(aligned_direct_prompt_count(16, 8), 16)
+        self.assertEqual(aligned_direct_prompt_count(7, 8), 0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            aligned_direct_prompt_count(8, 0)
 
     def test_caption_qa_rejects_out_of_contract_scores(self):
         with self.assertRaisesRegex(ValueError, "exactly one score 1"):

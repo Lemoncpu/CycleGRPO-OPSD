@@ -301,7 +301,9 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
 启用 `worker.supervised_anchors.direct_grounding` 时，trainer 从 cycle 与 non-cycle 子批的每个原始 UID
-只取一次 `grounding_query`，另建 `K=6` text-to-mask rollout group。`include_positive_sources` 控制 RefCOCO/gRefCOCO
+只取一次 `grounding_query`，另建 `K=6` text-to-mask rollout group。每个独立 direct parent 子批在 rollout
+前裁到 world size 的整倍数；不足一个 rank-shard 时跳过该子批并记录原因，以满足分布式 `DataProto` 等分约束。
+这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。`include_positive_sources` 控制 RefCOCO/gRefCOCO
 人工 expression，`include_label_sources` 独立控制 COCO-Stuff/PACO-LVIS 的类别模板 query，`include_no_target`
 控制 `gres_no_target`。无论来源，direct group 的 query 均按偶/奇 index 在 RefCOCO/GRES `Please segment {query} in this image.`
 与 GroundingSuite `Please carefully check ...` 模板之间 1:1 交替。火山引擎入口默认关闭整个 direct-grounding
@@ -1108,3 +1110,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.4 节 PACO 图像目录契约并追加本日志。
 - 行为：图像解析现在无条件依次尝试 metadata 相对路径、其 basename、以及 `train2017/` 和 `val2017/` 子目录。因此 `--images-dir` 既可传 `PACO-LVIS/images`，也可传已进入 split 的 `PACO-LVIS/images/train2017`。此前对后一种正确服务器路径，含 `train2017/` 前缀的 metadata 会被错误拼接为两层 split 目录，导致所有可用 PACO group 被计入 skipped。
 - 验证：`python3 -m py_compile projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py projects/rl/datasets/grounding_queries.py`、`python3 -m unittest tests.test_grounding_queries`（3 tests）、临时目录 image-root resolution smoke test（split root 与 parent root）和 `git diff --check` 均通过；服务器端仍需重跑 2,500 条 PACO 导出。
+
+### 2026-08-11 - 对齐 direct-grounding 子批的分布式 prompt 数
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4 节 direct-grounding 分布式 dispatch 契约并追加本日志。
+- 行为：每个 cycle/non-cycle direct parent 子批在 segmentation rollout 前裁到 rollout world size 的整数倍；少于一个完整 shard 时跳过并输出原因。此前主 cycle/non-cycle group 已按 8 卡对齐，但从它们筛出的 direct no-target 子批可保留 12 个 prompt，导致 `DataProto.chunk(8)` 在第 0 step 断言失败。现在该 case 裁为 8 个 prompt、`K=6` 产生 48 个 direct no-target rollout；cycle 主训练、no-target outer caption GRPO 和既有拒识 reward 不变。
+- 验证：`python3 -m py_compile verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py`、`python3 -m unittest tests.test_supervised_anchors`（10 tests）、aligned-prefix static integration assertion 与 `git diff --check` 均通过；服务器端需以 8 GPU 重启该 25k direct run，确认日志出现 trim/skip 信息后进入 step 1。

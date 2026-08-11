@@ -30,6 +30,13 @@ def alternating_localization_prompt_variants(size: int) -> list[str]:
     return ["refcoco" if index % 2 == 0 else "groundingsuite" for index in range(size)]
 
 
+def aligned_direct_prompt_count(prompt_count: int, world_size: int) -> int:
+    """Keep a prefix that can be dispatched evenly to every rollout rank."""
+    if world_size <= 0:
+        raise ValueError("world_size must be positive.")
+    return (prompt_count // world_size) * world_size
+
+
 @dataclass
 class CaptionQAConfig:
     enabled: bool = False

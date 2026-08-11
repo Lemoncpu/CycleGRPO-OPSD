@@ -60,6 +60,7 @@ from ..workers.opsd import (
     uses_original_grpo,
 )
 from ..workers.supervised_anchors import (
+    aligned_direct_prompt_count,
     alternating_localization_prompt_variants,
     direct_grounding_source,
 )
@@ -897,6 +898,25 @@ class RayPPOTrainer:
             sources.append(direct_source)
         if not indices:
             return None
+        aligned_count = aligned_direct_prompt_count(
+            len(indices), self.actor_rollout_ref_wg.world_size
+        )
+        if aligned_count == 0:
+            print(
+                "[direct_grounding] skip "
+                f"{len(indices)} prompts; need at least world_size="
+                f"{self.actor_rollout_ref_wg.world_size} for equal dispatch."
+            )
+            return None
+        if aligned_count != len(indices):
+            print(
+                "[direct_grounding] trim prompts "
+                f"{len(indices)}->{aligned_count} "
+                f"(divisible by world_size={self.actor_rollout_ref_wg.world_size})"
+            )
+            indices = indices[:aligned_count]
+            queries = queries[:aligned_count]
+            sources = sources[:aligned_count]
         direct_parent = cycle_batch[indices]
         _, direct_batch = self._make_seg_batch_data_for_caption(
             direct_parent,
