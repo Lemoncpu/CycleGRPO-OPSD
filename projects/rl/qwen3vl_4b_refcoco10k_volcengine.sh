@@ -69,6 +69,7 @@ DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-2}"
 DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
 DIRECT_GROUNDING_INCLUDE_NO_TARGET="${DIRECT_GROUNDING_INCLUDE_NO_TARGET:-true}"
 DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES:-false}"
+DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES:-false}"
 DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-true}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SAVE_LIMIT="${SAVE_LIMIT:-20}"
@@ -125,6 +126,7 @@ for bool_name in \
     DIRECT_GROUNDING_ENABLED \
     DIRECT_GROUNDING_INCLUDE_NO_TARGET \
     DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES \
+    DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
@@ -430,7 +432,7 @@ echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_T
 echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
-echo "Direct referring grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, loss weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
+echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, loss weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -515,6 +517,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
     worker.supervised_anchors.direct_grounding.include_no_target="${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" \
     worker.supervised_anchors.direct_grounding.include_positive_sources="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}" \
+    worker.supervised_anchors.direct_grounding.include_label_sources="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}" \
     worker.supervised_anchors.direct_grounding.consume_no_target_caption="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \

@@ -5,15 +5,20 @@ from typing import Optional
 
 
 def direct_grounding_source(
-    source: object, include_no_target: bool, include_positive_sources: bool = True
+    source: object,
+    include_no_target: bool,
+    include_positive_sources: bool = True,
+    include_label_sources: bool = False,
 ) -> Optional[str]:
-    """Map a dataset source to an isolated direct-grounding reward source.
+    """Map a selected supervised source to an isolated grounding reward source.
 
     The normal CycleGRPO source split deliberately puts ``gres_no_target`` in
     the non-cycle batch.  Keep that routing intact while allowing the direct
     anchor to explicitly opt it into the existing refusal reward.
     """
     if include_positive_sources and source in {"refcoco_cycle", "grefcoco_cycle"}:
+        return "supervised_grounding"
+    if include_label_sources and source in {"cocostuff_cycle", "paco_part_cycle"}:
         return "supervised_grounding"
     if source == "gres_no_target" and include_no_target:
         return "supervised_grounding_no_target"
@@ -54,6 +59,7 @@ class DirectGroundingConfig:
     loss_weight: float = 0.25
     include_no_target: bool = True
     include_positive_sources: bool = True
+    include_label_sources: bool = False
     consume_no_target_caption: bool = False
 
     def post_init(self):

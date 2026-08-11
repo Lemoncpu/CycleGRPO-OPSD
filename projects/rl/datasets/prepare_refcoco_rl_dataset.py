@@ -178,6 +178,7 @@ def main() -> None:
                 "cap_answer": sentence_text(ref),
                 # Kept separately for direct grounding; the mixer clears cap_answer.
                 "grounding_query": sentence_text(ref),
+                "grounding_query_kind": "human_referring",
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(binary_mask),

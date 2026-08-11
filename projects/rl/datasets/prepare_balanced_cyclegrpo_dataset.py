@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--part-count", type=int, default=DEFAULT_COUNTS["part"])
     parser.add_argument("--no-target-count", type=int, default=DEFAULT_COUNTS["no_target"])
     parser.add_argument(
+        "--require-grounding-query",
+        action="store_true",
+        help="Fail unless every selected sample has a non-empty direct-grounding query.",
+    )
+    parser.add_argument(
         "--caption-qa-manifest",
         type=Path,
         default=None,
@@ -135,6 +140,19 @@ def strip_positive_caption_answers(rows: list[dict[str, Any]]) -> list[dict[str,
     return sanitized
 
 
+def assert_grounding_queries(rows: list[dict[str, Any]]) -> None:
+    missing = [
+        row.get("source")
+        for row in rows
+        if not isinstance(row.get("grounding_query"), str) or not row["grounding_query"].strip()
+    ]
+    if missing:
+        raise RuntimeError(
+            "All selected samples must have non-empty grounding_query when "
+            f"--require-grounding-query is set; first missing source={missing[0]!r}."
+        )
+
+
 def mixture_counts(args: argparse.Namespace) -> dict[str, int]:
     counts = {
         "single": args.single_count,
@@ -200,6 +218,8 @@ def main() -> None:
     for role in ("single", "multi", "stuff", "part"):
         selected[role] = strip_positive_caption_answers(selected[role])
     combined = [row for role in counts for row in selected[role]]
+    if args.require_grounding_query:
+        assert_grounding_queries(combined)
     random.Random(args.seed).shuffle(combined)
     if len(combined) != sum(counts.values()):
         raise AssertionError(f"Expected {sum(counts.values())} rows, got {len(combined)}")
@@ -222,6 +242,16 @@ def main() -> None:
         },
         "positive_cap_answer": None,
         "grounding_query": "preserved separately; never used as cap_answer",
+        "require_grounding_query": args.require_grounding_query,
+        "grounding_query_counts": {
+            source: sum(
+                row["source"] == source
+                and isinstance(row.get("grounding_query"), str)
+                and bool(row["grounding_query"].strip())
+                for row in combined
+            )
+            for source in sorted({str(row["source"]) for row in combined})
+        },
         "qa_manifest": str(args.caption_qa_manifest.resolve()) if args.caption_qa_manifest else None,
         "qa_selected": {source: len(ids) for source, ids in qa_ids.items()},
     }

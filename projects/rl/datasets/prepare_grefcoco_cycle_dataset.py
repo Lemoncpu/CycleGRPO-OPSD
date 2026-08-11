@@ -178,6 +178,7 @@ def main() -> None:
                 # source expression would retain text supervision in the data.
                 "cap_answer": None,
                 "grounding_query": expression(ref),
+                "grounding_query_kind": "human_referring",
                 "grounding_instance_count": len(annotation_ids(ref)),
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
@@ -195,6 +196,7 @@ def main() -> None:
                 "cap_problem": NO_TARGET_PROMPT.format(expression=expression(ref)),
                 "cap_answer": None,
                 "grounding_query": expression(ref),
+                "grounding_query_kind": "no_target_referring",
                 "grounding_instance_count": 0,
                 "seg_problem": None,
                 "seg_answer": "<answer>No target.</answer>",

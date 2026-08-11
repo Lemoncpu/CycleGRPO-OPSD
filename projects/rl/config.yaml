@@ -52,6 +52,7 @@ worker:
       loss_weight: 0.25
       include_no_target: true
       include_positive_sources: true
+      include_label_sources: false
       consume_no_target_caption: false
   opsd:
     enabled: true

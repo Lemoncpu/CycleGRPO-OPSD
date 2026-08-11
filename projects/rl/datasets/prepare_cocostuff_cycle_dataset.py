@@ -17,6 +17,7 @@ from projects.rl.datasets.prepare_refcoco_rl_dataset import (
     encode_mask_token,
     encode_rle,
 )
+from projects.rl.datasets.grounding_queries import cocostuff_grounding_query
 
 # Official stuffthingmaps store label id - 1 in PNG pixels.  Official label ids
 # 92..182 are stuff, so valid PNG values are 91..181; 255 is void.
@@ -109,6 +110,8 @@ def main() -> None:
                 "images": [str(image_path.resolve())],
                 "cap_problem": CAPTION_PROMPT.format(mask_token=mask_token),
                 "cap_answer": None,
+                "grounding_query": cocostuff_grounding_query(stuff_pixel_value),
+                "grounding_query_kind": "semantic_label",
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(mask),
@@ -133,6 +136,7 @@ def main() -> None:
         "stuff_png_value_counts": {str(key): value for key, value in sorted(class_counts.items())},
         "stuff_label_id_range": [92, 182],
         "stuff_png_value_range": [91, 181],
+        "grounding_query_kind": "semantic_label",
         "area_ratio_range": [args.min_area_ratio, args.max_area_ratio],
     }
     manifest_path = args.output.with_suffix(".manifest.json")

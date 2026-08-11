@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from datasets import Dataset
 from PIL import Image
 
@@ -23,6 +24,7 @@ from projects.rl.datasets.prepare_refcoco_rl_dataset import (
     encode_mask_token,
     encode_rle,
 )
+from projects.rl.datasets.grounding_queries import paco_part_grounding_query
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +55,25 @@ def resolve_image(images_dir: Path, file_name: str) -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
+def part_group_key(
+    annotation: dict[str, Any],
+    annotations_by_id: dict[int, dict[str, Any]],
+    part_names: dict[int, str],
+    object_names: dict[int, str],
+) -> tuple[int, str, str] | None:
+    """Return the semantic query key whose masks must share one target."""
+    part_name = part_names.get(int(annotation["category_id"]))
+    parent = annotations_by_id.get(int(annotation.get("obj_ann_id", -1)))
+    parent_name = (
+        object_names.get(int(parent["category_id"]))
+        if parent is not None and parent.get("category_id") is not None
+        else None
+    )
+    if not part_name or not parent_name:
+        return None
+    return int(annotation["image_id"]), part_name, parent_name
+
+
 def main() -> None:
     args = parse_args()
     if args.max_samples <= 0:
@@ -65,21 +86,29 @@ def main() -> None:
         data: dict[str, Any] = json.load(file)
     images = {int(record["id"]): record for record in data["images"]}
     part_names = {int(record["id"]): str(record["name"]) for record in data.get("part_categories", [])}
-    candidates = [
-        record
-        for record in data["annotations"]
-        if int(record["id"]) != int(record.get("obj_ann_id", record["id"]))
-    ]
-    candidates.sort(key=lambda record: int(record["id"]))
-    random.Random(args.seed).shuffle(candidates)
+    object_names = {
+        int(record["id"]): str(record["name"])
+        for record in (data.get("categories") or data.get("object_categories") or [])
+    }
+    annotations_by_id = {int(record["id"]): record for record in data["annotations"]}
+    if not part_names or not object_names:
+        raise ValueError("PACO-LVIS annotation must provide non-empty part_categories and object categories.")
+    candidates: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
+    for record in data["annotations"]:
+        if int(record["id"]) == int(record.get("obj_ann_id", record["id"])):
+            continue
+        key = part_group_key(record, annotations_by_id, part_names, object_names)
+        if key is not None:
+            candidates.setdefault(key, []).append(record)
+    candidate_groups = sorted(candidates.items(), key=lambda item: min(int(row["id"]) for row in item[1]))
+    random.Random(args.seed).shuffle(candidate_groups)
 
     model = build_mask_tokenizer(args)
     records: list[dict[str, Any]] = []
     category_counts: Counter[str] = Counter()
     used_images: set[int] = set()
     skipped = 0
-    for annotation in candidates:
-        image_id = int(annotation["image_id"])
+    for (image_id, part_name, parent_name), annotations in candidate_groups:
         # One part per image avoids a few densely annotated objects dominating the 2k budget.
         if image_id in used_images:
             continue
@@ -93,16 +122,22 @@ def main() -> None:
             continue
         with Image.open(image_path) as file:
             image = file.convert("RGB")
-        mask = decode_segmentation(annotation.get("segmentation"), image.height, image.width)
-        if mask is None:
+        part_masks = [
+            decode_segmentation(annotation.get("segmentation"), image.height, image.width)
+            for annotation in annotations
+        ]
+        if any(mask is None for mask in part_masks):
             skipped += 1
             continue
+        mask = np.logical_or.reduce([np.asarray(mask, dtype=bool) for mask in part_masks])
         mask_token = encode_mask_token(model, image, mask)
         records.append(
             {
                 "images": [str(image_path.resolve())],
                 "cap_problem": CAPTION_PROMPT.format(mask_token=mask_token),
                 "cap_answer": None,
+                "grounding_query": paco_part_grounding_query(part_name, parent_name),
+                "grounding_query_kind": "part_label",
                 "seg_problem": None,
                 "seg_answer": f"<answer>{mask_token}</answer>",
                 "masks": encode_rle(mask),
@@ -110,7 +145,7 @@ def main() -> None:
             }
         )
         used_images.add(image_id)
-        category_counts[part_names.get(int(annotation["category_id"]), str(annotation["category_id"]))] += 1
+        category_counts[part_name] += 1
         if len(records) == args.max_samples:
             break
 
@@ -125,6 +160,7 @@ def main() -> None:
         "unique_images": len(used_images),
         "seed": args.seed,
         "part_category_counts": dict(sorted(category_counts.items())),
+        "grounding_query_kind": "part_label",
     }
     manifest_path = args.output.with_suffix(".manifest.json")
     with manifest_path.open("w", encoding="utf-8") as file:

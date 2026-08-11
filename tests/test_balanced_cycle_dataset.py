@@ -6,6 +6,7 @@ import unittest
 from argparse import Namespace
 
 from projects.rl.datasets.prepare_balanced_cyclegrpo_dataset import (
+    assert_grounding_queries,
     assert_multi_rows,
     load_caption_qa_ids,
     mixture_counts,
@@ -83,6 +84,13 @@ class BalancedCycleDatasetTest(unittest.TestCase):
             predicate=lambda row: row["grounding_instance_count"] >= 2,
         )
         self.assertEqual(selected[0]["grounding_instance_count"], 2)
+
+    def test_required_grounding_queries_reject_missing_rows(self):
+        with self.assertRaisesRegex(RuntimeError, "missing source='paco_part_cycle'"):
+            assert_grounding_queries([
+                {"source": "refcoco_cycle", "grounding_query": "the dog"},
+                {"source": "paco_part_cycle", "grounding_query": None},
+            ])
 
 
 if __name__ == "__main__":

@@ -45,6 +45,17 @@ class SupervisedAnchorsTest(unittest.TestCase):
         )
         self.assertIsNone(direct_grounding_source("gres_no_target", False))
         self.assertIsNone(direct_grounding_source("cocostuff_cycle", True))
+        self.assertIsNone(direct_grounding_source("paco_part_cycle", True))
+
+    def test_direct_grounding_can_include_label_supervision_sources(self):
+        self.assertEqual(
+            direct_grounding_source("cocostuff_cycle", False, include_label_sources=True),
+            "supervised_grounding",
+        )
+        self.assertEqual(
+            direct_grounding_source("paco_part_cycle", False, include_label_sources=True),
+            "supervised_grounding",
+        )
 
     def test_direct_grounding_can_use_no_target_without_expression_positives(self):
         self.assertIsNone(

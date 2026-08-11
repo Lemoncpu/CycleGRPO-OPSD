@@ -862,7 +862,7 @@ class RayPPOTrainer:
         return batch, gen_batch_output
 
     def _make_direct_grounding_batch(self, cycle_batch: DataProto) -> Optional[DataProto]:
-        """Generate a separate human-query grounding GRPO batch.
+        """Generate a separate query-to-mask grounding GRPO batch.
 
         The source batch contains G caption rollouts per original image. Keep one
         row per original uid and assign fresh localization UIDs in the shared
@@ -887,6 +887,7 @@ class RayPPOTrainer:
                 source,
                 config.include_no_target,
                 config.include_positive_sources,
+                config.include_label_sources,
             )
             if direct_source is None:
                 continue
@@ -995,7 +996,7 @@ class RayPPOTrainer:
     def _prepare_direct_grounding_advantage(
         self, batch: DataProto, metrics: dict[str, Any], timing_raw: dict[str, Any]
     ) -> DataProto:
-        """Score direct human-query grounding without entering OPSD routing."""
+        """Score direct query-to-mask grounding without entering OPSD routing."""
         self._balance_batch(batch, metrics=metrics, logging_prefix="direct_grounding_seqlen")
         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
         with timer("direct_grounding_reward", timing_raw):
