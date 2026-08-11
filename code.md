@@ -199,8 +199,9 @@ actor 通过同一 ID 加载 QA sidecar，而不是将题目写进 parquet；混
 PACO 2k（可用 `--qa-stuff-count` 与 `--qa-part-count` 显式覆盖）。
 
 `prepare_paco_lvis_part_cycle_dataset.py` 只接受 `id != obj_ann_id` 的 PACO annotation，并且每张图
-最多选一个 part，因而不会把 parent object mask 混入 Part 配额或让少数密集标注图主导。PACO-LVIS
-需要其对应的 COCO 2017 图像。`prepare_cocostuff_cycle_dataset.py` 只从官方
+最多选一个 parent-category part union，因而不会把 parent object mask 混入 Part 配额或让少数密集标注图主导。
+PACO-LVIS 需要其对应的 COCO 2017 图像；`--images-dir` 可指向图像父目录或直接指向
+`train2017`/`val2017` split 目录。`prepare_cocostuff_cycle_dataset.py` 只从官方
 `stuffthingmaps_trainval2017` PNG 的像素值 91..181 选取区域；这些值对应 COCO-Stuff 官方 label id
 92..182，0..90 是 COCO thing、255 是 void，均不进入 Stuff 配额。Stuff 转换按类别频率优先选取，
 仅保留面积占图像 1% 到 90% 的语义区域。
@@ -1100,3 +1101,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：实际 PACO-LVIS v1 train 标注显示所有 annotation 的 `category_id` 都属于 object category；`id != obj_ann_id` 的 395,071 条 non-parent annotation 虽是 part mask，却没有逐 mask part-category 字段。转换器不再把 object ID 错当 `part_categories` ID，改为对同图同 parent object 类别的全部 part mask 取 union，并写入 `the visible parts of the {parent}` 与 `grounding_query_kind=parent_parts_label`。这恢复非空 PACO 候选，同时避免制造不存在的 `the {part} of the {parent}` 细粒度监督或从同类 part 中任意抽取一个 mask。
 - 论文边界：该 PACO source 提供的是 parent-conditioned visible-part union supervision，粒度低于人工 part referring expression；它仍是额外 label-template direct grounding，不是 GroundingSuite 训练数据或原始 CycleGRPO image-mask-only cycle。
 - 验证：`python3 -m py_compile` 覆盖转换器/query helper、`python3 -m unittest tests.test_grounding_queries` 和 `git diff --check`；服务器端仍需重新导出 PACO parquet，并检查 2,500 条输出与 `parent_parts_label` manifest。
+
+### 2026-08-11 - 修复 PACO split 图像根目录解析
+
+- 代码：修改 `projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py`。
+- 文档：更新第 2.4 节 PACO 图像目录契约并追加本日志。
+- 行为：图像解析现在无条件依次尝试 metadata 相对路径、其 basename、以及 `train2017/` 和 `val2017/` 子目录。因此 `--images-dir` 既可传 `PACO-LVIS/images`，也可传已进入 split 的 `PACO-LVIS/images/train2017`。此前对后一种正确服务器路径，含 `train2017/` 前缀的 metadata 会被错误拼接为两层 split 目录，导致所有可用 PACO group 被计入 skipped。
+- 验证：`python3 -m py_compile projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py projects/rl/datasets/grounding_queries.py`、`python3 -m unittest tests.test_grounding_queries`（3 tests）、临时目录 image-root resolution smoke test（split root 与 parent root）和 `git diff --check` 均通过；服务器端仍需重跑 2,500 条 PACO 导出。

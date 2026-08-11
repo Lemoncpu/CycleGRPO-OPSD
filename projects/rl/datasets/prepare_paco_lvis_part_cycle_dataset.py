@@ -47,11 +47,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_image(images_dir: Path, file_name: str) -> Path | None:
-    direct = images_dir / file_name
-    candidates = [direct]
-    if not direct.is_file():
-        basename = Path(file_name).name
-        candidates.extend([images_dir / "train2017" / basename, images_dir / "val2017" / basename])
+    # PACO metadata can store either ``train2017/000...jpg`` or just the
+    # filename.  ``images_dir`` is likewise commonly supplied as either the
+    # parent image root or a split root, so always try the basename directly.
+    basename = Path(file_name).name
+    candidates = (
+        images_dir / file_name,
+        images_dir / basename,
+        images_dir / "train2017" / basename,
+        images_dir / "val2017" / basename,
+    )
     return next((path for path in candidates if path.is_file()), None)
 
 
