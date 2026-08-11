@@ -468,7 +468,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `reward_function/tg_reward.py` | temporal grounding 可组合奖励库 |
 | `reward_function/llm_judge_reward.py` | 可选外部 vLLM caption judge；包含无图 DLC-QA option judge，不占用训练 GPU |
 
-`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
+`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。GRES 默认标注根为服务器实际目录 `${BASE_DIR}/gRefCOCO`；也可通过 `GRES_ROOT` 覆盖。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
@@ -1039,3 +1039,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：追加本变更日志。
 - 行为：当 `SUPERVISED_CAPTION_QA_ENABLED=false` 时，入口只传递该 enabled flag，不再把空 `CAPTION_QA_JSONL`、judge URL/model 等命令行参数传入 OmegaConf。此前 Hydra 会将空字符串解析为 `None`，与 `CaptionQAConfig` 的 `str` 字段冲突并在 trainer 初始化前报错；启用 QA 时仍传递全部已校验参数。
 - 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；该问题发生在 OmegaConf 启动期，仍需在服务器以 QA disabled 的训练命令完成一次配置加载验证。
+
+### 2026-08-11 - 修正 GRES 评测默认标注目录大小写
+
+- 代码：修改 `projects/eval/qwen3vl_4b_volcengine.sh`。
+- 文档：更新第 5.3 的 GRES 评测路径约定并追加本日志。
+- 行为：统一评测入口的默认 `GRES_ROOT` 从不存在的 `${BASE_DIR}/grefcoco` 改为服务器实际目录 `${BASE_DIR}/gRefCOCO`，使默认 `grefs(unc).json` 和 `instances.json` 解析正常；显式 `GRES_ROOT` 覆盖行为不变。
+- 验证：`bash -n projects/eval/qwen3vl_4b_volcengine.sh` 与 `git diff --check` 通过；仍需在服务器重新运行 `gres` action 完成端到端验证。
