@@ -1032,3 +1032,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：有目标 image CycleGRPO localization 不再只使用历史长模板。对每个原图连续的 `G=6` 条 student caption，按组内偶/奇 index 精确使用 3 条 `Please segment {caption} in this image.` 与 3 条 GroundingSuite `Please carefully check ...` 模板；caption 本身仍来自 actor，不注入正样本人工 referring expression。火山引擎入口默认把 `gres_no_target` 建为独立 `task=segmentation` direct-grounding group，并按同一偶/奇规则以 1:1 覆盖这两种模板，使用既有两项拒识 reward；该 row 在 direct batch 构造后从 non-cycle caption PPO 移除，且 direct no-target 不加 segmentation anchor KL。`include_positive_sources=false` 保持该首版只对齐 no-target，开启正 expression direct grounding 时必须作为外部监督消融报告。
 - 论文边界：no-target 分支使用 gRefCOCO expression，属于为评测 instruction 对齐的受控 GRES 辅助项；它不进入 caption cycle 的 `R_Ci`、OPSD route、teacher regenerate/JSD 或 image-mask-only 主训练信号。
 - 验证：`python3 -m py_compile verl/trainer/ray_trainer.py verl/utils/dataset.py verl/workers/supervised_anchors.py tests/test_supervised_anchors.py`、`python3 -m unittest tests.test_supervised_anchors`（7 tests）、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机缺少 PyTorch/Ray/FSDP/vLLM、CUDA、SAMTok 与服务器数据，未执行 8-GPU smoke training。
+
+### 2026-08-11 - 修复禁用 caption-QA 时的 Hydra 空字符串覆盖
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：追加本变更日志。
+- 行为：当 `SUPERVISED_CAPTION_QA_ENABLED=false` 时，入口只传递该 enabled flag，不再把空 `CAPTION_QA_JSONL`、judge URL/model 等命令行参数传入 OmegaConf。此前 Hydra 会将空字符串解析为 `None`，与 `CaptionQAConfig` 的 `str` 字段冲突并在 trainer 初始化前报错；启用 QA 时仍传递全部已校验参数。
+- 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；该问题发生在 OmegaConf 启动期，仍需在服务器以 QA disabled 的训练命令完成一次配置加载验证。

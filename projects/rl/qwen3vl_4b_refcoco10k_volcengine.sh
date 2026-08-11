@@ -263,6 +263,23 @@ if [[ -n "${MAX_STEPS}" ]]; then
     TRAINER_MAX_STEPS_ARG=("trainer.max_steps=${MAX_STEPS}")
 fi
 
+# OmegaConf parses an empty command-line string as None. Keep disabled optional
+# caption-QA fields in their string defaults instead of overriding them with None.
+CAPTION_QA_OVERRIDES=(
+    "worker.supervised_anchors.caption_qa.enabled=${SUPERVISED_CAPTION_QA_ENABLED}"
+)
+if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    CAPTION_QA_OVERRIDES+=(
+        "worker.supervised_anchors.caption_qa.qa_jsonl=${CAPTION_QA_JSONL}"
+        "worker.supervised_anchors.caption_qa.judge_base_url=${CAPTION_QA_JUDGE_BASE_URL}"
+        "worker.supervised_anchors.caption_qa.judge_model=${CAPTION_QA_JUDGE_MODEL}"
+        "worker.supervised_anchors.caption_qa.judge_api_key=${CAPTION_QA_JUDGE_API_KEY}"
+        "worker.supervised_anchors.caption_qa.max_concurrency=${CAPTION_QA_MAX_CONCURRENCY}"
+        "worker.supervised_anchors.caption_qa.timeout_seconds=${CAPTION_QA_TIMEOUT_SECONDS}"
+        "worker.supervised_anchors.caption_qa.reward_weight=${CAPTION_QA_REWARD_WEIGHT}"
+    )
+fi
+
 if [[ "${CONDA_PREFIX:-}" != "${ENV_DIR}" ]] && command -v conda >/dev/null 2>&1; then
     CONDA_BASE="$(conda info --base)"
     # shellcheck disable=SC1091
@@ -492,14 +509,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.groundedness.no_target_enabled=false \
     worker.opsd.groundedness.token_jsd_enabled=false \
     worker.opsd.groundedness.token_jsd_multiplier=1.0 \
-    worker.supervised_anchors.caption_qa.enabled="${SUPERVISED_CAPTION_QA_ENABLED}" \
-    worker.supervised_anchors.caption_qa.qa_jsonl="${CAPTION_QA_JSONL}" \
-    worker.supervised_anchors.caption_qa.judge_base_url="${CAPTION_QA_JUDGE_BASE_URL}" \
-    worker.supervised_anchors.caption_qa.judge_model="${CAPTION_QA_JUDGE_MODEL}" \
-    worker.supervised_anchors.caption_qa.judge_api_key="${CAPTION_QA_JUDGE_API_KEY}" \
-    worker.supervised_anchors.caption_qa.max_concurrency="${CAPTION_QA_MAX_CONCURRENCY}" \
-    worker.supervised_anchors.caption_qa.timeout_seconds="${CAPTION_QA_TIMEOUT_SECONDS}" \
-    worker.supervised_anchors.caption_qa.reward_weight="${CAPTION_QA_REWARD_WEIGHT}" \
+    "${CAPTION_QA_OVERRIDES[@]}" \
     worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
     worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
     worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
