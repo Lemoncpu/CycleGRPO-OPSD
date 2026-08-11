@@ -46,5 +46,11 @@ def cocostuff_grounding_query(pixel_value: int) -> str:
         raise ValueError(f"Unsupported COCO-Stuff PNG value: {pixel_value}") from error
 
 
-def paco_part_grounding_query(part_name: str, parent_name: str) -> str:
-    return f"the {label_text(part_name)} of the {label_text(parent_name)}"
+def paco_parent_parts_grounding_query(parent_name: str) -> str:
+    """Build a PACO query from labels actually attached to its annotations.
+
+    PACO-LVIS v1 part annotations retain the parent object's ``category_id``;
+    they do not carry a per-mask part-category id.  The only sound label query
+    is therefore the union of visible annotated parts for a parent category.
+    """
+    return f"the visible parts of the {label_text(parent_name)}"

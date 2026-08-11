@@ -5,7 +5,7 @@ import unittest
 from projects.rl.datasets.grounding_queries import (
     COCO_STUFF_CLASS_NAMES,
     cocostuff_grounding_query,
-    paco_part_grounding_query,
+    paco_parent_parts_grounding_query,
 )
 
 
@@ -15,10 +15,10 @@ class GroundingQueryTest(unittest.TestCase):
         self.assertEqual(cocostuff_grounding_query(91), "the banner")
         self.assertEqual(cocostuff_grounding_query(181), "the wood")
 
-    def test_paco_query_keeps_part_and_parent(self):
+    def test_paco_query_uses_only_observed_parent_label(self):
         self.assertEqual(
-            paco_part_grounding_query("front-wheel", "mountain_bike"),
-            "the front wheel of the mountain bike",
+            paco_parent_parts_grounding_query("mountain_bike"),
+            "the visible parts of the mountain bike",
         )
 
     def test_unknown_stuff_value_is_rejected(self):

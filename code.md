@@ -187,10 +187,10 @@ JSON 映射。DAM caption 仍不进入 actor prompt。
 
 RefCOCO 与 gRefCOCO 转换器把原始 expression 另存为 `grounding_query`；它与被混合器清空的
 `cap_answer` 严格分离。COCO-Stuff 转换器把官方 91 个 semantic-Stuff label 的原始 PNG 值
-转换为 `the {label}`；其 GT 是同一图中该类别的完整 semantic union mask。PACO-LVIS 转换器从
-part annotation 的 `part_categories` 和 `obj_ann_id` 指向的 parent object category 构造
-`the {part} of the {parent}`；同图中同一 `(part,parent)` 标签的所有 part mask 先取 union，避免
-一个类别 query 错误地只监督其中一个同类 part。二者写入 `grounding_query_kind=semantic_label/part_label`，
+转换为 `the {label}`；其 GT 是同一图中该类别的完整 semantic union mask。PACO-LVIS v1 的 non-parent
+part annotation 只保留 parent object `category_id`，没有逐 mask part-category id；转换器因此按同图、同 parent
+object 类别合并全部 part mask，并构造 `the visible parts of the {parent}`，而不伪造细粒度 part 名称或任意选择
+一个 part instance。二者写入 `grounding_query_kind=semantic_label/parent_parts_label`，
 属于类别标签模板监督而不是人工 referring expression。gRefCOCO no-target 写入
 `grounding_query_kind=no_target_referring`。DAM 行的 `grounding_query=null`，仅保留 `dam_source_id`。若向混合器传入
 `--caption-qa-manifest`，其 JSONL 中的 Stuff/PACO ID 会在随机填充前强制纳入相应配额，随后训练 reward
@@ -494,7 +494,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
 - `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
-- `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask；同图同 `(part,parent)` 标签先 union、每图最多保留一个 query，写入 `paco_part_cycle` parquet 与 part-category manifest。
+- `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask；由于 PACO v1 不提供逐 mask part label，同图同 parent object 类别的所有 part mask 取 union、每图最多保留一个 query，写入 `paco_part_cycle` parquet 与 parent-category manifest。
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并写入 canonical semantic-label `grounding_query`。
 - `grounding_queries.py`：COCO-Stuff 官方 91 类 PNG-to-label 映射，以及 Stuff/PACO label-template query 的唯一构造器；不读取模型、图像或评测数据。
 - `prepare_dam_cycle_dataset.py`：从 DAM `COCOStuff`/`PACO` 的 `mask_rle + caption` annotation 构造 DAM-backed `cocostuff_cycle` 或 `paco_part_cycle` parquet；PACO 与官方 part annotation 交叉校验，caption 写入独立 manifest。
@@ -590,7 +590,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。若 `groundedness_parse_failure_rate` 高，先读取同文件每 step 最多 8 条、原始输出限 2048 字符的失败记录，按 `parse_failure_reason` 和 `discarded_claim_reasons` 定位 prompt、长度或字面 span 问题；这些诊断记录不能被误作有效 verifier verdict。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
-25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO 的同图 `(part,parent)` union mask 使用 `the {part} of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得将同一个 part label 的多个 mask 中任意挑一个作为目标。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
+25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1092,3 +1092,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：direct grounding 的 generic YAML、dataclass 与火山引擎入口默认 rollout 数统一为 `K=6`。它继续在主 cycle `G=6,K=6` rollout 完成后以新 UID 独立生成并在同一 optimizer step 累积梯度；不会进入或修改 cycle `R_Ci`、路由、teacher 或主奖励。`gres_no_target` 由 source 显式映射为 `supervised_grounding_no_target`，其 direct reward 仅是既有无 mask `No target.` 拒识正确性加 non-repeat，VQ-SAM2/像素 IoU 对该组明确跳过。移除 trainer 中曾按 `consume_no_target_caption` 删除主 no-target PPO row 的实现，并在 shell/config 校验中拒绝该旧替换式设置，因此 direct 对所有 source 均只能是额外监督。
 - 论文边界：direct K=6 是外部 query-to-mask supervised anchor 的采样规模调整，不属于原始 CycleGRPO 的 image-mask-only cycle；保留主 no-target outer-caption GRPO 则与原始训练拓扑一致。
 - 验证：`python3 -m unittest tests.test_supervised_anchors`、受影响 Python 文件的 `python3 -m py_compile`、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check`。
+
+### 2026-08-11 - 修正 PACO-LVIS v1 的 part 查询与 union 目标
+
+- 代码：修改 `projects/rl/datasets/grounding_queries.py`、`projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py` 和 `tests/test_grounding_queries.py`。
+- 文档：更新第 2.4、模块清单、关键注意事项 25 和本变更日志。
+- 行为：实际 PACO-LVIS v1 train 标注显示所有 annotation 的 `category_id` 都属于 object category；`id != obj_ann_id` 的 395,071 条 non-parent annotation 虽是 part mask，却没有逐 mask part-category 字段。转换器不再把 object ID 错当 `part_categories` ID，改为对同图同 parent object 类别的全部 part mask 取 union，并写入 `the visible parts of the {parent}` 与 `grounding_query_kind=parent_parts_label`。这恢复非空 PACO 候选，同时避免制造不存在的 `the {part} of the {parent}` 细粒度监督或从同类 part 中任意抽取一个 mask。
+- 论文边界：该 PACO source 提供的是 parent-conditioned visible-part union supervision，粒度低于人工 part referring expression；它仍是额外 label-template direct grounding，不是 GroundingSuite 训练数据或原始 CycleGRPO image-mask-only cycle。
+- 验证：`python3 -m py_compile` 覆盖转换器/query helper、`python3 -m unittest tests.test_grounding_queries` 和 `git diff --check`；服务器端仍需重新导出 PACO parquet，并检查 2,500 条输出与 `parent_parts_label` manifest。
