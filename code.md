@@ -1123,5 +1123,5 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - 代码：新增 `evaluation/refcoco/first_mask_diagnostic.py`、`evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `tests/test_first_mask_diagnostic.py`。
 - 文档：更新第 5.1、5.6、关键注意事项 26 和本日志。
-- 行为：诊断工具读取已有 RefCOCO 逐样本 response/GT JSON，只提取第一个完整且 codebook 合法的 SAMTok depth-2 mask group，以 VQ-SAM2 重新解码为独立目录的 mask，再输出 cIoU/mIoU、首 mask 缺失数。它不重新生成 VLM response、不修改原 union-mask prediction 或正式 benchmark 指标，可直接量化后续多 mask group 对当前 direct run 分割结果的污染。
-- 验证：`python3 -m py_compile evaluation/refcoco/first_mask_diagnostic.py tests/test_first_mask_diagnostic.py`、`python3 -m unittest tests.test_first_mask_diagnostic`（3 tests）、`bash -n evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `git diff --check` 均通过；服务器端仍需各运行 current-direct 与旧 C2 的 8-GPU re-decode 后比较 metrics。
+- 行为：诊断工具读取已有 RefCOCO 逐样本 response/GT JSON，只提取第一个完整且 codebook 合法的 SAMTok depth-2 mask group，以 VQ-SAM2 重新解码为独立目录的 mask，再输出 cIoU/mIoU、首 mask 缺失数。它不重新生成 VLM response、不修改原 union-mask prediction 或正式 benchmark 指标，可直接量化后续多 mask group 对当前 direct run 分割结果的污染。`--metric-only` 只需要 `--output-dir`；输入 response、RefCOCO 标注和 VQ-SAM2 路径只在重解码分片时校验。
+- 验证：`python3 -m py_compile evaluation/refcoco/first_mask_diagnostic.py tests/test_first_mask_diagnostic.py`、`python3 -m unittest tests.test_first_mask_diagnostic`（4 tests）、`bash -n evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `git diff --check` 均通过；本机无 NumPy，未能执行依赖 pycocotools/NumPy 的 metric-only runtime，服务器项目环境需各运行 current-direct 与旧 C2 的 8-GPU re-decode 后比较 metrics。

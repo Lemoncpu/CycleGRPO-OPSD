@@ -31,11 +31,11 @@ class DirectResize:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", type=Path, required=True, help="Existing RefCOCO per-case JSON directory.")
+    parser.add_argument("--input-dir", type=Path, help="Existing RefCOCO per-case JSON directory.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Separate first-mask prediction directory.")
-    parser.add_argument("--refcoco-root", type=Path, required=True)
-    parser.add_argument("--vq-sam2-path", type=Path, required=True)
-    parser.add_argument("--sam2-path", type=Path, required=True)
+    parser.add_argument("--refcoco-root", type=Path)
+    parser.add_argument("--vq-sam2-path", type=Path)
+    parser.add_argument("--sam2-path", type=Path)
     parser.add_argument("--task-id", type=int, default=0)
     parser.add_argument("--num-tasks", type=int, default=1)
     parser.add_argument("--gpu-id", type=int, default=-1)
@@ -140,21 +140,30 @@ def build_vq_sam2(args: argparse.Namespace, device):
 
 
 def main() -> None:
-    import numpy as np
-    import torch
-    from PIL import Image
-
     args = parse_args()
     if args.metric_only:
         metrics = compute_metrics(args.output_dir)
         metrics_path = args.output_dir.parent / f"{args.output_dir.name}_metrics.json"
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return
+    required_paths = {
+        "--input-dir": args.input_dir,
+        "--refcoco-root": args.refcoco_root,
+        "--vq-sam2-path": args.vq_sam2_path,
+        "--sam2-path": args.sam2_path,
+    }
+    missing = [name for name, value in required_paths.items() if value is None]
+    if missing:
+        raise ValueError(f"Missing required arguments outside --metric-only: {', '.join(missing)}.")
     if args.num_tasks <= 0 or not 0 <= args.task_id < args.num_tasks:
         raise ValueError("task_id must be in [0, num_tasks).")
-    for path in (args.input_dir, args.refcoco_root, args.vq_sam2_path, args.sam2_path):
+    for path in required_paths.values():
         if not path.exists():
             raise FileNotFoundError(path)
+
+    import numpy as np
+    import torch
+    from PIL import Image
 
     gpu_id = args.task_id if args.gpu_id < 0 else args.gpu_id
     torch.cuda.set_device(gpu_id)
