@@ -440,7 +440,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、DAM QA schema，以及 QA 聚合和 anchor 配置边界 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -594,6 +594,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
+26. **多 mask 输出必须先做 first-mask 诊断。** 标准 RefCOCO evaluator 会解析 response 中全部完整 mask group 并对其 decoded masks 取 union。因此 response 出现多个 group 时，原始 cIoU/mIoU 混合了首个 text-to-mask 选择和后续序列化污染。`evaluation/refcoco/first_mask_diagnostic.py` 仅重解码已保存 response 的第一个完整、合法 depth-2 group，独立写出 first-mask predictions/metrics，绝不覆盖标准 evaluator 输出。它是诊断工具，不是官方 benchmark protocol；报告正式结果仍使用标准 union 指标。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1117,3 +1118,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.4 节 direct-grounding 分布式 dispatch 契约并追加本日志。
 - 行为：每个 cycle/non-cycle direct parent 子批在 segmentation rollout 前裁到 rollout world size 的整数倍；少于一个完整 shard 时跳过并输出原因。此前主 cycle/non-cycle group 已按 8 卡对齐，但从它们筛出的 direct no-target 子批可保留 12 个 prompt，导致 `DataProto.chunk(8)` 在第 0 step 断言失败。现在该 case 裁为 8 个 prompt、`K=6` 产生 48 个 direct no-target rollout；cycle 主训练、no-target outer caption GRPO 和既有拒识 reward 不变。
 - 验证：`python3 -m py_compile verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py`、`python3 -m unittest tests.test_supervised_anchors`（10 tests）、aligned-prefix static integration assertion 与 `git diff --check` 均通过；服务器端需以 8 GPU 重启该 25k direct run，确认日志出现 trim/skip 信息后进入 step 1。
+
+### 2026-08-12 - 增加 RefCOCO first-mask 离线诊断
+
+- 代码：新增 `evaluation/refcoco/first_mask_diagnostic.py`、`evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `tests/test_first_mask_diagnostic.py`。
+- 文档：更新第 5.1、5.6、关键注意事项 26 和本日志。
+- 行为：诊断工具读取已有 RefCOCO 逐样本 response/GT JSON，只提取第一个完整且 codebook 合法的 SAMTok depth-2 mask group，以 VQ-SAM2 重新解码为独立目录的 mask，再输出 cIoU/mIoU、首 mask 缺失数。它不重新生成 VLM response、不修改原 union-mask prediction 或正式 benchmark 指标，可直接量化后续多 mask group 对当前 direct run 分割结果的污染。
+- 验证：`python3 -m py_compile evaluation/refcoco/first_mask_diagnostic.py tests/test_first_mask_diagnostic.py`、`python3 -m unittest tests.test_first_mask_diagnostic`（3 tests）、`bash -n evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `git diff --check` 均通过；服务器端仍需各运行 current-direct 与旧 C2 的 8-GPU re-decode 后比较 metrics。
