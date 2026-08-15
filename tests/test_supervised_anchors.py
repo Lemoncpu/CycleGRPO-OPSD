@@ -14,8 +14,12 @@ assert _CONFIG_SPEC.loader is not None
 _CONFIG_SPEC.loader.exec_module(_CONFIG_MODULE)
 CaptionQAConfig = _CONFIG_MODULE.CaptionQAConfig
 DirectGroundingConfig = _CONFIG_MODULE.DirectGroundingConfig
+DirectMaskCEConfig = _CONFIG_MODULE.DirectMaskCEConfig
 aligned_direct_prompt_count = _CONFIG_MODULE.aligned_direct_prompt_count
 alternating_localization_prompt_variants = _CONFIG_MODULE.alternating_localization_prompt_variants
+direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
+direct_mask_ce_response_fields = _CONFIG_MODULE.direct_mask_ce_response_fields
+direct_mask_ce_source = _CONFIG_MODULE.direct_mask_ce_source
 direct_grounding_source = _CONFIG_MODULE.direct_grounding_source
 
 
@@ -39,11 +43,37 @@ class SupervisedAnchorsTest(unittest.TestCase):
             DirectGroundingConfig(enabled=True, rollouts=1).post_init()
         with self.assertRaisesRegex(ValueError, "must be false"):
             DirectGroundingConfig(enabled=True, consume_no_target_caption=True).post_init()
+        with self.assertRaisesRegex(ValueError, "warmup steps"):
+            DirectGroundingConfig(warmup_start_step=31, warmup_end_step=30).post_init()
+        with self.assertRaisesRegex(ValueError, "include_positive_sources"):
+            DirectMaskCEConfig(enabled=True, include_positive_sources=False).post_init()
 
     def test_direct_grounding_defaults_to_six_additive_rollouts(self):
         config = DirectGroundingConfig()
         self.assertEqual(config.rollouts, 6)
         self.assertFalse(config.consume_no_target_caption)
+
+    def test_direct_grounding_weight_warmup_boundaries(self):
+        self.assertEqual(direct_grounding_loss_weight(10, 0.15, 10, 30), 0.0)
+        self.assertAlmostEqual(direct_grounding_loss_weight(20, 0.15, 10, 30), 0.075)
+        self.assertEqual(direct_grounding_loss_weight(30, 0.15, 10, 30), 0.15)
+        self.assertEqual(direct_grounding_loss_weight(29, 0.15, 30, 30), 0.0)
+        self.assertEqual(direct_grounding_loss_weight(30, 0.15, 30, 30), 0.15)
+
+    def test_direct_mask_ce_uses_human_positive_sources_only(self):
+        self.assertTrue(direct_mask_ce_source("refcoco_cycle"))
+        self.assertTrue(direct_mask_ce_source("grefcoco_cycle"))
+        self.assertFalse(direct_mask_ce_source("gres_no_target"))
+        self.assertFalse(direct_mask_ce_source("cocostuff_cycle"))
+        self.assertFalse(direct_mask_ce_source("paco_part_cycle"))
+
+    def test_direct_mask_ce_masks_eos_and_padding(self):
+        responses, loss_masks, attention_masks = direct_mask_ce_response_fields(
+            [[11, 12], [21]], eos_token_id=2, pad_token_id=0
+        )
+        self.assertEqual(responses, [[11, 12, 2], [21, 2, 0]])
+        self.assertEqual(loss_masks, [[1, 1, 0], [1, 0, 0]])
+        self.assertEqual(attention_masks, [[1, 1, 1], [1, 1, 0]])
 
     def test_direct_grounding_keeps_no_target_out_of_cycle_sources(self):
         self.assertEqual(direct_grounding_source("refcoco_cycle", True), "supervised_grounding")

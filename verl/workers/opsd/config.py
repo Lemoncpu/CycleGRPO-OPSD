@@ -10,6 +10,9 @@ class PixelIoUConfig:
     mask_threshold: float = 0.5
     prefer_raw_gt: bool = True
     invalid_iou: float = 0.0
+    require_exactly_one_mask: bool = True
+    extra_mask_penalty: float = 1.0
+    segmentation_max_response_tokens: int = 32
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -18,6 +21,10 @@ class PixelIoUConfig:
             raise ValueError("pixel_iou.mask_threshold must be in [0, 1].")
         if not 0.0 <= self.invalid_iou <= 1.0:
             raise ValueError("pixel_iou.invalid_iou must be in [0, 1].")
+        if self.extra_mask_penalty < 0.0:
+            raise ValueError("pixel_iou.extra_mask_penalty must be non-negative.")
+        if self.segmentation_max_response_tokens <= 0:
+            raise ValueError("pixel_iou.segmentation_max_response_tokens must be positive.")
 
 
 @dataclass

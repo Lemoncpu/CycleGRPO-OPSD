@@ -62,6 +62,9 @@ from ..workers.opsd import (
 from ..workers.supervised_anchors import (
     aligned_direct_prompt_count,
     alternating_localization_prompt_variants,
+    direct_grounding_loss_weight,
+    direct_mask_ce_response_fields,
+    direct_mask_ce_source,
     direct_grounding_source,
 )
 from .config import PPOConfig
@@ -791,6 +794,10 @@ class RayPPOTrainer:
         task_dict.update({k.replace(f'seg_', ''): gen_seg_batch.non_tensor_batch.pop(k) for k in [f'seg_raw_prompt_ids', f'seg_multi_modal_data']})
         gen_batch = DataProto.from_single_dict(task_dict, meta_info=batch.meta_info)
         gen_batch.meta_info.update({'task': 'segmentation'})
+        # Keep malformed early rollouts bounded. The strict reward below is the
+        # actual one-mask constraint; this only prevents long repeat loops from
+        # wasting generation time before the policy has adapted.
+        gen_batch.meta_info["max_tokens"] = self.config.worker.opsd.pixel_iou.segmentation_max_response_tokens
         gen_batch.non_tensor_batch.update({'seg_ground_truth': gen_seg_batch.non_tensor_batch['seg_ground_truth']})
         gen_batch.non_tensor_batch.update({'seg_problems': np.array(all_seg_problems, dtype=object)})
         # Store media under a unified 'media' key for downstream compatibility (images or videos)
@@ -929,6 +936,131 @@ class RayPPOTrainer:
         )
         direct_batch.non_tensor_batch["direct_grounding"] = np.ones(len(direct_batch), dtype=object)
         return direct_batch
+
+    def _make_direct_mask_ce_batch(self, cycle_batch: DataProto) -> Optional[DataProto]:
+        """Build one human-expression GT-mask CE target per original sample UID.
+
+        This intentionally does not reuse direct GRPO rollouts: sampled direct
+        responses retain their own independent GRPO advantages, whereas this
+        batch teacher-forces the stored SAMTok target exactly once.
+        """
+        config = self.config.worker.supervised_anchors.direct_mask_ce
+        if not config.enabled or "grounding_query" not in cycle_batch.non_tensor_batch:
+            return None
+
+        seen_uids: set[str] = set()
+        indices: list[int] = []
+        queries: list[str] = []
+        for index, (uid, source, query, target) in enumerate(
+            zip(
+                cycle_batch.non_tensor_batch["uid"],
+                cycle_batch.non_tensor_batch["source"],
+                cycle_batch.non_tensor_batch["grounding_query"],
+                cycle_batch.non_tensor_batch["seg_ground_truth"],
+            )
+        ):
+            uid_text = str(uid)
+            if uid_text in seen_uids:
+                continue
+            seen_uids.add(uid_text)
+            if (
+                not direct_mask_ce_source(source, config.include_positive_sources)
+                or not isinstance(query, str)
+                or not query.strip()
+                or not isinstance(target, str)
+                or not target.strip()
+            ):
+                continue
+            indices.append(index)
+            queries.append(query.strip())
+        if not indices:
+            return None
+
+        dataset = self.train_dataloader.dataset
+        prompt_records = []
+        target_ids = []
+        selected_uids = []
+        for output_index, parent_index in enumerate(indices):
+            parent = cycle_batch[parent_index]
+            seg_media = parent.non_tensor_batch["seg_multi_modal_data"][0]
+            cap_media = parent.non_tensor_batch["multi_modal_data"][0]
+            example = {
+                "seg_problem": queries[output_index],
+                "localization_prompt_variant": alternating_localization_prompt_variants(len(indices))[output_index],
+                "seg_ground_truth": parent.non_tensor_batch["seg_ground_truth"][0],
+                "source": "supervised_grounding",
+                "masks": parent.non_tensor_batch["masks"][0],
+                "cap_ground_truth": parent.non_tensor_batch["cap_ground_truth"][0],
+            }
+            if "images" in seg_media:
+                example["images"] = seg_media["images"]
+                example["cap_images"] = cap_media["images"]
+            elif "videos" in seg_media:
+                # Direct mask CE is image-only in the current supervised data contract.
+                continue
+            else:
+                continue
+            record = dataset._gen_seg_preprocess(example)
+            prompt_records.append(record)
+            target_ids.append(
+                self.tokenizer.encode(record["seg_ground_truth"], add_special_tokens=False)
+            )
+            selected_uids.append(str(cycle_batch.non_tensor_batch["uid"][parent_index]))
+        if not prompt_records:
+            return None
+
+        eos_token_id = self.tokenizer.eos_token_id
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0]
+        if eos_token_id is None:
+            raise ValueError("direct_mask_ce requires tokenizer.eos_token_id.")
+        response_rows, response_mask_rows, response_attention_rows = direct_mask_ce_response_fields(
+            target_ids,
+            int(eos_token_id),
+            int(self.tokenizer.pad_token_id),
+        )
+        target_length = len(response_rows[0])
+        responses = torch.tensor(response_rows, dtype=torch.long)
+        response_masks = torch.tensor(response_mask_rows, dtype=torch.long)
+        response_attention_mask = torch.tensor(response_attention_rows, dtype=torch.long)
+        prompts = torch.stack([record["seg_input_ids"] for record in prompt_records])
+        prompt_attention_mask = torch.stack(
+            [record["seg_attention_mask"] for record in prompt_records]
+        )
+        prompt_position_ids = torch.stack(
+            [record["seg_position_ids"] for record in prompt_records]
+        )
+        input_ids = torch.cat([prompts, responses], dim=-1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=-1)
+        delta = torch.arange(1, target_length + 1).view(1, -1).expand(len(prompt_records), -1)
+        if prompt_position_ids.ndim == 3:
+            delta = delta.view(len(prompt_records), 1, -1).expand(
+                len(prompt_records), prompt_position_ids.size(1), -1
+            )
+        position_ids = torch.cat(
+            [prompt_position_ids, prompt_position_ids[..., -1:] + delta], dim=-1
+        )
+        return DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "response_mask": response_masks,
+                "position_ids": position_ids,
+                "sample_weight": torch.ones(len(prompt_records), dtype=torch.float32),
+            },
+            non_tensors={
+                "multi_modal_data": np.array(
+                    [record["seg_multi_modal_data"] for record in prompt_records], dtype=object
+                ),
+                "uid": np.array(
+                    selected_uids,
+                    dtype=object,
+                ),
+            },
+            meta_info=dict(cycle_batch.meta_info),
+        )
 
     def _merge_pixel_iou_metadata(self, caption_batch: DataProto, segmentation_batch: DataProto) -> None:
         caption_uids = segmentation_batch.non_tensor_batch["caption_uid"]
@@ -1827,6 +1959,7 @@ class RayPPOTrainer:
                 distillation_batch = None
                 seg_batch = None
                 direct_grounding_batch = None
+                direct_mask_ce_batch = None
                 if cycle_batch is not None and (
                     self.config.worker.actor.optimize_captioner or self.config.worker.actor.optimize_segmenter
                 ):
@@ -1848,6 +1981,7 @@ class RayPPOTrainer:
                                 if len(direct_batches) == 1
                                 else DataProto.concat(direct_batches)
                             )
+                        direct_mask_ce_batch = self._make_direct_mask_ce_batch(cycle_batch)
                         cycle_cap_batch.meta_info.pop("n", None)
                         self.actor_rollout_ref_wg.release_rollout_engine()
                         if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:
@@ -1907,6 +2041,15 @@ class RayPPOTrainer:
                             )
                             pixel_values = cycle_seg_batch.non_tensor_batch["pixel_iou"].astype(float)
                             caption_scores = cycle_cap_batch.non_tensor_batch["R_Ci"].astype(float)
+                            seg_group_counts = np.asarray(
+                                cycle_seg_batch.non_tensor_batch["mask_group_count"], dtype=float
+                            )
+                            seg_exactly_one = np.asarray(
+                                cycle_seg_batch.non_tensor_batch["exactly_one_mask_group"], dtype=bool
+                            )
+                            seg_extra_groups = np.asarray(
+                                cycle_seg_batch.non_tensor_batch["extra_mask_group_count"], dtype=float
+                            )
                             metrics.update(
                                 {
                                     "opsd/pixel_iou_mean": float(np.mean(pixel_values)),
@@ -1915,8 +2058,31 @@ class RayPPOTrainer:
                                     "opsd/pixel_iou_max": float(np.max(pixel_values)),
                                     "opsd/R_Ci_mean": float(np.mean(caption_scores)),
                                     "opsd/R_Ci_std": float(np.std(caption_scores)),
+                                    "opsd/seg_exactly_one_mask_rate": float(np.mean(seg_exactly_one)),
+                                    "opsd/seg_multi_mask_rate": float(np.mean(seg_group_counts > 1)),
+                                    "opsd/seg_mean_mask_group_count": float(np.mean(seg_group_counts)),
+                                    "opsd/seg_mean_extra_mask_group_count": float(np.mean(seg_extra_groups)),
                                 }
                             )
+                            if direct_grounding_batch is not None:
+                                direct_sources = np.asarray(
+                                    direct_grounding_batch.non_tensor_batch["source"], dtype=object
+                                )
+                                positive_direct = direct_sources == "supervised_grounding"
+                                if np.any(positive_direct):
+                                    direct_group_counts = np.asarray(
+                                        direct_grounding_batch.non_tensor_batch["mask_group_count"], dtype=float
+                                    )[positive_direct]
+                                    direct_exactly_one = np.asarray(
+                                        direct_grounding_batch.non_tensor_batch["exactly_one_mask_group"], dtype=bool
+                                    )[positive_direct]
+                                    metrics.update(
+                                        {
+                                            "supervised_anchors/direct_exactly_one_mask_rate": float(np.mean(direct_exactly_one)),
+                                            "supervised_anchors/direct_multi_mask_rate": float(np.mean(direct_group_counts > 1)),
+                                            "supervised_anchors/direct_mean_mask_group_count": float(np.mean(direct_group_counts)),
+                                        }
+                                    )
                             references = list(cycle_seg_batch.non_tensor_batch["iou_reference"])
                             metrics["opsd/raw_gt_reference_rate"] = references.count("raw_gt") / max(
                                 len(references), 1
@@ -2179,10 +2345,32 @@ class RayPPOTrainer:
                     cap_batch_size = len(cap_batch) if cap_batch is not None else 0
                     seg_batch_size = len(seg_batch) if seg_batch is not None else 0
                     direct_grounding_size = len(direct_grounding_batch) if direct_grounding_batch is not None else 0
-                    total_size = cap_batch_size + seg_batch_size + direct_grounding_size
+                    direct_mask_ce_size = len(direct_mask_ce_batch) if direct_mask_ce_batch is not None else 0
+                    total_size = cap_batch_size + seg_batch_size + direct_grounding_size + direct_mask_ce_size
                     
                     cap_grad_weight = self.config.worker.opsd.caption_loss_weight
                     seg_grad_weight = self.config.worker.opsd.localization_loss_weight
+                    direct_config = self.config.worker.supervised_anchors.direct_grounding
+                    direct_target_weight = direct_config.loss_weight if direct_config.enabled else 0.0
+                    direct_grad_weight = direct_grounding_loss_weight(
+                        self.global_step,
+                        direct_target_weight,
+                        direct_config.warmup_start_step,
+                        direct_config.warmup_end_step,
+                    )
+                    direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
+                    metrics.update(
+                        {
+                            "supervised_anchors/direct_loss_weight_effective": direct_grad_weight,
+                            "supervised_anchors/direct_loss_weight_target": direct_target_weight,
+                            "supervised_anchors/direct_mask_ce_weight": (
+                                direct_mask_ce_config.loss_weight
+                                if direct_mask_ce_config.enabled
+                                else 0.0
+                            ),
+                            "supervised_anchors/direct_mask_ce_samples": direct_mask_ce_size,
+                        }
+                    )
 
                     if self.config.trainer.critic_warmup <= self.global_step:
                         self.actor_rollout_ref_wg.clear_multi_modal_cache()
@@ -2280,9 +2468,7 @@ class RayPPOTrainer:
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
 
                             if direct_grounding_batch is not None and direct_grounding_size > 0:
-                                direct_grounding_batch.meta_info["grad_weight"] = (
-                                    self.config.worker.supervised_anchors.direct_grounding.loss_weight
-                                )
+                                direct_grounding_batch.meta_info["grad_weight"] = direct_grad_weight
                                 direct_grounding_batch.meta_info["global_batch_size_per_device"] = (
                                     len(direct_grounding_batch) // self.actor_rollout_ref_wg.world_size
                                 )
@@ -2295,6 +2481,31 @@ class RayPPOTrainer:
                                         for key, value in reduce_metrics(direct_output.non_tensor_batch).items()
                                     }
                                 )
+
+                            if direct_mask_ce_batch is not None and direct_mask_ce_size > 0:
+                                ce_batch, ce_pad = pad_dataproto_to_divisor(
+                                    direct_mask_ce_batch,
+                                    self.actor_rollout_ref_wg.world_size
+                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                )
+                                if ce_pad:
+                                    ce_batch.batch["sample_weight"][-ce_pad:] = 0.0
+                                self._balance_batch(
+                                    ce_batch,
+                                    metrics=metrics,
+                                    logging_prefix="direct_mask_ce_seqlen",
+                                )
+                                ce_batch.meta_info["global_token_num"] = torch.sum(
+                                    ce_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                ce_batch.meta_info["grad_weight"] = direct_mask_ce_config.loss_weight
+                                ce_batch.meta_info["global_batch_size_per_device"] = (
+                                    len(ce_batch) // self.actor_rollout_ref_wg.world_size
+                                )
+                                ce_output = self.actor_rollout_ref_wg.accumulate_direct_mask_ce_gradients(
+                                    ce_batch
+                                )
+                                actor_metrics.update(reduce_metrics(ce_output.non_tensor_batch))
 
                             if not projection_enabled:
                                 # Preserve the historical accumulation order when projection is disabled.

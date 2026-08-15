@@ -67,3 +67,5 @@ class WorkerConfig:
             raise ValueError("direct_grounding requires OPSD pixel_iou.enabled=true.")
         if self.supervised_anchors.direct_grounding.enabled and not self.actor.optimize_segmenter:
             raise ValueError("direct_grounding requires actor.optimize_segmenter=true.")
+        if self.supervised_anchors.direct_mask_ce.enabled and not self.actor.optimize_segmenter:
+            raise ValueError("direct_mask_ce requires actor.optimize_segmenter=true.")

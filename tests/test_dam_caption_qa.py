@@ -1,6 +1,8 @@
 import unittest
 
 from projects.rl.datasets.generate_dam_caption_qa import (
+    GENERATION_PROMPT,
+    VALIDATION_PROMPT,
     extract_json_object,
     normalize_generated_payload,
 )
@@ -56,6 +58,22 @@ class DamCaptionQaTest(unittest.TestCase):
                     ],
                 }
             )
+
+    def test_prompt_templates_format_literal_json_schemas(self):
+        caption = "A wooden chair with a curved back is painted blue."
+        candidate_json = '{"class_name": "chair", "questions": []}'
+
+        generation_prompt = GENERATION_PROMPT.format(caption=caption)
+        validation_prompt = VALIDATION_PROMPT.format(
+            caption=caption, candidate_json=candidate_json
+        )
+
+        self.assertIn(caption, generation_prompt)
+        self.assertIn('"class_name": "short common-noun phrase"', generation_prompt)
+        self.assertIn('"questions": [', generation_prompt)
+        self.assertIn(caption, validation_prompt)
+        self.assertIn(candidate_json, validation_prompt)
+        self.assertIn('{"accepted": true_or_false, "reasons": ["short reason"]}', validation_prompt)
 
 
 if __name__ == "__main__":

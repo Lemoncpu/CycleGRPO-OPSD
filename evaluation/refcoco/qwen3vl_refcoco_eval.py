@@ -99,7 +99,13 @@ def load_samples(root: str, split_by: str, split: str) -> list[dict]:
 
 
 def parse_mask_codes(text: str) -> list[list[int]]:
-    values = [int(value) for value in re.findall(r"<\|mt_(\d{4})\|>", text)]
+    """Parse the first complete legal mask group only."""
+    match = re.search(
+        r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>", text
+    )
+    if match is None:
+        return []
+    values = [int(value) for value in match.groups()]
     codes = []
     for index in range(0, len(values) - 1, 2):
         first, second = values[index], values[index + 1] - 256
@@ -175,8 +181,16 @@ def main():
         width, height = image.size
         messages = [{"role": "user", "content": [{"type": "image", "image": sample["image_path"]}, {"type": "text", "text": f"Please segment {sample['phrase']} in this image."}]}]
         inputs = processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt").to(device)
+        base_eos = model.generation_config.eos_token_id
+        eos_token_id = list(base_eos) if isinstance(base_eos, (list, tuple)) else [base_eos]
+        eos_token_id.append(processor.tokenizer.convert_tokens_to_ids("<|mt_end|>"))
         with torch.no_grad():
-            generated = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,
+                eos_token_id=list(dict.fromkeys(token_id for token_id in eos_token_id if token_id is not None)),
+            )
         response = processor.batch_decode([generated[0][inputs.input_ids.shape[1] :]], skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
         codes = parse_mask_codes(response)
         if codes:
@@ -188,7 +202,19 @@ def main():
         else:
             prediction = np.zeros((height, width), dtype=bool)
         with open(output_path, "w") as file:
-            json.dump({"target": sample["target"], "prediction": encode_rle(prediction), "response": response}, file)
+            json.dump(
+                {
+                    "target": sample["target"],
+                    "prediction": encode_rle(prediction),
+                    "response": response,
+                    "mask_group_count": len(
+                        re.findall(
+                            r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", response
+                        )
+                    ),
+                },
+                file,
+            )
 
 
 if __name__ == "__main__":

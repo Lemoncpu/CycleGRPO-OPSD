@@ -18,8 +18,10 @@ from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
     decode_mask_tokens,
+    mask_group_metadata,
     parse_mask_codes,
 )
+from projects.rl.reward_function.text2mask import compute_score
 from verl.workers.opsd.routing import (
     GRPO_ROUTE,
     ON_POLICY_DISTILL_ROUTE,
@@ -38,6 +40,48 @@ from verl.workers.opsd.routing import (
 
 
 class OPSDCoreTest(unittest.TestCase):
+    def test_strict_single_mask_metadata_and_reward(self):
+        first = "<|mt_start|><|mt_0007|><|mt_0268|><|mt_end|>"
+        repeated = first * 3
+        valid = mask_group_metadata(first)
+        duplicate = mask_group_metadata(repeated)
+        self.assertTrue(valid["exactly_one_valid_group"])
+        self.assertEqual(valid["first_valid_codes"], [7, 12])
+        self.assertFalse(duplicate["exactly_one_valid_group"])
+        self.assertEqual(duplicate["complete_group_count"], 3)
+        self.assertEqual(duplicate["extra_group_count"], 2)
+        self.assertEqual(parse_mask_codes(repeated), [7, 12])
+
+        reward_inputs = [
+            {
+                "source": "supervised_grounding",
+                "response": first,
+                "iou_scores": 0.8,
+                "mask_group_count": 1,
+                "valid_mask_group_count": 1,
+                "extra_mask_group_count": 0,
+                "exactly_one_mask_group": True,
+                "extra_mask_penalty": 1.0,
+                "require_exactly_one_mask": True,
+            },
+            {
+                "source": "supervised_grounding",
+                "response": repeated,
+                "iou_scores": 0.8,
+                "mask_group_count": 3,
+                "valid_mask_group_count": 3,
+                "extra_mask_group_count": 2,
+                "exactly_one_mask_group": False,
+                "extra_mask_penalty": 1.0,
+                "require_exactly_one_mask": True,
+            },
+        ]
+        scores = compute_score(reward_inputs, task="segmentation")
+        self.assertAlmostEqual(scores[0]["seg_overall"], 10.0)
+        self.assertEqual(scores[1]["seg_overall"], -2.0)
+        self.assertEqual(scores[1]["seg_exactly_one_mask_group"], 0.0)
+        self.assertEqual(scores[1]["seg_extra_mask_group_penalty"], -2.0)
+
     def test_anchor_kl_coefficients_must_be_non_negative(self):
         config = OPSDConfig(caption_anchor_kl_coef=0.05, segmentation_anchor_kl_coef=0.05)
         config.post_init()

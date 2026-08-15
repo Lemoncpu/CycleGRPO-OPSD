@@ -19,20 +19,53 @@ def extract_mask_token(text: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def extract_mask_tokens(text: Optional[str]) -> list[str]:
+    """Return every complete depth-2 SAMTok group in generation order."""
+    if not isinstance(text, str) or not text:
+        return []
+    return [match.group(0) for match in MASK_TOKEN_PATTERN.finditer(text)]
+
+
+def mask_group_metadata(
+    text: Optional[str], codebook_size: int = 256, codebook_depth: int = 2
+) -> dict[str, object]:
+    """Summarize complete SAMTok groups without silently accepting trailing masks.
+
+    The online decoder still uses the first valid group as a diagnostic mask, but
+    positive localization training can require ``exactly_one_valid_group`` so a
+    correct first mask cannot reward an unbounded suffix of extra mask tokens.
+    """
+    groups = extract_mask_tokens(text)
+    valid_groups: list[str] = []
+    valid_codes: list[list[int]] = []
+    for group in groups:
+        match = MASK_TOKEN_PATTERN.fullmatch(group)
+        if match is None:
+            continue
+        global_codes = [int(value) for value in match.groups()]
+        if len(global_codes) != codebook_depth:
+            continue
+        local_codes = [value - depth * codebook_size for depth, value in enumerate(global_codes)]
+        if any(value < 0 or value >= codebook_size for value in local_codes):
+            continue
+        valid_groups.append(group)
+        valid_codes.append(local_codes)
+    complete_count = len(groups)
+    valid_count = len(valid_groups)
+    return {
+        "complete_group_count": complete_count,
+        "valid_group_count": valid_count,
+        "extra_group_count": max(complete_count - 1, 0),
+        "exactly_one_valid_group": complete_count == 1 and valid_count == 1,
+        "first_valid_group": valid_groups[0] if valid_groups else None,
+        "first_valid_codes": valid_codes[0] if valid_codes else None,
+    }
+
+
 def parse_mask_codes(text: Optional[str], codebook_size: int = 256, codebook_depth: int = 2) -> Optional[list[int]]:
-    token = extract_mask_token(text)
-    if token is None:
-        return None
-    match = MASK_TOKEN_PATTERN.fullmatch(token)
-    if match is None:
-        return None
-    global_codes = [int(value) for value in match.groups()]
-    if len(global_codes) != codebook_depth:
-        return None
-    local_codes = [value - depth * codebook_size for depth, value in enumerate(global_codes)]
-    if any(value < 0 or value >= codebook_size for value in local_codes):
-        return None
-    return local_codes
+    metadata = mask_group_metadata(text, codebook_size, codebook_depth)
+    codes = metadata["first_valid_codes"]
+    return codes if isinstance(codes, list) else None
 
 
 def compute_binary_iou(target: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:

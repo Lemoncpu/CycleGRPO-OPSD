@@ -18,21 +18,21 @@ GENERATION_PROMPT = """You create rigorous text-only multiple-choice questions f
 evaluating a generated region description. The reference caption is the only evidence.
 
 Return exactly one JSON object with this schema:
-{
+{{
   "class_name": "short common-noun phrase",
   "questions": [
-    {
+    {{
       "type": "positive",
       "question": "question answerable only from the caption",
       "choices": [["correct choice", 1], ["distractor", 0], ["distractor", 0], ["distractor", 0]]
-    },
-    {
+    }},
+    {{
       "type": "positive",
       "question": "another question answerable only from the caption",
       "choices": [["correct choice", 1], ["distractor", 0], ["distractor", 0], ["distractor", 0]]
-    }
+    }}
   ]
-}
+}}
 
 Rules:
 - Produce exactly two positive questions. They must test distinct, explicitly stated facts.
@@ -50,7 +50,7 @@ Reference caption:
 
 VALIDATION_PROMPT = """You validate text-only multiple-choice QA against a reference
 caption. The caption is the only evidence. Return exactly this JSON object:
-{"accepted": true_or_false, "reasons": ["short reason"]}
+{{"accepted": true_or_false, "reasons": ["short reason"]}}
 
 Accept only when all of the following are true:
 1. Every positive question is uniquely answerable from an explicit caption fact.

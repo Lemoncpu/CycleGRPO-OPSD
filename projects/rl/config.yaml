@@ -50,10 +50,16 @@ worker:
       enabled: false
       rollouts: 6
       loss_weight: 0.25
+      warmup_start_step: 10
+      warmup_end_step: 30
       include_no_target: true
       include_positive_sources: true
       include_label_sources: false
       consume_no_target_caption: false
+    direct_mask_ce:
+      enabled: false
+      loss_weight: 0.02
+      include_positive_sources: true
   opsd:
     enabled: true
     localization_rollouts: 6
@@ -76,6 +82,9 @@ worker:
       mask_threshold: 0.5
       prefer_raw_gt: true
       invalid_iou: 0.0
+      require_exactly_one_mask: true
+      extra_mask_penalty: 1.0
+      segmentation_max_response_tokens: 32
     routing:
       enabled: true
       low_threshold: 0.5

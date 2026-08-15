@@ -96,6 +96,7 @@ from .opsd import (
     compute_binary_iou,
     decode_mask_tokens,
     extract_mask_token,
+    mask_group_metadata,
 )
 
 class DirectResize:
@@ -1454,7 +1455,17 @@ class FSDPWorker(Worker):
             if rollout_scores is not None
             else np.zeros(len(data), dtype=np.float32)
         )
-        predicted_tokens = np.array([extract_mask_token(text) for text in responses], dtype=object)
+        response_mask_metadata = [
+            mask_group_metadata(
+                text,
+                codebook_size=self.config.reward.codebook_size,
+                codebook_depth=self.config.reward.codebook_depth,
+            )
+            for text in responses
+        ]
+        predicted_tokens = np.array(
+            [metadata["first_valid_group"] for metadata in response_mask_metadata], dtype=object
+        )
         target_tokens = np.array([extract_mask_token(text) for text in targets], dtype=object)
         reference_sources = np.full(len(data), "rollout_score", dtype=object)
         decoded_predictions = [None] * len(data)
@@ -1465,6 +1476,7 @@ class FSDPWorker(Worker):
             sample_groups.setdefault(str(uid), []).append(index)
 
         pixel_config = self.config.opsd.pixel_iou
+        first_mask_pixel_ious = np.full(len(data), pixel_config.invalid_iou, dtype=np.float32)
         for sample_uid, indices in sample_groups.items():
             first = indices[0]
             if data.non_tensor_batch["source"][first] == "supervised_grounding_no_target":
@@ -1509,9 +1521,15 @@ class FSDPWorker(Worker):
                         prediction[None, None].float(), size=target_mask.shape, mode="nearest"
                     )[0, 0].bool()
                     decoded_predictions[data_index] = prediction
-                pixel_ious[data_index] = float(
+                first_mask_pixel_ious[data_index] = float(
                     compute_binary_iou(target_mask[None], prediction[None])[0].item()
                 )
+                pixel_ious[data_index] = first_mask_pixel_ious[data_index]
+                if (
+                    pixel_config.require_exactly_one_mask
+                    and not bool(response_mask_metadata[data_index]["exactly_one_valid_group"])
+                ):
+                    pixel_ious[data_index] = pixel_config.invalid_iou
 
         caption_groups = {}
         for index, uid in enumerate(caption_uids):
@@ -1548,6 +1566,25 @@ class FSDPWorker(Worker):
 
         data.non_tensor_batch["predicted_mask_token"] = predicted_tokens
         data.non_tensor_batch["target_mask_token"] = target_tokens
+        data.non_tensor_batch["mask_group_count"] = np.array(
+            [metadata["complete_group_count"] for metadata in response_mask_metadata], dtype=object
+        )
+        data.non_tensor_batch["valid_mask_group_count"] = np.array(
+            [metadata["valid_group_count"] for metadata in response_mask_metadata], dtype=object
+        )
+        data.non_tensor_batch["extra_mask_group_count"] = np.array(
+            [metadata["extra_group_count"] for metadata in response_mask_metadata], dtype=object
+        )
+        data.non_tensor_batch["exactly_one_mask_group"] = np.array(
+            [metadata["exactly_one_valid_group"] for metadata in response_mask_metadata], dtype=object
+        )
+        data.non_tensor_batch["first_mask_pixel_iou"] = first_mask_pixel_ious.astype(object)
+        data.non_tensor_batch["extra_mask_penalty"] = np.full(
+            len(data), pixel_config.extra_mask_penalty, dtype=object
+        )
+        data.non_tensor_batch["require_exactly_one_mask"] = np.full(
+            len(data), pixel_config.require_exactly_one_mask, dtype=object
+        )
         data.non_tensor_batch["pixel_iou"] = pixel_ious.astype(object)
         data.non_tensor_batch["mask_token_accuracy"] = pixel_ious.astype(object)
         data.non_tensor_batch["R_Ci"] = r_ci.astype(object)
@@ -1817,6 +1854,32 @@ class FSDPWorker(Worker):
             output = DataProto(
                 non_tensor_batch={
                     key: np.array([value] if np.isscalar(value) else value) for key, value in metrics.items()
+                }
+            )
+        return output.to("cpu")
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def accumulate_direct_mask_ce_gradients(self, data: DataProto):
+        """Accumulate GT SAMTok CE without sharing regenerate CE metrics."""
+        assert self._has_actor
+        grad_weight = data.meta_info.get("grad_weight", 1.0)
+        self._process_multi_modal_inputs(data)
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            metrics = self.actor.update_supervised(
+                data=data,
+                grad_weight=grad_weight,
+                metric_name="supervised_anchors/direct_mask_ce_loss",
+            )
+            output = DataProto(
+                non_tensor_batch={
+                    key: np.array([value] if np.isscalar(value) else value)
+                    for key, value in metrics.items()
                 }
             )
         return output.to("cpu")

@@ -17,6 +17,9 @@ CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
 PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
+REQUIRE_EXACTLY_ONE_MASK="${REQUIRE_EXACTLY_ONE_MASK:-true}"
+EXTRA_MASK_PENALTY="${EXTRA_MASK_PENALTY:-1.0}"
+SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-32}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
@@ -70,10 +73,14 @@ CAPTION_QA_REWARD_WEIGHT="${CAPTION_QA_REWARD_WEIGHT:-1.0}"
 DIRECT_GROUNDING_ENABLED="${DIRECT_GROUNDING_ENABLED:-false}"
 DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-6}"
 DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
+DIRECT_GROUNDING_WARMUP_START_STEP="${DIRECT_GROUNDING_WARMUP_START_STEP:-10}"
+DIRECT_GROUNDING_WARMUP_END_STEP="${DIRECT_GROUNDING_WARMUP_END_STEP:-30}"
 DIRECT_GROUNDING_INCLUDE_NO_TARGET="${DIRECT_GROUNDING_INCLUDE_NO_TARGET:-false}"
 DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES:-false}"
 DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES:-false}"
 DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-false}"
+DIRECT_MASK_CE_ENABLED="${DIRECT_MASK_CE_ENABLED:-false}"
+DIRECT_MASK_CE_LOSS_WEIGHT="${DIRECT_MASK_CE_LOSS_WEIGHT:-0.02}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SAVE_LIMIT="${SAVE_LIMIT:-20}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
@@ -118,6 +125,7 @@ fi
 
 for bool_name in \
     PIXEL_IOU_ENABLED \
+    REQUIRE_EXACTLY_ONE_MASK \
     ROUTING_ENABLED \
     CAPTION_SAFETY_ENABLED \
     CAPTION_SAFETY_FORCE_REGENERATE \
@@ -130,7 +138,8 @@ for bool_name in \
     DIRECT_GROUNDING_INCLUDE_NO_TARGET \
     DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES \
     DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
-    DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION; do
+    DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
+    DIRECT_MASK_CE_ENABLED; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
         echo "${bool_name} must be true or false: ${bool_value}" >&2
@@ -156,6 +165,20 @@ if [[ ! "${DIRECT_GROUNDING_ROLLOUTS}" =~ ^[2-9][0-9]*$ ]] \
     echo "DIRECT_GROUNDING_ROLLOUTS must be >=2 and CAPTION_QA_MAX_CONCURRENCY must be positive." >&2
     exit 1
 fi
+
+if [[ ! "${DIRECT_GROUNDING_WARMUP_START_STEP}" =~ ^[0-9]+$ ]] \
+    || [[ ! "${DIRECT_GROUNDING_WARMUP_END_STEP}" =~ ^[0-9]+$ ]] \
+    || (( DIRECT_GROUNDING_WARMUP_END_STEP < DIRECT_GROUNDING_WARMUP_START_STEP )); then
+    echo "Direct grounding warmup must satisfy 0 <= start <= end: ${DIRECT_GROUNDING_WARMUP_START_STEP}, ${DIRECT_GROUNDING_WARMUP_END_STEP}" >&2
+    exit 1
+fi
+
+for direct_weight_name in DIRECT_GROUNDING_LOSS_WEIGHT DIRECT_MASK_CE_LOSS_WEIGHT; do
+    if ! awk -v value="${!direct_weight_name}" 'BEGIN { exit !(value >= 0) }'; then
+        echo "${direct_weight_name} must be non-negative: ${!direct_weight_name}" >&2
+        exit 1
+    fi
+done
 
 if [[ "${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" != "false" ]]; then
     echo "DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION must be false: direct grounding is additive to main no-target caption GRPO." >&2
@@ -265,6 +288,16 @@ fi
 
 if [[ ! "${CAPTION_MAX_RESPONSE_LENGTH}" =~ ^[1-9][0-9]*$ ]]; then
     echo "CAPTION_MAX_RESPONSE_LENGTH must be a positive integer: ${CAPTION_MAX_RESPONSE_LENGTH}" >&2
+    exit 1
+fi
+
+if [[ ! "${SEGMENTATION_MAX_RESPONSE_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SEGMENTATION_MAX_RESPONSE_TOKENS must be a positive integer: ${SEGMENTATION_MAX_RESPONSE_TOKENS}" >&2
+    exit 1
+fi
+
+if ! awk -v value="${EXTRA_MASK_PENALTY}" 'BEGIN { exit !(value >= 0) }'; then
+    echo "EXTRA_MASK_PENALTY must be non-negative: ${EXTRA_MASK_PENALTY}" >&2
     exit 1
 fi
 
@@ -429,6 +462,8 @@ echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
+echo "Positive segmentation mask contract: exactly-one=${REQUIRE_EXACTLY_ONE_MASK}, extra-mask penalty=${EXTRA_MASK_PENALTY}"
+echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -440,7 +475,8 @@ echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_T
 echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
-echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, loss weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
+echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
+echo "Direct GT-mask CE anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive expressions only)"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -494,6 +530,9 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.teacher_confidence.regenerate_min_normalized_improvement="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}" \
     worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
     worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
+    worker.opsd.pixel_iou.require_exactly_one_mask="${REQUIRE_EXACTLY_ONE_MASK}" \
+    worker.opsd.pixel_iou.extra_mask_penalty="${EXTRA_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.segmentation_max_response_tokens="${SEGMENTATION_MAX_RESPONSE_TOKENS}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
@@ -523,10 +562,15 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
     worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
     worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
+    worker.supervised_anchors.direct_grounding.warmup_start_step="${DIRECT_GROUNDING_WARMUP_START_STEP}" \
+    worker.supervised_anchors.direct_grounding.warmup_end_step="${DIRECT_GROUNDING_WARMUP_END_STEP}" \
     worker.supervised_anchors.direct_grounding.include_no_target="${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" \
     worker.supervised_anchors.direct_grounding.include_positive_sources="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}" \
     worker.supervised_anchors.direct_grounding.include_label_sources="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}" \
     worker.supervised_anchors.direct_grounding.consume_no_target_caption="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" \
+    worker.supervised_anchors.direct_mask_ce.enabled="${DIRECT_MASK_CE_ENABLED}" \
+    worker.supervised_anchors.direct_mask_ce.loss_weight="${DIRECT_MASK_CE_LOSS_WEIGHT}" \
+    worker.supervised_anchors.direct_mask_ce.include_positive_sources=true \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \

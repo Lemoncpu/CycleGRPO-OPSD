@@ -160,8 +160,14 @@ def rle_to_mask(rle):
 
 
 def extract_mt_token_ids_v1(text):
-    pattern = r"<\|mt_(\d{4})\|>"
-    return [int(x) for x in re.findall(pattern, text)]
+    """Return the first complete legal depth-2 mask group only."""
+    match = re.search(
+        r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>", text
+    )
+    if match is None:
+        return []
+    first, second = (int(value) for value in match.groups())
+    return [first, second] if 0 <= first < CODEBOOK_SIZE and CODEBOOK_SIZE <= second < 2 * CODEBOOK_SIZE else []
 
 def extract_mt_token_ids_v2(text):
     pattern = re.compile(r'<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>')
@@ -358,11 +364,15 @@ def main():
         inputs = inputs.to(model.device)
 
         # Inference: Generation of the output
+        base_eos = model.generation_config.eos_token_id
+        eos_token_id = list(base_eos) if isinstance(base_eos, (list, tuple)) else [base_eos]
+        eos_token_id.append(processor.tokenizer.convert_tokens_to_ids("<|mt_end|>"))
         generated_ids = model.generate(
             **inputs, 
-            max_new_tokens=512,
+            max_new_tokens=128,
             do_sample=False,  # 关闭采样，使用贪婪解码
             top_p=1.0,  # 配合do_sample=False使用
+            eos_token_id=list(dict.fromkeys(token_id for token_id in eos_token_id if token_id is not None)),
         )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -370,14 +380,15 @@ def main():
         output_text = processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        # print("User: ", phrase)
-        print("Assistant: ", output_text)
+        mask_group_count = len(
+            re.findall(r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", output_text[0])
+        )
 
         quant_ids = extract_mt_token_ids_v1(output_text[0])
         if len(quant_ids) == 0:
             zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
             zero_mask = mask_to_rle(zero_mask)[0]
-            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id}
+            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
             with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
                 json.dump(prediction, f)
@@ -392,7 +403,7 @@ def main():
         if len(quant_ids) % CODEBOOK_DEPTH != 0:
             zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
             zero_mask = mask_to_rle(zero_mask)[0]
-            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id}
+            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
             with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
                 json.dump(prediction, f)
@@ -428,7 +439,7 @@ def main():
             print(f"[task {args.task_id}] forward_with_codes failed on idx={item_idx}: {e}")
             zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
             zero_mask = mask_to_rle(zero_mask)[0]
-            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id}
+            prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
             with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
                 json.dump(prediction, f)
@@ -444,7 +455,7 @@ def main():
         except:
             pred_box = [0, 0, 0, 0]
         _pred_masks = mask_to_rle(_pred_masks)[0]
-        prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': pred_box, 'predicted_segmentation': _pred_masks, 'class_id': class_id}
+        prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': pred_box, 'predicted_segmentation': _pred_masks, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
         with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
             json.dump(prediction, f)
 

@@ -12,6 +12,8 @@ from .mask_iou import (
     compute_binary_iou,
     decode_mask_tokens,
     extract_mask_token,
+    extract_mask_tokens,
+    mask_group_metadata,
     mask_summary,
     parse_mask_codes,
 )
@@ -57,6 +59,8 @@ __all__ = [
     "compute_binary_iou",
     "decode_mask_tokens",
     "extract_mask_token",
+    "extract_mask_tokens",
+    "mask_group_metadata",
     "mask_summary",
     "parse_mask_codes",
     "regenerate_weight",

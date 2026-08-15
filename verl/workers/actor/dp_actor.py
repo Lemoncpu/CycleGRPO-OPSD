@@ -386,8 +386,13 @@ class DataParallelPPOActor(BasePPOActor):
         metrics["actor/grad_norm"] = grad_norm.detach().item()
         return metrics
 
-    def update_supervised(self, data: DataProto, grad_weight: float = 1.0) -> dict[str, Any]:
-        """Accumulate weighted teacher-forcing CE for regenerated captions."""
+    def update_supervised(
+        self,
+        data: DataProto,
+        grad_weight: float = 1.0,
+        metric_name: str = "opsd/regenerate_ce",
+    ) -> dict[str, Any]:
+        """Accumulate weighted teacher-forcing CE for an auxiliary target."""
         self.actor_module.train()
         select_keys = [
             "input_ids",
@@ -418,5 +423,5 @@ class DataParallelPPOActor(BasePPOActor):
             )
             scaled_loss.backward()
             local_loss = loss_numerator / response_mask.sum().clamp_min(1.0)
-            append_to_dict(metrics, {"opsd/regenerate_ce": local_loss.detach().item()})
+            append_to_dict(metrics, {metric_name: local_loss.detach().item()})
         return metrics

@@ -183,7 +183,9 @@ caption 写入独立 JSONL manifest，供后续 DLC QA 使用。
 hallucination QA；第二次 LLM 调用要求逐题验证显式文本蕴含、唯一正确项和无歧义干扰项。
 本地 schema 检查会拒绝不满足这些积分约定的输出。结果以可断点续跑的 JSONL 写出，保留
 caption、source、图像关联和生成模型元信息；可选额外导出与 DLC 无图 judge 兼容的 QA/class-name
-JSON 映射。DAM caption 仍不进入 actor prompt。
+JSON 映射。DAM caption 仍不进入 actor prompt。生成/验证 prompt 内的 JSON schema 使用 Python
+`str.format` 的转义字面花括号，只有 caption 与 candidate JSON 是格式化字段；这保证请求在发送至
+本地 LLM 前不会因 schema key 被误解析为 format field 而失败。
 
 RefCOCO 与 gRefCOCO 转换器把原始 expression 另存为 `grounding_query`；它与被混合器清空的
 `cap_answer` 严格分离。COCO-Stuff 转换器把官方 91 个 semantic-Stuff label 的原始 PNG 值
@@ -294,6 +296,8 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 2. 对视频描述去掉显式时间先验，避免模型直接复述时间戳。
 3. 调用 dataset 的 `_gen_seg_preprocess`，把 caption 注入 localization prompt。图像 caption index 按偶/奇在 RefCOCO/GRES 与 GroundingSuite 两个 benchmark 同构模板之间交替；`caption_text` 仍保存裸 student caption，供 CycleGRPO reward、OPSD 路由和 teacher 使用。
 4. 从 `worker.opsd.localization_rollouts` 读取 `K`，用当前 actor 为每条 caption 采样定位结果。
+   每条正例 localization rollout 的生成上限独立限制为 `32` token，防止尚未收敛的策略在首个
+   mask 后无界重复；这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 token。
 6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
@@ -314,6 +318,20 @@ GRPO。其 UID、优势和日志均独立；正例 direct anchor 用原始 RLE I
 与正确空响应冲突。该 batch 不调用 cycle 的 `R_Ci` 合并函数，因而不会改变 caption cycle 的低/中/高路由、teacher
 regenerate 或 JSD。
 
+`direct_grounding.loss_weight` 是目标权重，不直接以固定值累积。开启该 anchor 后，
+`direct_grounding.warmup_start_step=10` 前有效权重为零，`10..30` 之间线性升到目标值，
+`warmup_end_step=30` 后保持目标值；因此推荐受控实验的 `loss_weight=0.15` 不会在早期直接压过
+cycle localization。direct GRPO 仍按其单独 UID 的 `K=6` reward/advantage group 正规化，绝不能与 cycle
+caption 或 localization reward 拼接后共同 whiten。
+
+可选 `worker.supervised_anchors.direct_mask_ce` 是与 sampled direct GRPO 分开的 GT SAMTok
+teacher-forcing anchor。它只从 `refcoco_cycle`/`grefcoco_cycle` 的每个原始 UID 建立一条
+`grounding_query -> seg_answer` 正例，使用相同的两种 localization prompt 交替；不接收
+`gres_no_target`、COCO-Stuff/PACO label-template、rollout response、IoU 或 advantage。GT response
+由完整 mask-token group、EOS 和 padding 组成，但 CE loss mask 仅覆盖 GT mask tokens，EOS/padding
+只作为前向上下文。该项默认关闭，推荐开启时固定 `loss_weight=0.02`，并在同一 optimizer step 中独立
+累积，不通过 K 次 rollout 放大。
+
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
 ### 3.5 奖励
@@ -330,11 +348,17 @@ caption:
   R_cap_i = (non_repeat_i + 10*m_i) * valid_i + valid_i
   valid_i 同时检查没有 bbox/中文，且没有非终止 special token 或 mask_2d JSON；违规时正奖励被门控清零。
 
-localization:
-  R_loc_i,k = 10 * (s_i,k * m_i) + non_repeat_i,k + mask_format_i,k
+localization positive:
+  valid_single_i,k = 1 iff response has exactly one complete, codebook-valid depth-2 mask group
+  R_loc_i,k = valid_single_i,k * (10 * s_i,k * m_i + 2) - extra_mask_penalty * extra_group_count
 ```
 
-这与论文的 `R_cap_i=mean(s_i,k)`、`R_loc_i,k=R_cap_i*s_i,k` 对应，但代码额外乘 `10` 并加入格式/重复约束。
+在线 VQ-SAM2 解码保留首个合法 group，用于首 mask IoU 的诊断；当
+`pixel_iou.require_exactly_one_mask=true`（默认）时，多 group response 的训练 pixel IoU 置零，
+不再让第一个正确 mask 给后续重复 token 正优势。每一个额外完整 group 再减
+`pixel_iou.extra_mask_penalty=1.0`。这与论文的 `R_cap_i=mean(s_i,k)`、
+`R_loc_i,k=R_cap_i*s_i,k` 对应，但代码额外乘 `10`、加入格式约束，且新增了当前扩展的严格
+单 mask 序列化约束。
 
 `text2mask.py` 还保留多任务分支：
 
@@ -356,7 +380,8 @@ JSONL，并按 `dam_source_id` join Stuff/PACO caption rollout。独立 Llama ju
 选项；每条 rollout 对全部题目作答，`1/0/-1` 的均值乘 `reward_weight` 加到原 cycle caption reward。
 服务超时、请求失败或无唯一选项时该题贡献 `0`，不会中断训练，也不改变 `R_Ci` 或 OPSD routing。
 
-`supervised_grounding` 的 segmentation reward 是 `10 * pixel_iou + format + non_repeat`；
+`supervised_grounding` 的正例 segmentation reward 使用同一严格单 mask 合约：仅一个合法 group
+得到 `10 * pixel_iou + 2`，额外 group 按数量扣分；
 `supervised_grounding_no_target` 复用 `No target.` 拒识加非重复奖励。二者只出现在独立 batch。
 
 `tg_reward.py` 是可配置的 temporal grounding 奖励库，支持 tIoU、format、precision/recall/F1、C-Acc、caption judge 和长度惩罚；当前 `text2mask.py` 的主要视频路径只直接复用其中少量逻辑或保留了注释调用。
@@ -389,6 +414,7 @@ route-replacement: high GRPO + low CE + mid JSD
 B: safe 全部原始 GRPO + low CE + mid JSD
 辅助 CE/JSD 均按候选比例归一化，caption 侧再乘 caption_loss_weight=0.5
 全部 route 的 localization GRPO，再乘 localization_loss_weight=0.5
+可选 human-query anchor: lambda_direct(step) * direct GRPO + 0.02 * direct GT-mask CE
 clip grad norm -> one optimizer.step()
 optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` 时，更新为恒等映射，teacher
 保持 worker 初始化时从初始 SAMTok actor 复制的参数。
@@ -402,6 +428,13 @@ supervised anchor，保证 no-target 保留原始 CycleGRPO 外层 GRPO 和两�
 group，它会额外使用独立 `K=6` group；`consume_no_target_caption=true` 已由配置校验拒绝，避免 no-target 仅依赖
 direct rollout 而在同组正确拒识相同的情况下产生零 GRPO advantage。direct query 使用人工 expression 或类别模板，属于受控外部监督，不是 image-mask-only
 CycleGRPO 的核心奖励或纯 on-policy self-distillation。
+
+当同时开启两项 direct anchor 时，有效目标为
+`L_total=0.5*L_cycle_caption + 0.5*L_cycle_segmentation + lambda_direct(step)*L_direct_GRPO + 0.02*L_direct_mask_CE + existing auxiliary losses`。
+标量日志 `supervised_anchors/direct_loss_weight_{effective,target}`、
+`supervised_anchors/direct_mask_ce_{weight,samples,loss}` 必须与 direct single-mask/no-target reward
+指标共同检查。GT-mask CE 是原论文 CycleGRPO 之外的显式外部有监督消融，不能称为 image-mask-only
+cycle self-supervision。
 
 ## 4. SAMTok / VQ-SAM2 实现
 
@@ -453,8 +486,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `trainer/core_algos.py` | GAE、GRPO、RLOO、ReMax、REINFORCE++，PPO clip loss、KL/value loss |
 | `trainer/data_loader.py` | train/val `RLHFDataset` 和 sampler/DataLoader |
 | `trainer/metrics.py` | reward、length、timing、throughput 指标汇总 |
-| `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分 |
-| `workers/actor/dp_actor.py` | log-prob 前向、动态 micro-batch、PPO loss、独立 caption anchor KL、梯度累积和 optimizer step |
+| `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分，以及 regenerate/direct-mask CE 的独立梯度累积调用 |
+| `workers/actor/dp_actor.py` | log-prob 前向、动态 micro-batch、PPO loss、独立 caption anchor KL、命名的 teacher-forcing CE、梯度累积和 optimizer step |
 | `workers/critic/dp_critic.py` | GAE/PPO 可选 value model；GRPO 主配置通常不启用 critic |
 | `workers/rollout/vllm_rollout_spmd.py` | SPMD vLLM engine、采样参数、视觉输入和 response tensor 构造；caption task 动态以 logit bias 屏蔽 SAMTok/object-reference vocabulary |
 | `workers/sharding_manager/fsdp_vllm.py` | FSDP 参数与 vLLM engine 同步/offload |
@@ -463,7 +496,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 与 groundedness 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
 | `workers/opsd/groundedness.py` | teacher verifier JSON 的保守解析、claim/penalty 汇总，以及 optional token-span 对齐；解析不确定时 fail closed 为零辅助梯度 |
-| `workers/opsd/mask_iou.py` | 严格 token 解析、原始 GT 转换、批量 mask 解码、尺寸恢复和像素 IoU |
+| `workers/opsd/mask_iou.py` | 严格 token 解析、完整/合法 mask group 计数、原始 GT 转换、批量首 mask 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
@@ -558,8 +591,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 目录 | 文件职责 |
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；不依赖 Detectron2 或内部数据目录 |
-| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根 |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；生成遇到首个 `<|mt_end|>` 即终止，只解码首个完整合法 mask group，并保存 group 数用于格式诊断 |
+| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128、首个 `<|mt_end|>` 后终止，只解码首个完整合法 group，不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
 | `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt、192-token 上限和 caption-only special-token logits blocker，另写 `.stats.json` 记录 leak rate |
@@ -594,7 +627,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
-26. **多 mask 输出必须先做 first-mask 诊断。** 标准 RefCOCO evaluator 会解析 response 中全部完整 mask group 并对其 decoded masks 取 union。因此 response 出现多个 group 时，原始 cIoU/mIoU 混合了首个 text-to-mask 选择和后续序列化污染。`evaluation/refcoco/first_mask_diagnostic.py` 仅重解码已保存 response 的第一个完整、合法 depth-2 group，独立写出 first-mask predictions/metrics，绝不覆盖标准 evaluator 输出。它是诊断工具，不是官方 benchmark protocol；报告正式结果仍使用标准 union 指标。
+26. **正例 segmentation 必须恰好一个 mask group。** 当前 online reward 记录 `mask_group_count`、`valid_mask_group_count`、`exactly_one_mask_group`、`first_mask_pixel_iou` 和额外 group penalty。重复 group 的首 mask 诊断 IoU 可保留，但它不能贡献 CycleGRPO 或 direct positive reward。训练日志必须检查 `opsd/seg_exactly_one_mask_rate`、`opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 和 direct 对应指标；未恢复接近单 group 前不得解释分割基准的速度/质量变化。离线 RefCOCO/GRES/GroundingSuite 统一在首个完整合法 group 后停止并只解码它，形成新的正式协议；历史 union 输出不能直接和该协议的结果比较。`evaluation/refcoco/first_mask_diagnostic.py` 仍可用于已保存旧 response 的无重新生成诊断。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1125,3 +1158,26 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.1、5.6、关键注意事项 26 和本日志。
 - 行为：诊断工具读取已有 RefCOCO 逐样本 response/GT JSON，只提取第一个完整且 codebook 合法的 SAMTok depth-2 mask group，以 VQ-SAM2 重新解码为独立目录的 mask，再输出 cIoU/mIoU、首 mask 缺失数。它不重新生成 VLM response、不修改原 union-mask prediction 或正式 benchmark 指标，可直接量化后续多 mask group 对当前 direct run 分割结果的污染。`--metric-only` 只需要 `--output-dir`；输入 response、RefCOCO 标注和 VQ-SAM2 路径只在重解码分片时校验。
 - 验证：`python3 -m py_compile evaluation/refcoco/first_mask_diagnostic.py tests/test_first_mask_diagnostic.py`、`python3 -m unittest tests.test_first_mask_diagnostic`（4 tests）、`bash -n evaluation/refcoco/run_first_mask_diagnostic_multigpu.sh` 和 `git diff --check` 均通过；本机无 NumPy，未能执行依赖 pycocotools/NumPy 的 metric-only runtime，服务器项目环境需各运行 current-direct 与旧 C2 的 8-GPU re-decode 后比较 metrics。
+
+### 2026-08-12 - 强制正例 segmentation 的单 mask 序列化并统一首 mask 评测
+
+- 代码：修改 `verl/workers/opsd/mask_iou.py`、`verl/workers/opsd/config.py`、`verl/workers/opsd/__init__.py`、`verl/workers/fsdp_workers.py`、`verl/workers/reward/function.py`、`verl/trainer/ray_trainer.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、RefCOCO/GRES/GroundingSuite 评测脚本；扩展 `tests/test_opsd_core.py`。
+- 文档：更新第 3.4、3.5、5.2、5.6、关键注意事项 26 和本日志。
+- 行为：正例 cycle localization 与 `supervised_grounding` 现在要求 response 含恰好一个完整、codebook 合法的 SAMTok depth-2 group。online VQ-SAM2 仍解码首个合法 group 以记录 `first_mask_pixel_iou`，但若 group 数不是一，训练 IoU 为零、format/non-repeat 正项为零，并按额外完整 group 数施加 `-1.0` penalty；`supervised_grounding_no_target` 继续使用未改变的 `No target.` 零 mask 拒识 reward。新增 group-count metadata 和 cycle/direct one-mask/multi-mask 日志。为避免早期重复循环耗尽 rollout token，正例 localization 独立限制为 32 tokens。离线 RefCOCO/GRES/GroundingSuite 生成在第一个 `<|mt_end|>` 停止，只解码第一个完整合法 group；GroundingSuite 上限由 512 降为 128 且不再打印每条 response。新旧 checkpoint 必须在这一首 mask 协议下重新生成，不能与历史 union-mask 数值直接混比。
+- 论文边界：原始 CycleGRPO 只奖励存在的 mask-token 格式；本修改是针对 direct-grounding 高权重训练触发的重复同一 code group 循环的格式稳定化扩展，不改变 `G=6`、`K=6`、多实例 union GT、pixel-IoU 定义或 no-target 两项 reward。
+- 验证：本机 `python3 -m py_compile` 覆盖全部修改 Python 文件，`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 通过。新增 unit test 覆盖单 group 正分、三次重复 group 的零 IoU/`-2` penalty 和首合法 code 保留；本机缺少 PyTorch、Hydra、vLLM、CUDA 与项目 Conda 环境，`tests.test_opsd_core` 和评测 parser runtime 必须在服务器 `$ENV_DIR/bin/python3` 运行，尚未执行 8-GPU smoke training。
+
+### 2026-08-12 - 受控融合 CycleGRPO、direct GRPO 与 GT-mask CE
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/workers/config.py`、`verl/trainer/ray_trainer.py`、`verl/workers/fsdp_workers.py`、`verl/workers/actor/dp_actor.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4、3.5、3.6、5.2 节和本日志。
+- 行为：direct GRPO 的 `loss_weight` 现在是目标权重；默认 step `<=10` 为零、`11..29` 线性升高、step `>=30` 到达目标。新增默认关闭的 `direct_mask_ce`，仅从 RefCOCO/gRefCOCO 人工正 referring expression 的每个原始 UID 建立一条 query-to-GT-SAMTok teacher-forcing 样本；GRES no-target、Stuff/PACO label template 与 direct rollout response 不进入 CE。GT mask token 参与 CE，EOS 与 padding 只参与前向上下文且 loss mask 为零。两项 direct 梯度与现有 caption GRPO、localization GRPO、regenerate CE、JSD/KL 在同一次 optimizer step 累积；direct GRPO 的 UID/advantage group 不变。新增 effective/target direct 权重、direct CE 权重、样本数与独立 CE loss 日志。
+- 论文边界：`lambda_direct(step)*L_direct_GRPO + 0.02*L_direct_mask_CE` 是当前 image-mask-only CycleGRPO 之外的外部人工 referring-expression 监督消融；它不修改 cycle `R_Ci`、三路由、pixel-IoU 定义或原有 no-target 两项 reward。
+- 验证：本机 `python3 -m py_compile` 覆盖 anchor/config/trainer/FSDP/actor，`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`python3 -m unittest tests.test_supervised_anchors`（13 tests）和 `git diff --check` 通过。本机缺少 PyTorch/Hydra/Ray/vLLM/CUDA，尚未运行完整 `tests.test_opsd_core` 或 8-GPU 20-step smoke training；服务器需确认 step 10/30 weight、CE sample count、single-mask rate、no-target reward 和 RefCOCO 首 mask指标。
+
+### 2026-08-15 - 修复 DAM QA prompt 的 JSON schema 格式化
+
+- 代码：修改 `projects/rl/datasets/generate_dam_caption_qa.py` 和 `tests/test_dam_caption_qa.py`。
+- 文档：更新第 2.4 节 DAM QA prompt 渲染契约并追加本日志。
+- 行为：生成与 LLM 验证 prompt 的字面 JSON 花括号现在以 `str.format` 规则转义，只有 `{caption}` 和 `{candidate_json}` 保留为格式化字段。此前 schema 内的 `"class_name"` 会在请求发送前触发 `KeyError`，导致全部 QA 记录在本地重试后进入 rejected JSONL；QA schema、判定规则、source 配额和训练 reward 均未改变。
+- 验证：`python3 -m py_compile projects/rl/datasets/generate_dam_caption_qa.py tests/test_dam_caption_qa.py`、`python3 -m unittest tests.test_dam_caption_qa` 和 `git diff --check`。

@@ -15,7 +15,7 @@ from pycocotools import mask as mask_utils
 from pycocoevalcap.cider.cider import Cider
 from torchvision.transforms.functional import to_pil_image
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
-from verl.workers.opsd import caption_safety_reason, groundedness_penalty
+from verl.workers.opsd import caption_safety_reason, groundedness_penalty, mask_group_metadata
 
 _MODEL_CACHE = {'vq_sam2': None, 'sam2_image_processor': None}
 
@@ -908,6 +908,43 @@ def non_repeat_reward(predict_str: str) -> float:
             break
     return non_repeat_reward
 
+
+def single_mask_reward_terms(reward_input: dict[str, Any]) -> tuple[float, float, float, int, int]:
+    """Return strict positive-localization reward terms for one rollout.
+
+    A positive segmentation response has exactly one legal SAMTok group.  The
+    first mask remains the pixel-IoU diagnostic, but any additional complete
+    group makes the response invalid and receives a negative per-group penalty.
+    """
+    response = reward_input["response"]
+    metadata = mask_group_metadata(response)
+    group_count = int(
+        reward_input.get("mask_group_count")
+        if reward_input.get("mask_group_count") is not None
+        else metadata["complete_group_count"]
+    )
+    valid_count = int(
+        reward_input.get("valid_mask_group_count")
+        if reward_input.get("valid_mask_group_count") is not None
+        else metadata["valid_group_count"]
+    )
+    exactly_one = bool(
+        reward_input.get("exactly_one_mask_group")
+        if reward_input.get("exactly_one_mask_group") is not None
+        else metadata["exactly_one_valid_group"]
+    )
+    extra_count = int(
+        reward_input.get("extra_mask_group_count")
+        if reward_input.get("extra_mask_group_count") is not None
+        else max(group_count - 1, 0)
+    )
+    require_exactly_one = bool(reward_input.get("require_exactly_one_mask", True))
+    if not require_exactly_one:
+        exactly_one = valid_count > 0
+        extra_count = 0
+    penalty = float(reward_input.get("extra_mask_penalty", 1.0) or 0.0) * extra_count
+    return float(exactly_one), -penalty, float(exactly_one), group_count, valid_count
+
 def psg_non_repeat_reward(text_triplets: list[str]):
     if len(text_triplets) == 0:
         return 1.0
@@ -1332,14 +1369,18 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
         for reward_input in reward_inputs:
             source = reward_input["source"]
             if source == "supervised_grounding":
-                iou_score = float(reward_input["iou_scores"] or 0.0)
-                format_score = float(bool(re.search(r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", reward_input["response"])))
-                no_repeat_score = non_repeat_reward(reward_input["response"])
+                valid_single, extra_penalty, format_score, group_count, valid_count = single_mask_reward_terms(reward_input)
+                iou_score = float(reward_input["iou_scores"] or 0.0) * valid_single
+                no_repeat_score = valid_single
                 scores.append({
-                    "seg_overall": 10 * iou_score + format_score + no_repeat_score,
+                    "seg_overall": 10 * iou_score + format_score + no_repeat_score + extra_penalty,
                     "seg_supervised_grounding_iou": iou_score,
                     "seg_format": format_score,
                     "seg_no_repeat_score": no_repeat_score,
+                    "seg_mask_group_count": group_count,
+                    "seg_valid_mask_group_count": valid_count,
+                    "seg_exactly_one_mask_group": valid_single,
+                    "seg_extra_mask_group_penalty": extra_penalty,
                 })
                 continue
             if source == "supervised_grounding_no_target":
@@ -1387,21 +1428,23 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'dam_cyclegrpo', None] or source is None:
                 # format_score = format_reward(reward_input["response"])
                 # _, answer_content = extract_think_and_answer_robust(reward_input["response"])
-                iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"]
-                # think_content_no_repeat_score = non_repeat_reward(think_content)
-                
-                answer_content_no_repeat_score = non_repeat_reward(reward_input["response"])
-                mask_token_format_correct = mask_token_format_reward(reward_input["response"])
+                valid_single, extra_penalty, mask_token_format_correct, group_count, valid_count = single_mask_reward_terms(reward_input)
+                iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"] * valid_single
+                answer_content_no_repeat_score = valid_single
                 
                 # answer_content_no_repeat_score = non_repeat_reward(reward_input["response"])
                 # mask_token_format_correct = bbox_format_reward(reward_input["response"])
                 scores.append(
                     {
-                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct,
+                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct + extra_penalty,
                         # "seg_format": format_score,
                         "seg_iou_scores": iou_score,
                         "seg_answer_content_no_repeat_score": answer_content_no_repeat_score,
                         "seg_mask_token_format_correct": mask_token_format_correct,
+                        "seg_mask_group_count": group_count,
+                        "seg_valid_mask_group_count": valid_count,
+                        "seg_exactly_one_mask_group": valid_single,
+                        "seg_extra_mask_group_penalty": extra_penalty,
                     }
                 )
             else: 
