@@ -1,7 +1,7 @@
 """Configuration for external rewards that do not alter CycleGRPO routing."""
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 def direct_grounding_source(
@@ -60,6 +60,11 @@ def direct_grounding_loss_weight(
 def direct_mask_ce_source(source: object, include_positive_sources: bool = True) -> bool:
     """GT mask CE is deliberately restricted to human positive expressions."""
     return bool(include_positive_sources and source in {"refcoco_cycle", "grefcoco_cycle"})
+
+
+def non_tensor_batch_row(values: Any, index: int) -> Any:
+    """Select a row before DataProto indexing can collapse an object array."""
+    return values[index]
 
 
 def direct_mask_ce_response_fields(

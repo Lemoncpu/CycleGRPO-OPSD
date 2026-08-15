@@ -21,6 +21,7 @@ direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
 direct_mask_ce_response_fields = _CONFIG_MODULE.direct_mask_ce_response_fields
 direct_mask_ce_source = _CONFIG_MODULE.direct_mask_ce_source
 direct_grounding_source = _CONFIG_MODULE.direct_grounding_source
+non_tensor_batch_row = _CONFIG_MODULE.non_tensor_batch_row
 
 
 class SupervisedAnchorsTest(unittest.TestCase):
@@ -74,6 +75,10 @@ class SupervisedAnchorsTest(unittest.TestCase):
         self.assertEqual(responses, [[11, 12, 2], [21, 2, 0]])
         self.assertEqual(loss_masks, [[1, 1, 0], [1, 0, 0]])
         self.assertEqual(attention_masks, [[1, 1, 1], [1, 1, 0]])
+
+    def test_direct_mask_ce_keeps_non_tensor_batch_axis_for_media(self):
+        media_rows = [{"images": ["first.jpg"]}, {"images": ["second.jpg"]}]
+        self.assertEqual(non_tensor_batch_row(media_rows, 1), {"images": ["second.jpg"]})
 
     def test_direct_grounding_keeps_no_target_out_of_cycle_sources(self):
         self.assertEqual(direct_grounding_source("refcoco_cycle", True), "supervised_grounding")

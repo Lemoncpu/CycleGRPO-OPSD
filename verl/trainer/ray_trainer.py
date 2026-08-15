@@ -66,6 +66,7 @@ from ..workers.supervised_anchors import (
     direct_mask_ce_response_fields,
     direct_mask_ce_source,
     direct_grounding_source,
+    non_tensor_batch_row,
 )
 from .config import PPOConfig
 from .core_algos import (
@@ -980,17 +981,27 @@ class RayPPOTrainer:
         prompt_records = []
         target_ids = []
         selected_uids = []
+        prompt_variants = alternating_localization_prompt_variants(len(indices))
         for output_index, parent_index in enumerate(indices):
-            parent = cycle_batch[parent_index]
-            seg_media = parent.non_tensor_batch["seg_multi_modal_data"][0]
-            cap_media = parent.non_tensor_batch["multi_modal_data"][0]
+            # DataProto[parent_index] unwraps an object-array row to its dict.
+            # Select from the parent batch so list/array indexing remains valid.
+            seg_media = non_tensor_batch_row(
+                cycle_batch.non_tensor_batch["seg_multi_modal_data"], parent_index
+            )
+            cap_media = non_tensor_batch_row(
+                cycle_batch.non_tensor_batch["multi_modal_data"], parent_index
+            )
             example = {
                 "seg_problem": queries[output_index],
-                "localization_prompt_variant": alternating_localization_prompt_variants(len(indices))[output_index],
-                "seg_ground_truth": parent.non_tensor_batch["seg_ground_truth"][0],
+                "localization_prompt_variant": prompt_variants[output_index],
+                "seg_ground_truth": non_tensor_batch_row(
+                    cycle_batch.non_tensor_batch["seg_ground_truth"], parent_index
+                ),
                 "source": "supervised_grounding",
-                "masks": parent.non_tensor_batch["masks"][0],
-                "cap_ground_truth": parent.non_tensor_batch["cap_ground_truth"][0],
+                "masks": non_tensor_batch_row(cycle_batch.non_tensor_batch["masks"], parent_index),
+                "cap_ground_truth": non_tensor_batch_row(
+                    cycle_batch.non_tensor_batch["cap_ground_truth"], parent_index
+                ),
             }
             if "images" in seg_media:
                 example["images"] = seg_media["images"]

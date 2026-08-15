@@ -329,8 +329,9 @@ teacher-forcing anchor。它只从 `refcoco_cycle`/`grefcoco_cycle` 的每个原
 `grounding_query -> seg_answer` 正例，使用相同的两种 localization prompt 交替；不接收
 `gres_no_target`、COCO-Stuff/PACO label-template、rollout response、IoU 或 advantage。GT response
 由完整 mask-token group、EOS 和 padding 组成，但 CE loss mask 仅覆盖 GT mask tokens，EOS/padding
-只作为前向上下文。该项默认关闭，推荐开启时固定 `loss_weight=0.02`，并在同一 optimizer step 中独立
-累积，不通过 K 次 rollout 放大。
+只作为前向上下文。构造该 batch 时必须从保留 batch 维度的 non-tensor object array 取每个 parent 的图像
+metadata、GT 和 mask；不得先以 `DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定
+`loss_weight=0.02`，并在同一 optimizer step 中独立累积，不通过 K 次 rollout 放大。
 
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
@@ -1181,3 +1182,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.4 节 DAM QA prompt 渲染契约并追加本日志。
 - 行为：生成与 LLM 验证 prompt 的字面 JSON 花括号现在以 `str.format` 规则转义，只有 `{caption}` 和 `{candidate_json}` 保留为格式化字段。此前 schema 内的 `"class_name"` 会在请求发送前触发 `KeyError`，导致全部 QA 记录在本地重试后进入 rejected JSONL；QA schema、判定规则、source 配额和训练 reward 均未改变。
 - 验证：`python3 -m py_compile projects/rl/datasets/generate_dam_caption_qa.py tests/test_dam_caption_qa.py`、`python3 -m unittest tests.test_dam_caption_qa` 和 `git diff --check`。
+
+### 2026-08-15 - 修复 direct GT-mask CE 的 non-tensor media 索引
+
+- 代码：修改 `verl/trainer/ray_trainer.py`、`verl/workers/supervised_anchors.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4 节 direct GT-mask CE 的 DataProto non-tensor 取值契约并追加本日志。
+- 行为：direct mask CE 现在在原始 cycle batch 的 object array 上按 parent index 选择图像 media、GT mask、RLE 和 caption metadata。此前先执行 `DataProto[parent_index]` 会把 media row 解包为字典，代码随后对该字典执行 `[0]` 而在首个 CE batch 触发 `KeyError: 0`。CE source 筛选、target token、loss mask、权重和主 CycleGRPO/direct GRPO 均未改变。
+- 验证：`python3 -m py_compile verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、`python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。
