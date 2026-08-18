@@ -1189,3 +1189,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.4 节 direct GT-mask CE 的 DataProto non-tensor 取值契约并追加本日志。
 - 行为：direct mask CE 现在在原始 cycle batch 的 object array 上按 parent index 选择图像 media、GT mask、RLE 和 caption metadata。此前先执行 `DataProto[parent_index]` 会把 media row 解包为字典，代码随后对该字典执行 `[0]` 而在首个 CE batch 触发 `KeyError: 0`。CE source 筛选、target token、loss mask、权重和主 CycleGRPO/direct GRPO 均未改变。
 - 验证：`python3 -m py_compile verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、`python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。
+
+### 2026-08-18 - 重写 README 的环境、数据、权重与运行手册
+
+- 代码：修改 `README.md`；不修改训练、评测、数据转换或奖励逻辑。
+- 文档：README 现在以当前受维护的火山引擎训练入口和统一 FSDP 导出/评测入口为主，覆盖 CUDA/Python/vLLM 环境 profile、SAMTok/VQ-SAM2 文件契约、RefCOCO/gRefCOCO/Stuff/PACO/DAM/GroundingSuite/DLC 数据边界、公开 COCO/COCO-Stuff/RefCOCO/PACO-LVIS 的可恢复下载与目录整理命令、Parquet 导出、25k 混合、direct/CE、DAM QA、resume、导出和四项评测命令。监督章节现位于 checkpoint 导出和评测之前；direct 段新增完整 RefCOCO train（42,404 条）Parquet 导出命令，可作为直接 GRPO/GT-mask CE 专项训练输入。HF checkpoint 下载改为当前激活环境的 `snapshot_download`，RefCOCO expression 文件通过 `find` 适配官方压缩包的不同层级；DLC judge 改为直接 `vllm serve`，避免历史脚本忽略用户模型路径；direct 样例补齐独立运行所需的 GPU/model/data/run 变量，QA 片段明确为完整训练命令的附加变量。gRefCOCO、DAM、GroundingSuite 与 DLC 仅列出官方发布入口和目标目录，避免对可能受限或变动的第三方发布 URL 作出不可靠承诺。
+- 行为：用户不再被旧通用脚本的占位符或“FSDP shard 可直接评测”的错误假设误导；README 明确当前外部有监督扩展与原始 image-mask-only CycleGRPO 的边界。文档中的服务器手动命令不使用 fail-fast shell 选项，以保留终端 traceback。
+- 验证：逐段核对 README 的 bash block、变量名、数据源、转换器参数、训练/eval action 与 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`projects/eval/qwen3vl_4b_volcengine.sh`、`projects/rl/datasets/*`、`evaluation/dlc_bench/serve_judge.sh`，并执行 `git diff --check`。
