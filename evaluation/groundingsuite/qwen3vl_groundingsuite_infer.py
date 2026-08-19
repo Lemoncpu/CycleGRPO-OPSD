@@ -22,6 +22,10 @@ from torchvision.transforms.functional import to_pil_image
 
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 
+CODEBOOK_SIZE = 256
+CODEBOOK_DEPTH = 2
+
+
 class DirectResize:
     def __init__(self, target_length: int) -> None:
         self.target_length = target_length
@@ -277,9 +281,7 @@ def main():
 
     processor = AutoProcessor.from_pretrained(args.model_path)
 
-    # build vq-sam2 model
-    CODEBOOK_SIZE = 256
-    CODEBOOK_DEPTH = 2
+    # Build VQ-SAM2 with the same codebook contract used by token parsing.
     with hydra.initialize(version_base=None, config_path='../../projects/transformers/vq_sam2/sam2/sam2_configs'):
         sam2_config = SAM2Config(
             cfg_path="sam2.1_hiera_l.yaml",

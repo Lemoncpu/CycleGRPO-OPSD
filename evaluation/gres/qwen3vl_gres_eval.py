@@ -29,6 +29,9 @@ from evaluation.gres.subset_metrics import (
     two_instance_diagnostic_sample,
 )
 
+CODEBOOK_SIZE = 256
+CODEBOOK_DEPTH = 2
+
 
 class DirectResize:
     def __init__(self, target_length: int) -> None:
@@ -596,9 +599,7 @@ def main():
 
     processor = AutoProcessor.from_pretrained(args.model_path)
 
-    # build vq-sam2 model
-    CODEBOOK_SIZE = 256
-    CODEBOOK_DEPTH = 2
+    # Build VQ-SAM2 with the same codebook contract used by token parsing.
     config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../projects/transformers/vq_sam2/sam2/sam2_configs"))
     with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
         sam2_config = SAM2Config(

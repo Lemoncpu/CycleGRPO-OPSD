@@ -591,7 +591,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；生成遇到首个 `<|mt_end|>` 即终止，只解码首个完整合法 mask group，并保存 group 数用于格式诊断。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；VQ-SAM2 解码和逐样本 JSON 写出保持原语义 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128、首个 `<|mt_end|>` 后终止，只解码首个完整合法 group，不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
@@ -1203,3 +1203,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.6 节 RefCOCO 评测职责。
 - 行为：RefCOCO 每个 GPU 不再逐条调用 Qwen3-VL `generate`；待评测样本按 `--batch_size` 组成多图多文本 batch，统一 padding 后执行 generation，再按原有逐样本路径解码首个合法 mask group、恢复原尺寸并写 JSON。launcher 从 `EVAL_BATCH_SIZE` 读取每卡 batch size，默认 16。已有 JSON 仍会跳过，指标格式、mask 解析和 VQ-SAM2 解码语义不变。H20 可先显式设为 32；OOM 时降低为 24 或 16。
 - 验证：`python3 -m py_compile evaluation/refcoco/qwen3vl_refcoco_eval.py`、`bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 和 `git diff --check` 通过。本机没有 Qwen3-VL/SAMTok、CUDA、RefCOCO 数据或 H20，尚未执行多图 processor/generation 的端到端 smoke test；服务器应先以一个 shard 和 `EVAL_BATCH_SIZE=16` 验证输出数与单样本协议一致，再提高 batch size。
+
+### 2026-08-19 - 修复 GRES 与 GroundingSuite 首 mask 解析的 codebook 作用域
+
+- 代码：修改 `evaluation/gres/qwen3vl_gres_eval.py` 与 `evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`。
+- 文档：更新第 5.6 节 GRES 评测职责并追加本日志。
+- 行为：将 `CODEBOOK_SIZE=256` 和 `CODEBOOK_DEPTH=2` 设为模块级常量，供首个 depth-2 SAMTok mask group 的合法性检查和 VQ-SAM2 构造共同使用，移除两个 `main()` 中遮蔽同名常量的局部声明。此前 GRES 的 `extract_mt_token_ids_v1()` 在模型首次返回完整 mask group 时引用未定义的局部作用域常量并触发 `NameError`，导致各 shard 退出；GroundingSuite 存在相同潜在错误。结果文件的恢复/跳过协议、首 mask 语义与指标计算均不变。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/gres/qwen3vl_gres_eval.py evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`、GRES 与 GroundingSuite launcher 的 `bash -n`、以及 `git diff --check` 通过；本机没有 H20、模型和评测数据，服务器需以保留的 case JSON 续跑 GRES 来完成端到端验证。
