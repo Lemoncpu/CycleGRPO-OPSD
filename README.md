@@ -183,7 +183,7 @@ MODEL_PATH=$BASE_DIR/Qwen3-VL-4B-SAMTok
 |---|---|---|
 | RefCOCO | `instances.json`, `refs(unc).p`, COCO `train2014/` | single-instance cycle data; RefCOCO evaluation |
 | gRefCOCO | `instances.json`, `grefs(unc).json`, COCO `train2014/` | multi-instance union masks, no-target training, GRES evaluation |
-| COCO-Stuff | `stuffthingmaps_trainval2017/train2017/`, COCO `train2017/` | semantic Stuff masks |
+| COCO-Stuff | `train2017/`, COCO `train2017/` | semantic Stuff masks |
 | PACO-LVIS | `paco_lvis_v1_train.json`, COCO/PACO `train2017/` | parent-conditioned visible-part union masks |
 | Describe Anything (optional) | DAM `COCOStuff` and `PACO` annotation JSON plus images | DAM captions and DLC-QA sidecar |
 | GroundingSuite | `GroundingSuite-Eval.jsonl` and released assets | GroundingSuite evaluation only |
@@ -218,8 +218,8 @@ mkdir -p "$BASE_DIR/coco2017"
 wget -c -P "$DOWNLOAD_DIR" http://images.cocodataset.org/zips/train2017.zip
 unzip -n "$DOWNLOAD_DIR/train2017.zip" -d "$BASE_DIR/coco2017"
 
-# COCO-Stuff semantic masks. This expands to
-# COCO-Stuff/stuffthingmaps_trainval2017/train2017/.
+# COCO-Stuff semantic masks. The official archive expands directly to
+# COCO-Stuff/train2017/ and COCO-Stuff/val2017/.
 mkdir -p "$BASE_DIR/COCO-Stuff"
 wget -c -P "$DOWNLOAD_DIR" http://calvin.inf.ed.ac.uk/wp-content/uploads/data/cocostuffdataset/stuffthingmaps_trainval2017.zip
 unzip -n "$DOWNLOAD_DIR/stuffthingmaps_trainval2017.zip" -d "$BASE_DIR/COCO-Stuff"
@@ -227,8 +227,8 @@ unzip -n "$DOWNLOAD_DIR/stuffthingmaps_trainval2017.zip" -d "$BASE_DIR/COCO-Stuf
 # PACO-LVIS v1 annotation. PACO reuses COCO 2017 images, so expose the
 # existing train split at the path used by the converter.
 mkdir -p "$BASE_DIR/PACO-LVIS/annotations" "$BASE_DIR/PACO-LVIS/images"
-wget -c -P "$DOWNLOAD_DIR" https://dl.fbaipublicfiles.com/paco/paco_lvis_v1_train.json.zip
-unzip -n "$DOWNLOAD_DIR/paco_lvis_v1_train.json.zip" -d "$BASE_DIR/PACO-LVIS/annotations"
+wget -c -P "$DOWNLOAD_DIR" https://dl.fbaipublicfiles.com/paco/paco_lvis_v1.zip
+unzip -n "$DOWNLOAD_DIR/paco_lvis_v1.zip" -d "$BASE_DIR/PACO-LVIS/annotations"
 ln -s "$BASE_DIR/coco2017/train2017" "$BASE_DIR/PACO-LVIS/images/train2017"
 ```
 
@@ -320,8 +320,8 @@ references are valid.
 # gRefCOCO: 6,250 true multi-instance positives + 2,500 no-target expressions.
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" projects/rl/datasets/prepare_grefcoco_cycle_dataset.py --instances "$BASE_DIR/gRefCOCO/instances.json" --grefs "$BASE_DIR/gRefCOCO/grefs(unc).json" --images-dir "$BASE_DIR/refcoco-train2014-assets/train2014" --output-dir "$BASE_DIR/datasets/grefcoco_8750" --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" --positive-samples 6250 --no-target-samples 2500 --single-fraction 0.0 --seed 20260815 --device cuda
 
-# COCO-Stuff: choose the actual stuffthingmaps_trainval2017/train2017 location.
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" projects/rl/datasets/prepare_cocostuff_cycle_dataset.py --masks-dir "$BASE_DIR/COCO-Stuff/stuffthingmaps_trainval2017/train2017" --images-dir "$BASE_DIR/coco2017/train2017" --output "$BASE_DIR/datasets/cocostuff_5k.parquet" --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" --max-samples 5000 --seed 20260815 --device cuda
+# COCO-Stuff: official semantic PNG masks are in COCO-Stuff/train2017.
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" projects/rl/datasets/prepare_cocostuff_cycle_dataset.py --masks-dir "$BASE_DIR/COCO-Stuff/train2017" --images-dir "$BASE_DIR/coco2017/train2017" --output "$BASE_DIR/datasets/cocostuff_5k.parquet" --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" --max-samples 5000 --seed 20260815 --device cuda
 
 # PACO-LVIS: use actual PACO annotation and image paths.
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" projects/rl/datasets/prepare_paco_lvis_part_cycle_dataset.py --annotations "$BASE_DIR/PACO-LVIS/annotations/paco_lvis_v1_train.json" --images-dir "$BASE_DIR/PACO-LVIS/images/train2017" --output "$BASE_DIR/datasets/paco_part_2500.parquet" --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" --max-samples 2500 --seed 20260815 --device cuda
@@ -552,9 +552,10 @@ CHECKPOINT_PATH="$CKPT" HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" \
 TRAIN_MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" NUM_GPUS=8 \
 bash "$EVAL_SCRIPT" export
 
-# RefCOCO val cIoU/mIoU.
+# RefCOCO val cIoU/mIoU. The H20 recipe starts at 16 images per GPU; raise to
+# 24 or 32 only after one successful run confirms the available headroom.
 HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" REFCOCO_SPLIT=val NUM_GPUS=8 \
+REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" REFCOCO_SPLIT=val NUM_GPUS=8 EVAL_BATCH_SIZE=16 \
 bash "$EVAL_SCRIPT" refcoco
 
 # GroundingSuite mask GIoU.

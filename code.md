@@ -592,7 +592,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 目录 | 文件职责 |
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；生成遇到首个 `<|mt_end|>` 即终止，只解码首个完整合法 mask group，并保存 group 数用于格式诊断 |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；生成遇到首个 `<|mt_end|>` 即终止，只解码首个完整合法 mask group，并保存 group 数用于格式诊断。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；VQ-SAM2 解码和逐样本 JSON 写出保持原语义 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128、首个 `<|mt_end|>` 后终止，只解码首个完整合法 group，不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
@@ -1193,6 +1193,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 ### 2026-08-18 - 重写 README 的环境、数据、权重与运行手册
 
 - 代码：修改 `README.md`；不修改训练、评测、数据转换或奖励逻辑。
-- 文档：README 现在以当前受维护的火山引擎训练入口和统一 FSDP 导出/评测入口为主，覆盖 CUDA/Python/vLLM 环境 profile、SAMTok/VQ-SAM2 文件契约、RefCOCO/gRefCOCO/Stuff/PACO/DAM/GroundingSuite/DLC 数据边界、公开 COCO/COCO-Stuff/RefCOCO/PACO-LVIS 的可恢复下载与目录整理命令、Parquet 导出、25k 混合、direct/CE、DAM QA、resume、导出和四项评测命令。监督章节现位于 checkpoint 导出和评测之前；direct 段新增完整 RefCOCO train（42,404 条）Parquet 导出命令，可作为直接 GRPO/GT-mask CE 专项训练输入。HF checkpoint 下载改为当前激活环境的 `snapshot_download`，RefCOCO expression 文件通过 `find` 适配官方压缩包的不同层级；DLC judge 改为直接 `vllm serve`，避免历史脚本忽略用户模型路径；direct 样例补齐独立运行所需的 GPU/model/data/run 变量，QA 片段明确为完整训练命令的附加变量。gRefCOCO、DAM、GroundingSuite 与 DLC 仅列出官方发布入口和目标目录，避免对可能受限或变动的第三方发布 URL 作出不可靠承诺。
+- 文档：README 现在以当前受维护的火山引擎训练入口和统一 FSDP 导出/评测入口为主，覆盖 CUDA/Python/vLLM 环境 profile、SAMTok/VQ-SAM2 文件契约、RefCOCO/gRefCOCO/Stuff/PACO/DAM/GroundingSuite/DLC 数据边界、公开 COCO/COCO-Stuff/RefCOCO/PACO-LVIS 的可恢复下载与目录整理命令、Parquet 导出、25k 混合、direct/CE、DAM QA、resume、导出和四项评测命令。监督章节现位于 checkpoint 导出和评测之前；direct 段新增完整 RefCOCO train（42,404 条）Parquet 导出命令，可作为直接 GRPO/GT-mask CE 专项训练输入。根据新服务器的实际解压结果，COCO-Stuff 路径更正为官方 archive 直接生成的 `COCO-Stuff/train2017`，PACO 下载更正为完整官方 `paco_lvis_v1.zip`。HF checkpoint 下载改为当前激活环境的 `snapshot_download`，RefCOCO expression 文件通过 `find` 适配官方压缩包的不同层级；DLC judge 改为直接 `vllm serve`，避免历史脚本忽略用户模型路径；direct 样例补齐独立运行所需的 GPU/model/data/run 变量，QA 片段明确为完整训练命令的附加变量。gRefCOCO、DAM、GroundingSuite 与 DLC 仅列出官方发布入口和目标目录，避免对可能受限或变动的第三方发布 URL 作出不可靠承诺。
 - 行为：用户不再被旧通用脚本的占位符或“FSDP shard 可直接评测”的错误假设误导；README 明确当前外部有监督扩展与原始 image-mask-only CycleGRPO 的边界。文档中的服务器手动命令不使用 fail-fast shell 选项，以保留终端 traceback。
 - 验证：逐段核对 README 的 bash block、变量名、数据源、转换器参数、训练/eval action 与 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`projects/eval/qwen3vl_4b_volcengine.sh`、`projects/rl/datasets/*`、`evaluation/dlc_bench/serve_judge.sh`，并执行 `git diff --check`。
+
+### 2026-08-19 - 批量化 RefCOCO 离线生成
+
+- 代码：修改 `evaluation/refcoco/qwen3vl_refcoco_eval.py`、`evaluation/refcoco/run_refcoco_multigpu.sh` 与 `README.md`。
+- 文档：更新第 5.6 节 RefCOCO 评测职责。
+- 行为：RefCOCO 每个 GPU 不再逐条调用 Qwen3-VL `generate`；待评测样本按 `--batch_size` 组成多图多文本 batch，统一 padding 后执行 generation，再按原有逐样本路径解码首个合法 mask group、恢复原尺寸并写 JSON。launcher 从 `EVAL_BATCH_SIZE` 读取每卡 batch size，默认 16。已有 JSON 仍会跳过，指标格式、mask 解析和 VQ-SAM2 解码语义不变。H20 可先显式设为 32；OOM 时降低为 24 或 16。
+- 验证：`python3 -m py_compile evaluation/refcoco/qwen3vl_refcoco_eval.py`、`bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 和 `git diff --check` 通过。本机没有 Qwen3-VL/SAMTok、CUDA、RefCOCO 数据或 H20，尚未执行多图 processor/generation 的端到端 smoke test；服务器应先以一个 shard 和 `EVAL_BATCH_SIZE=16` 验证输出数与单样本协议一致，再提高 batch size。
