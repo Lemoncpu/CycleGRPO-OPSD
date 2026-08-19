@@ -1227,3 +1227,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：正例 localization 不再要求恰好一个 group，也不再把多 group IoU 置零或按额外 group 扣分。在线 decoder 从同一 image embedding 批量解码一条 response 的全部完整、codebook 合法 depth-2 group，并 union 为一个 prediction；raw GT 可用时仍优先作为 IoU target，结果同时作为 cycle `s_i,k`、`R_Ci` routing 和 direct `pixel_iou`。奖励恢复原 CycleGRPO 的格式与 non-repeat 语义：至少一个完整 group 得 format 一分，只有同一完整 group 超过三次时 non-repeat 一分为零，IoU 不受此正则置零。保留 `segmentation_max_response_tokens=32` 作为生成长度上限和 group-count telemetry；移除严格单 group 配置、环境变量、Hydra override 与遥测。
 - 论文边界：原始公开 CycleGRPO 以 HTG token matching 计算 `s_i,k`；当前实现唯一替换该测量为在线 decoded union 的像素 IoU，保留其在 `R_loc_i,k=10*s_i,k*mean_k(s_i,k)+format+non_repeat` 中的位置和其多 group 表达语义。此项取代本日志中 2026-08-12 的严格单 group 训练扩展；离线 `legacy_union|first_mask` 协议不变。
 - 验证：修改 Python 文件的 AST 语法检查、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 通过。`python3 -m unittest tests.test_opsd_core` 在本机因缺少 `torch` 无法导入；测试已新增多 group 正奖励、四次相同 group 仅清零 non-repeat 项、以及 shared embedding 的 union decode 覆盖。服务器仍需以项目环境运行该单元测试和最小 batch smoke training。
+
+### 2026-08-19 - 修复 union-IoU 训练入口的残留严格开关校验
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：追加本日志。
+- 行为：移除布尔环境变量校验列表中已删除的 `REQUIRE_EXACTLY_ONE_MASK`。union-IoU 改动已不再定义该变量；其残留会在脚本的 `set -u` 下于模型、Ray 或训练日志初始化前报 `!bool_name: unbound variable`。训练参数、direct GRPO/CE、数据和 checkpoint 行为均不变。
+- 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过。
