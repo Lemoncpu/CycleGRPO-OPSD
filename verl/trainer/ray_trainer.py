@@ -2055,12 +2055,6 @@ class RayPPOTrainer:
                             seg_group_counts = np.asarray(
                                 cycle_seg_batch.non_tensor_batch["mask_group_count"], dtype=float
                             )
-                            seg_exactly_one = np.asarray(
-                                cycle_seg_batch.non_tensor_batch["exactly_one_mask_group"], dtype=bool
-                            )
-                            seg_extra_groups = np.asarray(
-                                cycle_seg_batch.non_tensor_batch["extra_mask_group_count"], dtype=float
-                            )
                             metrics.update(
                                 {
                                     "opsd/pixel_iou_mean": float(np.mean(pixel_values)),
@@ -2069,10 +2063,8 @@ class RayPPOTrainer:
                                     "opsd/pixel_iou_max": float(np.max(pixel_values)),
                                     "opsd/R_Ci_mean": float(np.mean(caption_scores)),
                                     "opsd/R_Ci_std": float(np.std(caption_scores)),
-                                    "opsd/seg_exactly_one_mask_rate": float(np.mean(seg_exactly_one)),
                                     "opsd/seg_multi_mask_rate": float(np.mean(seg_group_counts > 1)),
                                     "opsd/seg_mean_mask_group_count": float(np.mean(seg_group_counts)),
-                                    "opsd/seg_mean_extra_mask_group_count": float(np.mean(seg_extra_groups)),
                                 }
                             )
                             if direct_grounding_batch is not None:
@@ -2084,12 +2076,8 @@ class RayPPOTrainer:
                                     direct_group_counts = np.asarray(
                                         direct_grounding_batch.non_tensor_batch["mask_group_count"], dtype=float
                                     )[positive_direct]
-                                    direct_exactly_one = np.asarray(
-                                        direct_grounding_batch.non_tensor_batch["exactly_one_mask_group"], dtype=bool
-                                    )[positive_direct]
                                     metrics.update(
                                         {
-                                            "supervised_anchors/direct_exactly_one_mask_rate": float(np.mean(direct_exactly_one)),
                                             "supervised_anchors/direct_multi_mask_rate": float(np.mean(direct_group_counts > 1)),
                                             "supervised_anchors/direct_mean_mask_group_count": float(np.mean(direct_group_counts)),
                                         }

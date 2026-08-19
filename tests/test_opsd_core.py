@@ -40,16 +40,17 @@ from verl.workers.opsd.routing import (
 
 
 class OPSDCoreTest(unittest.TestCase):
-    def test_strict_single_mask_metadata_and_reward(self):
+    def test_multi_group_reward_keeps_original_cyclegrpo_semantics(self):
         first = "<|mt_start|><|mt_0007|><|mt_0268|><|mt_end|>"
-        repeated = first * 3
+        second = "<|mt_start|><|mt_0008|><|mt_0269|><|mt_end|>"
+        repeated = first * 4
         valid = mask_group_metadata(first)
-        duplicate = mask_group_metadata(repeated)
-        self.assertTrue(valid["exactly_one_valid_group"])
+        multi_group = mask_group_metadata(first + second)
+        self.assertEqual(valid["complete_group_count"], 1)
+        self.assertEqual(valid["valid_group_count"], 1)
         self.assertEqual(valid["first_valid_codes"], [7, 12])
-        self.assertFalse(duplicate["exactly_one_valid_group"])
-        self.assertEqual(duplicate["complete_group_count"], 3)
-        self.assertEqual(duplicate["extra_group_count"], 2)
+        self.assertEqual(multi_group["complete_group_count"], 2)
+        self.assertEqual(multi_group["valid_group_count"], 2)
         self.assertEqual(parse_mask_codes(repeated), [7, 12])
 
         reward_inputs = [
@@ -59,28 +60,27 @@ class OPSDCoreTest(unittest.TestCase):
                 "iou_scores": 0.8,
                 "mask_group_count": 1,
                 "valid_mask_group_count": 1,
-                "extra_mask_group_count": 0,
-                "exactly_one_mask_group": True,
-                "extra_mask_penalty": 1.0,
-                "require_exactly_one_mask": True,
+            },
+            {
+                "source": "supervised_grounding",
+                "response": first + second,
+                "iou_scores": 0.8,
+                "mask_group_count": 2,
+                "valid_mask_group_count": 2,
             },
             {
                 "source": "supervised_grounding",
                 "response": repeated,
                 "iou_scores": 0.8,
-                "mask_group_count": 3,
-                "valid_mask_group_count": 3,
-                "extra_mask_group_count": 2,
-                "exactly_one_mask_group": False,
-                "extra_mask_penalty": 1.0,
-                "require_exactly_one_mask": True,
+                "mask_group_count": 4,
+                "valid_mask_group_count": 4,
             },
         ]
         scores = compute_score(reward_inputs, task="segmentation")
         self.assertAlmostEqual(scores[0]["seg_overall"], 10.0)
-        self.assertEqual(scores[1]["seg_overall"], -2.0)
-        self.assertEqual(scores[1]["seg_exactly_one_mask_group"], 0.0)
-        self.assertEqual(scores[1]["seg_extra_mask_group_penalty"], -2.0)
+        self.assertAlmostEqual(scores[1]["seg_overall"], 10.0)
+        self.assertAlmostEqual(scores[2]["seg_overall"], 9.0)
+        self.assertEqual(scores[2]["seg_no_repeat_score"], 0.0)
 
     def test_anchor_kl_coefficients_must_be_non_negative(self):
         config = OPSDConfig(caption_anchor_kl_coef=0.05, segmentation_anchor_kl_coef=0.05)
@@ -227,24 +227,28 @@ class OPSDCoreTest(unittest.TestCase):
 
             def decode_codes_from_single_image(self, image_state, codes):
                 self.decode_calls += 1
-                return torch.ones((len(codes), 1, 2, 2), dtype=torch.float32)
+                logits = torch.zeros((len(codes), 1, 2, 2), dtype=torch.float32)
+                for index, code in enumerate(codes[:, 0].tolist()):
+                    logits[index, 0, code % 2, code // 2 % 2] = 1.0
+                return logits
 
         decoder = FakeDecoder()
-        image = Image.new("RGB", (3, 2), color="white")
+        image = Image.new("RGB", (2, 2), color="white")
         masks, size = decode_mask_tokens(
             vq_sam2=decoder,
             image=image,
             token_texts=[
                 "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>",
-                "<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|>",
+                "<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|><|mt_start|><|mt_0003|><|mt_0259|><|mt_end|>",
                 "invalid",
             ],
             decode_batch_size=1,
         )
         self.assertEqual(decoder.encode_calls, 1)
-        self.assertEqual(decoder.decode_calls, 2)
-        self.assertEqual(size, (2, 3))
-        self.assertEqual(tuple(masks[0].shape), (2, 3))
+        self.assertEqual(decoder.decode_calls, 3)
+        self.assertEqual(size, (2, 2))
+        self.assertEqual(tuple(masks[0].shape), (2, 2))
+        self.assertEqual(int(masks[1].sum()), 2)
         self.assertIsNone(masks[2])
 
     def test_aggregate_and_privileged_context(self):

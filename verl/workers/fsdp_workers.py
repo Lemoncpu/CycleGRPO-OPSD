@@ -1476,7 +1476,6 @@ class FSDPWorker(Worker):
             sample_groups.setdefault(str(uid), []).append(index)
 
         pixel_config = self.config.opsd.pixel_iou
-        first_mask_pixel_ious = np.full(len(data), pixel_config.invalid_iou, dtype=np.float32)
         for sample_uid, indices in sample_groups.items():
             first = indices[0]
             if data.non_tensor_batch["source"][first] == "supervised_grounding_no_target":
@@ -1492,7 +1491,9 @@ class FSDPWorker(Worker):
                 continue
             image = mm_data["images"][0]
             reference_sources[indices] = "decoded_target"
-            texts = [target_tokens[first], *[predicted_tokens[index] for index in indices]]
+            # The target and each response may contain multiple legal groups.
+            # decode_mask_tokens unions each response's decoded groups before IoU.
+            texts = [targets[first], *[responses[index] for index in indices]]
             decoded, image_size = decode_mask_tokens(
                 vq_sam2=self.vq_sam2,
                 image=image,
@@ -1521,15 +1522,9 @@ class FSDPWorker(Worker):
                         prediction[None, None].float(), size=target_mask.shape, mode="nearest"
                     )[0, 0].bool()
                     decoded_predictions[data_index] = prediction
-                first_mask_pixel_ious[data_index] = float(
+                pixel_ious[data_index] = float(
                     compute_binary_iou(target_mask[None], prediction[None])[0].item()
                 )
-                pixel_ious[data_index] = first_mask_pixel_ious[data_index]
-                if (
-                    pixel_config.require_exactly_one_mask
-                    and not bool(response_mask_metadata[data_index]["exactly_one_valid_group"])
-                ):
-                    pixel_ious[data_index] = pixel_config.invalid_iou
 
         caption_groups = {}
         for index, uid in enumerate(caption_uids):
@@ -1571,19 +1566,6 @@ class FSDPWorker(Worker):
         )
         data.non_tensor_batch["valid_mask_group_count"] = np.array(
             [metadata["valid_group_count"] for metadata in response_mask_metadata], dtype=object
-        )
-        data.non_tensor_batch["extra_mask_group_count"] = np.array(
-            [metadata["extra_group_count"] for metadata in response_mask_metadata], dtype=object
-        )
-        data.non_tensor_batch["exactly_one_mask_group"] = np.array(
-            [metadata["exactly_one_valid_group"] for metadata in response_mask_metadata], dtype=object
-        )
-        data.non_tensor_batch["first_mask_pixel_iou"] = first_mask_pixel_ious.astype(object)
-        data.non_tensor_batch["extra_mask_penalty"] = np.full(
-            len(data), pixel_config.extra_mask_penalty, dtype=object
-        )
-        data.non_tensor_batch["require_exactly_one_mask"] = np.full(
-            len(data), pixel_config.require_exactly_one_mask, dtype=object
         )
         data.non_tensor_batch["pixel_iou"] = pixel_ious.astype(object)
         data.non_tensor_batch["mask_token_accuracy"] = pixel_ious.astype(object)

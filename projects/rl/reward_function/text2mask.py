@@ -909,12 +909,12 @@ def non_repeat_reward(predict_str: str) -> float:
     return non_repeat_reward
 
 
-def single_mask_reward_terms(reward_input: dict[str, Any]) -> tuple[float, float, float, int, int]:
-    """Return strict positive-localization reward terms for one rollout.
+def mask_group_reward_terms(reward_input: dict[str, Any]) -> tuple[float, float, int, int]:
+    """Return original CycleGRPO format/repetition terms with group telemetry.
 
-    A positive segmentation response has exactly one legal SAMTok group.  The
-    first mask remains the pixel-IoU diagnostic, but any additional complete
-    group makes the response invalid and receives a negative per-group penalty.
+    Distinct complete groups are valid: their decoded masks are unioned upstream
+    for pixel IoU.  Only the historical exact-group repetition regularizer can
+    zero its own one-point term after more than three copies of one group.
     """
     response = reward_input["response"]
     metadata = mask_group_metadata(response)
@@ -928,22 +928,7 @@ def single_mask_reward_terms(reward_input: dict[str, Any]) -> tuple[float, float
         if reward_input.get("valid_mask_group_count") is not None
         else metadata["valid_group_count"]
     )
-    exactly_one = bool(
-        reward_input.get("exactly_one_mask_group")
-        if reward_input.get("exactly_one_mask_group") is not None
-        else metadata["exactly_one_valid_group"]
-    )
-    extra_count = int(
-        reward_input.get("extra_mask_group_count")
-        if reward_input.get("extra_mask_group_count") is not None
-        else max(group_count - 1, 0)
-    )
-    require_exactly_one = bool(reward_input.get("require_exactly_one_mask", True))
-    if not require_exactly_one:
-        exactly_one = valid_count > 0
-        extra_count = 0
-    penalty = float(reward_input.get("extra_mask_penalty", 1.0) or 0.0) * extra_count
-    return float(exactly_one), -penalty, float(exactly_one), group_count, valid_count
+    return mask_token_format_reward(response), non_repeat_reward(response), group_count, valid_count
 
 def psg_non_repeat_reward(text_triplets: list[str]):
     if len(text_triplets) == 0:
@@ -1369,18 +1354,15 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
         for reward_input in reward_inputs:
             source = reward_input["source"]
             if source == "supervised_grounding":
-                valid_single, extra_penalty, format_score, group_count, valid_count = single_mask_reward_terms(reward_input)
-                iou_score = float(reward_input["iou_scores"] or 0.0) * valid_single
-                no_repeat_score = valid_single
+                format_score, no_repeat_score, group_count, valid_count = mask_group_reward_terms(reward_input)
+                iou_score = float(reward_input["iou_scores"] or 0.0)
                 scores.append({
-                    "seg_overall": 10 * iou_score + format_score + no_repeat_score + extra_penalty,
+                    "seg_overall": 10 * iou_score + format_score + no_repeat_score,
                     "seg_supervised_grounding_iou": iou_score,
                     "seg_format": format_score,
                     "seg_no_repeat_score": no_repeat_score,
                     "seg_mask_group_count": group_count,
                     "seg_valid_mask_group_count": valid_count,
-                    "seg_exactly_one_mask_group": valid_single,
-                    "seg_extra_mask_group_penalty": extra_penalty,
                 })
                 continue
             if source == "supervised_grounding_no_target":
@@ -1428,23 +1410,19 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             elif source in ['groundingme', 'denseworld_single', 'denseworld_multiple', 'refcoco_cycle', 'grefcoco_cycle', 'cocostuff_cycle', 'paco_part_cycle', 'dam_cyclegrpo', None] or source is None:
                 # format_score = format_reward(reward_input["response"])
                 # _, answer_content = extract_think_and_answer_robust(reward_input["response"])
-                valid_single, extra_penalty, mask_token_format_correct, group_count, valid_count = single_mask_reward_terms(reward_input)
-                iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"] * valid_single
-                answer_content_no_repeat_score = valid_single
-                
-                # answer_content_no_repeat_score = non_repeat_reward(reward_input["response"])
+                mask_token_format_correct, answer_content_no_repeat_score, group_count, valid_count = mask_group_reward_terms(reward_input)
+                iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"]
+
                 # mask_token_format_correct = bbox_format_reward(reward_input["response"])
                 scores.append(
                     {
-                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct + extra_penalty,
+                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct,
                         # "seg_format": format_score,
                         "seg_iou_scores": iou_score,
                         "seg_answer_content_no_repeat_score": answer_content_no_repeat_score,
                         "seg_mask_token_format_correct": mask_token_format_correct,
                         "seg_mask_group_count": group_count,
                         "seg_valid_mask_group_count": valid_count,
-                        "seg_exactly_one_mask_group": valid_single,
-                        "seg_extra_mask_group_penalty": extra_penalty,
                     }
                 )
             else: 

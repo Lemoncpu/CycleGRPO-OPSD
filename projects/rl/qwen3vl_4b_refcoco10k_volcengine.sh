@@ -17,8 +17,6 @@ CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
 PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
-REQUIRE_EXACTLY_ONE_MASK="${REQUIRE_EXACTLY_ONE_MASK:-true}"
-EXTRA_MASK_PENALTY="${EXTRA_MASK_PENALTY:-1.0}"
 SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-32}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
@@ -296,11 +294,6 @@ if [[ ! "${SEGMENTATION_MAX_RESPONSE_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-if ! awk -v value="${EXTRA_MASK_PENALTY}" 'BEGIN { exit !(value >= 0) }'; then
-    echo "EXTRA_MASK_PENALTY must be non-negative: ${EXTRA_MASK_PENALTY}" >&2
-    exit 1
-fi
-
 TRAINER_MAX_STEPS_ARG=()
 if [[ -n "${MAX_STEPS}" ]]; then
     TRAINER_MAX_STEPS_ARG=("trainer.max_steps=${MAX_STEPS}")
@@ -462,7 +455,7 @@ echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
-echo "Positive segmentation mask contract: exactly-one=${REQUIRE_EXACTLY_ONE_MASK}, extra-mask penalty=${EXTRA_MASK_PENALTY}"
+echo "Positive segmentation mask protocol: union of all complete legal SAMTok groups"
 echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
@@ -530,8 +523,6 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.teacher_confidence.regenerate_min_normalized_improvement="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}" \
     worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
     worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
-    worker.opsd.pixel_iou.require_exactly_one_mask="${REQUIRE_EXACTLY_ONE_MASK}" \
-    worker.opsd.pixel_iou.extra_mask_penalty="${EXTRA_MASK_PENALTY}" \
     worker.opsd.pixel_iou.segmentation_max_response_tokens="${SEGMENTATION_MAX_RESPONSE_TOKENS}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \

@@ -297,8 +297,8 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 3. 调用 dataset 的 `_gen_seg_preprocess`，把 caption 注入 localization prompt。图像 caption index 按偶/奇在 RefCOCO/GRES 与 GroundingSuite 两个 benchmark 同构模板之间交替；`caption_text` 仍保存裸 student caption，供 CycleGRPO reward、OPSD 路由和 teacher 使用。
 4. 从 `worker.opsd.localization_rollouts` 读取 `K`，用当前 actor 为每条 caption 采样定位结果。
    每条正例 localization rollout 的生成上限独立限制为 `32` token，防止尚未收敛的策略在首个
-   mask 后无界重复；这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
-5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 token。
+   mask 后无界延续；合法的多个 mask group 仍可共同表示一个区域。这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
+5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的全部合法 group，再在每条 response 内取像素 union。
 6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
@@ -339,10 +339,11 @@ metadata、GT 和 mask；不得先以 `DataProto[index]` 解包再用 `[0]` 索�
 
 `verl/workers/reward/function.py::BatchFunctionRewardManager` 动态调用 `projects/rl/reward_function/text2mask.py:compute_score`，并只把标量奖励写到 response 最后一个有效 token；之后优势会扩展到整个 response mask。
 
-核心图像 cycle source 的有效奖励仍保留 CycleGRPO 的倍率、格式和非重复项，但 `s_i,k` 与 `m_i` 已替换成真实像素值：
+核心图像 cycle source 保留原 CycleGRPO 的倍率、格式和非重复项，只把原始 HTG
+token matching 的 `s_i,k` 替换为在线 VQ-SAM2 解码后的真实像素 IoU：
 
 ```text
-s_i,k = graded_match(pred_mask_token_i,k, target_mask_token)
+s_i,k = pixel_iou(union(decode(all legal groups in response_i,k)), GT_i)
 m_i   = mean_k(s_i,k)
 
 caption:
@@ -350,16 +351,15 @@ caption:
   valid_i 同时检查没有 bbox/中文，且没有非终止 special token 或 mask_2d JSON；违规时正奖励被门控清零。
 
 localization positive:
-  valid_single_i,k = 1 iff response has exactly one complete, codebook-valid depth-2 mask group
-  R_loc_i,k = valid_single_i,k * (10 * s_i,k * m_i + 2) - extra_mask_penalty * extra_group_count
+  R_loc_i,k = 10 * s_i,k * m_i + format_i,k + non_repeat_i,k
 ```
 
-在线 VQ-SAM2 解码保留首个合法 group，用于首 mask IoU 的诊断；当
-`pixel_iou.require_exactly_one_mask=true`（默认）时，多 group response 的训练 pixel IoU 置零，
-不再让第一个正确 mask 给后续重复 token 正优势。每一个额外完整 group 再减
-`pixel_iou.extra_mask_penalty=1.0`。这与论文的 `R_cap_i=mean(s_i,k)`、
-`R_loc_i,k=R_cap_i*s_i,k` 对应，但代码额外乘 `10`、加入格式约束，且新增了当前扩展的严格
-单 mask 序列化约束。
+每条 response 的全部完整且 codebook 合法 depth-2 group 都会解码并 union；多组并非错误，
+其额外区域自然反映在 union 的像素 IoU 中。`format_i,k` 仍要求至少存在一个完整 group；
+`non_repeat_i,k` 保留原始规则，只在同一个完整 group 出现超过三次时从 `1` 降为 `0`，不置零 IoU
+也不施加额外 group penalty。`supervised_grounding` 使用同样的 format/non-repeat 语义，奖励为
+`10 * pixel_iou + format + non_repeat`。这与论文的 `R_cap_i=mean(s_i,k)`、
+`R_loc_i,k=R_cap_i*s_i,k` 对应，但代码仍保留 `10x` 和两项一分的序列化正则。
 
 `text2mask.py` 还保留多任务分支：
 
@@ -381,9 +381,9 @@ JSONL，并按 `dam_source_id` join Stuff/PACO caption rollout。独立 Llama ju
 选项；每条 rollout 对全部题目作答，`1/0/-1` 的均值乘 `reward_weight` 加到原 cycle caption reward。
 服务超时、请求失败或无唯一选项时该题贡献 `0`，不会中断训练，也不改变 `R_Ci` 或 OPSD routing。
 
-`supervised_grounding` 的正例 segmentation reward 使用同一严格单 mask 合约：仅一个合法 group
-得到 `10 * pixel_iou + 2`，额外 group 按数量扣分；
-`supervised_grounding_no_target` 复用 `No target.` 拒识加非重复奖励。二者只出现在独立 batch。
+`supervised_grounding` 的正例 segmentation reward 对一条 response 内所有合法 group 的 decoded union
+计算 `10 * pixel_iou + format + non_repeat`；`supervised_grounding_no_target` 复用 `No target.`
+拒识加非重复奖励。二者只出现在独立 batch。
 
 `tg_reward.py` 是可配置的 temporal grounding 奖励库，支持 tIoU、format、precision/recall/F1、C-Acc、caption judge 和长度惩罚；当前 `text2mask.py` 的主要视频路径只直接复用其中少量逻辑或保留了注释调用。
 
@@ -497,7 +497,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 与 groundedness 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
 | `workers/opsd/groundedness.py` | teacher verifier JSON 的保守解析、claim/penalty 汇总，以及 optional token-span 对齐；解析不确定时 fail closed 为零辅助梯度 |
-| `workers/opsd/mask_iou.py` | 严格 token 解析、完整/合法 mask group 计数、原始 GT 转换、批量首 mask 解码、尺寸恢复和像素 IoU |
+| `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、共享 image embedding 的批量全 group 解码/response union、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
@@ -629,7 +629,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
-26. **正例 segmentation 必须恰好一个 mask group。** 当前 online reward 记录 `mask_group_count`、`valid_mask_group_count`、`exactly_one_mask_group`、`first_mask_pixel_iou` 和额外 group penalty。重复 group 的首 mask 诊断 IoU 可保留，但它不能贡献 CycleGRPO 或 direct positive reward。训练日志必须检查 `opsd/seg_exactly_one_mask_rate`、`opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 和 direct 对应指标；未恢复接近单 group 前不得解释分割基准的速度/质量变化。该训练约束不改变历史 SAMTok 离线 baseline：RefCOCO/GRES/GroundingSuite 默认 `legacy_union`，不以 `<|mt_end|>` 截断并 union 全部完整、合法 group；`first_mask` 是显式选择的严格单 mask 离线协议。两种离线协议不能混合比较，且必须以新的空输出目录或协议不匹配自动重写的目录重新生成。`evaluation/refcoco/first_mask_diagnostic.py` 仍可用于已保存旧 response 的无重新生成诊断。
+26. **正例 segmentation 使用 union 语义。** 在线 CycleGRPO 与 direct reward 都记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。该训练语义与 RefCOCO/GRES/GroundingSuite 默认 `legacy_union` 一致；`first_mask` 仍是仅用于离线诊断的显式协议，两种评测协议不能混合比较。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1219,3 +1219,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：三个离线分割评测器现在共享显式 `legacy_union|first_mask` 协议。默认 `legacy_union` 不将 `<|mt_end|>` 设为 EOS，解析全部完整、codebook 合法的 depth-2 mask group，逐组 VQ-SAM2 解码后取 union，以保证 SAMTok 历史 RefCOCO/GRES/GroundingSuite 基线可比；`first_mask` 保留此前严格首组语义，并将 `<|mt_end|>` 加入 EOS。每条预测写入 `mask_protocol`；已有 JSON 只有在协议相同才会 resume，旧的无协议或不同协议结果会重算，防止指标混合。在线 CycleGRPO/direct 的单 mask reward、额外 group penalty、codebook 作用域修复与 RefCOCO batch generation 均未改变。
 - 论文边界：这是离线 benchmark 可比性修复，不放宽训练时正例 localization 的单 mask 序列化约束。使用 `first_mask` 的新 direct checkpoint 分数必须作为独立协议报告，不能和历史 union baseline 直接比较。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/mask_protocol.py evaluation/refcoco/qwen3vl_refcoco_eval.py evaluation/gres/qwen3vl_gres_eval.py evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py tests/test_mask_protocol.py`、`python3 -m unittest tests.test_mask_protocol`（4 tests）、三个 evaluator launcher 与 `projects/eval/qwen3vl_4b_volcengine.sh` 的 `bash -n`、以及 `git diff --check` 均通过。本机无 H20、checkpoint、CUDA 和 benchmark 数据，尚未运行端到端重新生成；服务器必须用独立 `EVAL_ROOT`（推荐）或允许协议字段触发目录内 JSON 重写后完成三项完整评测。
+
+### 2026-08-19 - 恢复 CycleGRPO 多 group 训练语义并在线计算 union IoU
+
+- 代码：修改 `verl/workers/opsd/mask_iou.py`、`verl/workers/opsd/config.py`、`verl/workers/fsdp_workers.py`、`verl/workers/reward/function.py`、`verl/trainer/ray_trainer.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_opsd_core.py`。
+- 文档：更新 `README.md`、第 3.4、3.5、5.2、关键注意事项 26 和本日志。
+- 行为：正例 localization 不再要求恰好一个 group，也不再把多 group IoU 置零或按额外 group 扣分。在线 decoder 从同一 image embedding 批量解码一条 response 的全部完整、codebook 合法 depth-2 group，并 union 为一个 prediction；raw GT 可用时仍优先作为 IoU target，结果同时作为 cycle `s_i,k`、`R_Ci` routing 和 direct `pixel_iou`。奖励恢复原 CycleGRPO 的格式与 non-repeat 语义：至少一个完整 group 得 format 一分，只有同一完整 group 超过三次时 non-repeat 一分为零，IoU 不受此正则置零。保留 `segmentation_max_response_tokens=32` 作为生成长度上限和 group-count telemetry；移除严格单 group 配置、环境变量、Hydra override 与遥测。
+- 论文边界：原始公开 CycleGRPO 以 HTG token matching 计算 `s_i,k`；当前实现唯一替换该测量为在线 decoded union 的像素 IoU，保留其在 `R_loc_i,k=10*s_i,k*mean_k(s_i,k)+format+non_repeat` 中的位置和其多 group 表达语义。此项取代本日志中 2026-08-12 的严格单 group 训练扩展；离线 `legacy_union|first_mask` 协议不变。
+- 验证：修改 Python 文件的 AST 语法检查、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 通过。`python3 -m unittest tests.test_opsd_core` 在本机因缺少 `torch` 无法导入；测试已新增多 group 正奖励、四次相同 group 仅清零 non-repeat 项、以及 shared embedding 的 union decode 覆盖。服务器仍需以项目环境运行该单元测试和最小 batch smoke training。

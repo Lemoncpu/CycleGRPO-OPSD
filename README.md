@@ -359,8 +359,9 @@ directory, and writes stdout to `<RUN_ROOT>/train_<timestamp>.log`.
 
 The default controlled setup uses `G=6` caption rollouts and `K=6`
 localization rollouts. With OPSD enabled, localization uses decoded pixel IoU;
-positive masks must contain exactly one valid SAMTok group. The default
-teacher/routing settings are documented in `code.md`.
+all complete, codebook-valid SAMTok groups in one response are decoded and
+unioned before scoring. The default teacher/routing settings are documented in
+`code.md`.
 
 ```bash
 RUN_NAME=gs25k_cycle

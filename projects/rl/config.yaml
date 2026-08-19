@@ -82,8 +82,6 @@ worker:
       mask_threshold: 0.5
       prefer_raw_gt: true
       invalid_iou: 0.0
-      require_exactly_one_mask: true
-      extra_mask_penalty: 1.0
       segmentation_max_response_tokens: 32
     routing:
       enabled: true

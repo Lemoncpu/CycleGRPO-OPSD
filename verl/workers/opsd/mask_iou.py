@@ -29,12 +29,7 @@ def extract_mask_tokens(text: Optional[str]) -> list[str]:
 def mask_group_metadata(
     text: Optional[str], codebook_size: int = 256, codebook_depth: int = 2
 ) -> dict[str, object]:
-    """Summarize complete SAMTok groups without silently accepting trailing masks.
-
-    The online decoder still uses the first valid group as a diagnostic mask, but
-    positive localization training can require ``exactly_one_valid_group`` so a
-    correct first mask cannot reward an unbounded suffix of extra mask tokens.
-    """
+    """Summarize complete SAMTok groups and retain their legal codebook entries."""
     groups = extract_mask_tokens(text)
     valid_groups: list[str] = []
     valid_codes: list[list[int]] = []
@@ -55,8 +50,6 @@ def mask_group_metadata(
     return {
         "complete_group_count": complete_count,
         "valid_group_count": valid_count,
-        "extra_group_count": max(complete_count - 1, 0),
-        "exactly_one_valid_group": complete_count == 1 and valid_count == 1,
         "first_valid_group": valid_groups[0] if valid_groups else None,
         "first_valid_codes": valid_codes[0] if valid_codes else None,
     }
@@ -146,6 +139,12 @@ def decode_mask_tokens(
     threshold: float = 0.5,
     decode_batch_size: int = 32,
 ) -> tuple[list[Optional[torch.Tensor]], tuple[int, int]]:
+    """Decode every legal group in each response and return their pixel union.
+
+    The VQ-SAM2 image embedding is shared across all groups for one image.  This
+    preserves CycleGRPO's original multi-group semantics while replacing its
+    token-domain grading with online pixel IoU.
+    """
     if decode_batch_size <= 0:
         raise ValueError("decode_batch_size must be positive.")
     pil_image = _load_rgb_image(image)
@@ -154,10 +153,22 @@ def decode_mask_tokens(
     pixel_values = torch.from_numpy(np.asarray(resized).copy()).permute(2, 0, 1).contiguous()
     pixel_values = pixel_values.unsqueeze(0).to(device=vq_sam2.device, dtype=vq_sam2.dtype)
 
-    parsed = [parse_mask_codes(text, codebook_size, codebook_depth) for text in token_texts]
-    valid_indices = [index for index, codes in enumerate(parsed) if codes is not None]
+    parsed_groups: list[list[list[int]]] = []
+    for text in token_texts:
+        groups = []
+        for group in extract_mask_tokens(text):
+            codes = parse_mask_codes(group, codebook_size, codebook_depth)
+            if codes is not None:
+                groups.append(codes)
+        parsed_groups.append(groups)
+
+    decode_items = [
+        (response_index, codes)
+        for response_index, groups in enumerate(parsed_groups)
+        for codes in groups
+    ]
     output: list[Optional[torch.Tensor]] = [None] * len(token_texts)
-    if not valid_indices:
+    if not decode_items:
         return output, (height, width)
 
     image_state = None
@@ -165,20 +176,23 @@ def decode_mask_tokens(
         image_state = vq_sam2.encode_single_image(pixel_values)
 
     # Decode in bounded chunks while retaining one shared image embedding.
-    for start in range(0, len(valid_indices), decode_batch_size):
-        batch_indices = valid_indices[start : start + decode_batch_size]
-        codes = torch.tensor([parsed[index] for index in batch_indices], device=vq_sam2.device, dtype=torch.long)
+    for start in range(0, len(decode_items), decode_batch_size):
+        batch_items = decode_items[start : start + decode_batch_size]
+        codes = torch.tensor([codes for _, codes in batch_items], device=vq_sam2.device, dtype=torch.long)
         if image_state is not None:
             logits = vq_sam2.decode_codes_from_single_image(image_state, codes)
         elif hasattr(vq_sam2, "forward_codes_single_image"):
             logits = vq_sam2.forward_codes_single_image(pixel_values, codes)
         else:
-            repeated_pixels = pixel_values.expand(len(batch_indices), -1, -1, -1)
+            repeated_pixels = pixel_values.expand(len(batch_items), -1, -1, -1)
             logits = vq_sam2.forward_with_codes(repeated_pixels, codes)
         logits = F.interpolate(logits, size=(height, width), mode="bilinear", align_corners=False)
         masks = logits[:, 0] > threshold
-        for index, mask in zip(batch_indices, masks):
-            output[index] = mask.detach().cpu()
+        for response_index, mask in zip((index for index, _ in batch_items), masks):
+            mask = mask.detach().cpu()
+            output[response_index] = mask if output[response_index] is None else torch.logical_or(
+                output[response_index], mask
+            )
     return output, (height, width)
 
 
