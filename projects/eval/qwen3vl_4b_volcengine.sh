@@ -20,6 +20,7 @@ GRES_INSTANCES_FILE=${GRES_INSTANCES_FILE:-$GRES_ROOT/instances.json}
 GRES_IMAGE_ROOT=${GRES_IMAGE_ROOT:-$REFCOCO_ROOT/train2014}
 GRES_SPLIT=${GRES_SPLIT:-val}
 NUM_GPUS=${NUM_GPUS:-8}
+MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
 RAY_SHORT_ROOT=${RAY_SHORT_ROOT:-/tmp/cgrpo-export-${UID:-$(id -u)}}
 
 case "$ACTION" in
@@ -70,7 +71,7 @@ run_refcoco() {
     require_hf_model
     VQ_SAM2_PATH="$TRAIN_MODEL_PATH/mask_tokenizer_256x2.pth" \
     SAM2_PATH="$TRAIN_MODEL_PATH/sam2.1_hiera_large.pt" PYTHON_BIN="$PYTHON_BIN" \
-    bash evaluation/refcoco/run_refcoco_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" \
+    MASK_PROTOCOL="$MASK_PROTOCOL" bash evaluation/refcoco/run_refcoco_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" \
         "$EVAL_ROOT/refcoco_${REFCOCO_SPLIT:-val}" "$REFCOCO_ROOT" "${REFCOCO_SPLIT:-val}"
 }
 
@@ -81,7 +82,7 @@ run_groundingsuite() {
     VQ_SAM2_PATH="$TRAIN_MODEL_PATH/mask_tokenizer_256x2.pth" \
     SAM2_PATH="$TRAIN_MODEL_PATH/sam2.1_hiera_large.pt" DATASET="$dataset" \
     DATA_ROOT="$GROUNDINGSUITE_ROOT" COCO_ROOT="$REFCOCO_ROOT" PYTHON_BIN="$PYTHON_BIN" \
-    bash evaluation/groundingsuite/run_groundingsuite_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$EVAL_ROOT/groundingsuite"
+    MASK_PROTOCOL="$MASK_PROTOCOL" bash evaluation/groundingsuite/run_groundingsuite_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$EVAL_ROOT/groundingsuite"
     "$PYTHON_BIN" projects/vlm/tokenmask/evaluation/groundingsuite_metric.py \
         --image_dir "$GROUNDINGSUITE_ROOT" --gt_file "$dataset" \
         --pred_folder "$EVAL_ROOT/groundingsuite" --mode mask --vis_samples 0 \
@@ -115,7 +116,7 @@ run_gres() {
     fi
     VQ_SAM2_PATH="$TRAIN_MODEL_PATH/mask_tokenizer_256x2.pth" \
     SAM2_PATH="$TRAIN_MODEL_PATH/sam2.1_hiera_large.pt" PYTHON_BIN="$PYTHON_BIN" \
-    bash evaluation/gres/run_gres_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$save_dir" "$dataset"
+    MASK_PROTOCOL="$MASK_PROTOCOL" bash evaluation/gres/run_gres_multigpu.sh "$NUM_GPUS" "$HF_MODEL_PATH" "$save_dir" "$dataset"
 }
 
 case "$ACTION" in

@@ -525,7 +525,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `reward_function/tg_reward.py` | temporal grounding 可组合奖励库 |
 | `reward_function/llm_judge_reward.py` | 可选外部 vLLM caption judge；包含无图 DLC-QA option judge，不占用训练 GPU |
 
-`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。GRES 默认标注根为服务器实际目录 `${BASE_DIR}/gRefCOCO`；也可通过 `GRES_ROOT` 覆盖。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
+`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。三项分割评测都接受 `MASK_PROTOCOL=legacy_union|first_mask`；默认 `legacy_union` 用完整合法 depth-2 group 的解码 union 复现历史 SAMTok baseline，`first_mask` 才会在第一个 `<|mt_end|>` 终止并只解码首组，供严格单 mask 格式实验单独报告。逐样本 JSON 会保存 `mask_protocol`，resume 时协议不同或旧结果缺失该字段会自动重新推理，禁止混合两种口径。GRES 默认标注根为服务器实际目录 `${BASE_DIR}/gRefCOCO`；也可通过 `GRES_ROOT` 覆盖。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
@@ -592,8 +592,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 目录 | 文件职责 |
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；生成遇到首个 `<|mt_end|>` 即终止，只解码首个完整合法 mask group，并保存 group 数用于格式诊断。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；VQ-SAM2 解码和逐样本 JSON 写出保持原语义 |
-| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128、首个 `<|mt_end|>` 后终止，只解码首个完整合法 group，不打印逐样本 response |
+| `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；逐样本 JSON 保存 group 数和协议，协议不匹配时会重新生成 |
+| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128，默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
 | `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt、192-token 上限和 caption-only special-token logits blocker，另写 `.stats.json` 记录 leak rate |
@@ -628,7 +629,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
-26. **正例 segmentation 必须恰好一个 mask group。** 当前 online reward 记录 `mask_group_count`、`valid_mask_group_count`、`exactly_one_mask_group`、`first_mask_pixel_iou` 和额外 group penalty。重复 group 的首 mask 诊断 IoU 可保留，但它不能贡献 CycleGRPO 或 direct positive reward。训练日志必须检查 `opsd/seg_exactly_one_mask_rate`、`opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 和 direct 对应指标；未恢复接近单 group 前不得解释分割基准的速度/质量变化。离线 RefCOCO/GRES/GroundingSuite 统一在首个完整合法 group 后停止并只解码它，形成新的正式协议；历史 union 输出不能直接和该协议的结果比较。`evaluation/refcoco/first_mask_diagnostic.py` 仍可用于已保存旧 response 的无重新生成诊断。
+26. **正例 segmentation 必须恰好一个 mask group。** 当前 online reward 记录 `mask_group_count`、`valid_mask_group_count`、`exactly_one_mask_group`、`first_mask_pixel_iou` 和额外 group penalty。重复 group 的首 mask 诊断 IoU 可保留，但它不能贡献 CycleGRPO 或 direct positive reward。训练日志必须检查 `opsd/seg_exactly_one_mask_rate`、`opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 和 direct 对应指标；未恢复接近单 group 前不得解释分割基准的速度/质量变化。该训练约束不改变历史 SAMTok 离线 baseline：RefCOCO/GRES/GroundingSuite 默认 `legacy_union`，不以 `<|mt_end|>` 截断并 union 全部完整、合法 group；`first_mask` 是显式选择的严格单 mask 离线协议。两种离线协议不能混合比较，且必须以新的空输出目录或协议不匹配自动重写的目录重新生成。`evaluation/refcoco/first_mask_diagnostic.py` 仍可用于已保存旧 response 的无重新生成诊断。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1210,3 +1211,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.6 节 GRES 评测职责并追加本日志。
 - 行为：将 `CODEBOOK_SIZE=256` 和 `CODEBOOK_DEPTH=2` 设为模块级常量，供首个 depth-2 SAMTok mask group 的合法性检查和 VQ-SAM2 构造共同使用，移除两个 `main()` 中遮蔽同名常量的局部声明。此前 GRES 的 `extract_mt_token_ids_v1()` 在模型首次返回完整 mask group 时引用未定义的局部作用域常量并触发 `NameError`，导致各 shard 退出；GroundingSuite 存在相同潜在错误。结果文件的恢复/跳过协议、首 mask 语义与指标计算均不变。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/gres/qwen3vl_gres_eval.py evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`、GRES 与 GroundingSuite launcher 的 `bash -n`、以及 `git diff --check` 通过；本机没有 H20、模型和评测数据，服务器需以保留的 case JSON 续跑 GRES 来完成端到端验证。
+
+### 2026-08-19 - 恢复 SAMTok 历史 union 分割评测协议
+
+- 代码：新增 `evaluation/mask_protocol.py` 与 `tests/test_mask_protocol.py`；修改 `evaluation/refcoco/qwen3vl_refcoco_eval.py`、`evaluation/gres/qwen3vl_gres_eval.py`、`evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`、三个对应 multi-GPU launcher、`projects/eval/qwen3vl_4b_volcengine.sh` 和 `README.md`。
+- 文档：更新第 2.2、5.6、关键注意事项 26、模块清单和本日志。
+- 行为：三个离线分割评测器现在共享显式 `legacy_union|first_mask` 协议。默认 `legacy_union` 不将 `<|mt_end|>` 设为 EOS，解析全部完整、codebook 合法的 depth-2 mask group，逐组 VQ-SAM2 解码后取 union，以保证 SAMTok 历史 RefCOCO/GRES/GroundingSuite 基线可比；`first_mask` 保留此前严格首组语义，并将 `<|mt_end|>` 加入 EOS。每条预测写入 `mask_protocol`；已有 JSON 只有在协议相同才会 resume，旧的无协议或不同协议结果会重算，防止指标混合。在线 CycleGRPO/direct 的单 mask reward、额外 group penalty、codebook 作用域修复与 RefCOCO batch generation 均未改变。
+- 论文边界：这是离线 benchmark 可比性修复，不放宽训练时正例 localization 的单 mask 序列化约束。使用 `first_mask` 的新 direct checkpoint 分数必须作为独立协议报告，不能和历史 union baseline 直接比较。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/mask_protocol.py evaluation/refcoco/qwen3vl_refcoco_eval.py evaluation/gres/qwen3vl_gres_eval.py evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py tests/test_mask_protocol.py`、`python3 -m unittest tests.test_mask_protocol`（4 tests）、三个 evaluator launcher 与 `projects/eval/qwen3vl_4b_volcengine.sh` 的 `bash -n`、以及 `git diff --check` 均通过。本机无 H20、checkpoint、CUDA 和 benchmark 数据，尚未运行端到端重新生成；服务器必须用独立 `EVAL_ROOT`（推荐）或允许协议字段触发目录内 JSON 重写后完成三项完整评测。

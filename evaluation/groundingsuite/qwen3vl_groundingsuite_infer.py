@@ -17,6 +17,12 @@ import hydra
 
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
+from evaluation.mask_protocol import (
+    MASK_PROTOCOLS,
+    complete_mask_group_count,
+    generation_eos_token_id,
+    parse_mask_groups,
+)
 from qwen_vl_utils import process_vision_info
 from torchvision.transforms.functional import to_pil_image
 
@@ -80,6 +86,8 @@ def parse_args():
                              'one to finish collates them here automatically.')
     parser.add_argument('--no_merge', '--no-merge', action='store_true',
                         help='Disable the automatic merge-to-JSONL step.')
+    parser.add_argument('--mask_protocol', choices=MASK_PROTOCOLS, default='legacy_union',
+                        help='SAMTok decoding protocol. legacy_union matches historical SAMTok results.')
     args = parser.parse_args()
     return args
 
@@ -163,15 +171,31 @@ def rle_to_mask(rle):
     return mask
 
 
-def extract_mt_token_ids_v1(text):
-    """Return the first complete legal depth-2 mask group only."""
-    match = re.search(
-        r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>", text
-    )
-    if match is None:
-        return []
-    first, second = (int(value) for value in match.groups())
-    return [first, second] if 0 <= first < CODEBOOK_SIZE and CODEBOOK_SIZE <= second < 2 * CODEBOOK_SIZE else []
+def extract_mt_token_ids(text, mask_protocol):
+    """Return raw token IDs for all legal groups selected by the protocol."""
+    return [
+        token_id
+        for first, second in parse_mask_groups(
+            text, codebook_size=CODEBOOK_SIZE, protocol=mask_protocol
+        )
+        for token_id in (first, second + CODEBOOK_SIZE)
+    ]
+
+
+def has_matching_protocol(path, mask_protocol):
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'r') as file:
+            return json.load(file).get('mask_protocol') == mask_protocol
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def write_prediction(path, prediction, mask_protocol):
+    prediction['mask_protocol'] = mask_protocol
+    with open(path, 'w') as file:
+        json.dump(prediction, file)
 
 def extract_mt_token_ids_v2(text):
     pattern = re.compile(r'<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>')
@@ -340,7 +364,8 @@ def main():
 
         question = f"Please carefully check the image and detect the object this sentence describes: {caption}"
 
-        if os.path.exists(f"{args.save_dir}/{item_idx}.json"):
+        output_path = f"{args.save_dir}/{item_idx}.json"
+        if has_matching_protocol(output_path, args.mask_protocol):
             print("file exists.............")
             continue
 
@@ -366,49 +391,45 @@ def main():
         inputs = inputs.to(model.device)
 
         # Inference: Generation of the output
-        base_eos = model.generation_config.eos_token_id
-        eos_token_id = list(base_eos) if isinstance(base_eos, (list, tuple)) else [base_eos]
-        eos_token_id.append(processor.tokenizer.convert_tokens_to_ids("<|mt_end|>"))
-        generated_ids = model.generate(
+        generation_kwargs = dict(
             **inputs, 
             max_new_tokens=128,
             do_sample=False,  # 关闭采样，使用贪婪解码
             top_p=1.0,  # 配合do_sample=False使用
-            eos_token_id=list(dict.fromkeys(token_id for token_id in eos_token_id if token_id is not None)),
         )
+        eos_token_id = generation_eos_token_id(model, processor, args.mask_protocol)
+        if eos_token_id is not None:
+            generation_kwargs['eos_token_id'] = eos_token_id
+        generated_ids = model.generate(**generation_kwargs)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         output_text = processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        mask_group_count = len(
-            re.findall(r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", output_text[0])
-        )
+        mask_group_count = complete_mask_group_count(output_text[0])
 
-        quant_ids = extract_mt_token_ids_v1(output_text[0])
+        quant_ids = extract_mt_token_ids(output_text[0], args.mask_protocol)
         if len(quant_ids) == 0:
             zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
             zero_mask = mask_to_rle(zero_mask)[0]
             prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
-            with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
-                json.dump(prediction, f)
+            write_prediction(output_path, prediction, args.mask_protocol)
             continue
 
         # if len(quant_ids) % CODEBOOK_DEPTH != 0:
         #     print("FORMAT ERROR: ", output_text)
         #     output_text = [fix_mt_format_comprehensive(output_text[0])]
         #     print("FIXED OUTPUT TEXT: ", output_text)
-        #     quant_ids = extract_mt_token_ids_v2(output_text[0])
+        #     quant_ids = extract_mt_token_ids(output_text[0], args.mask_protocol)
         # assert len(quant_ids) % CODEBOOK_DEPTH == 0
         if len(quant_ids) % CODEBOOK_DEPTH != 0:
             zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
             zero_mask = mask_to_rle(zero_mask)[0]
             prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
-            with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
-                json.dump(prediction, f)
+            write_prediction(output_path, prediction, args.mask_protocol)
             continue
 
         batch_size = len(quant_ids) // CODEBOOK_DEPTH
@@ -443,8 +464,7 @@ def main():
             zero_mask = mask_to_rle(zero_mask)[0]
             prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': [0, 0, 0, 0], 'predicted_segmentation': zero_mask, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
 
-            with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
-                json.dump(prediction, f)
+            write_prediction(output_path, prediction, args.mask_protocol)
             continue
 
         _pred_masks = torch.nn.functional.interpolate(_pred_masks, size=(ori_height, ori_width), mode='bilinear')
@@ -458,8 +478,7 @@ def main():
             pred_box = [0, 0, 0, 0]
         _pred_masks = mask_to_rle(_pred_masks)[0]
         prediction = {'idx': item_idx, 'image_path': image_file, 'predicted_box': pred_box, 'predicted_segmentation': _pred_masks, 'class_id': class_id, 'response': output_text[0], 'mask_group_count': mask_group_count}
-        with open(f"{args.save_dir}/{item_idx}.json", 'w') as f:
-            json.dump(prediction, f)
+        write_prediction(output_path, prediction, args.mask_protocol)
 
     # once this shard is done, merge into one JSONL iff all shards have finished
     maybe_merge(all_data_dict, args)

@@ -9,6 +9,7 @@ DATASET=${4:?"prepared GRES dataset is required"}
 VQ_SAM2_PATH=${VQ_SAM2_PATH:?"VQ_SAM2_PATH is required"}
 SAM2_PATH=${SAM2_PATH:?"SAM2_PATH is required"}
 PYTHON_BIN=${PYTHON_BIN:-python}
+MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -32,6 +33,7 @@ for ((task=0; task<NUM_GPUS; task++)); do
         --dataset "$DATASET" \
         --save_dir "$SAVE_DIR" \
         --task_id "$task" --num_tasks "$NUM_GPUS" --gpu_id 0 \
+        --mask_protocol "$MASK_PROTOCOL" \
         > "$LOG_DIR/gres_shard${task}.log" 2>&1 &
     pids+=("$!")
     echo "  shard $task -> GPU $task (pid ${pids[-1]}, log $LOG_DIR/gres_shard${task}.log)"

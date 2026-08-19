@@ -11,6 +11,7 @@ VQ_SAM2_PATH=${VQ_SAM2_PATH:?"VQ_SAM2_PATH is required"}
 SAM2_PATH=${SAM2_PATH:?"SAM2_PATH is required"}
 PYTHON_BIN=${PYTHON_BIN:-python}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-16}
+MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$(dirname "$SAVE_DIR")/logs"
@@ -22,6 +23,7 @@ for ((task=0; task<NUM_GPUS; task++)); do
         --refcoco_root "$REFCOCO_ROOT" --split_by "$SPLIT_BY" --split "$SPLIT" \
         --save_dir "$SAVE_DIR" --task_id "$task" --num_tasks "$NUM_GPUS" --gpu_id 0 \
         --batch_size "$EVAL_BATCH_SIZE" \
+        --mask_protocol "$MASK_PROTOCOL" \
         > "$LOG_DIR/refcoco_${SPLIT}_shard${task}.log" 2>&1 &
     pids+=("$!")
 done

@@ -15,6 +15,12 @@ from pycocotools import mask as mask_utils
 from torchvision.transforms.functional import to_pil_image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+from evaluation.mask_protocol import (
+    MASK_PROTOCOLS,
+    complete_mask_group_count,
+    generation_eos_token_id,
+    parse_mask_groups,
+)
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2, VQ_SAM2Config
 
 
@@ -39,6 +45,7 @@ def parse_args():
     parser.add_argument("--num_tasks", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--mask_protocol", choices=MASK_PROTOCOLS, default="legacy_union")
     parser.add_argument("--metric_only", action="store_true")
     return parser.parse_args()
 
@@ -99,20 +106,18 @@ def load_samples(root: str, split_by: str, split: str) -> list[dict]:
     return samples
 
 
-def parse_mask_codes(text: str) -> list[list[int]]:
-    """Parse the first complete legal mask group only."""
-    match = re.search(
-        r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>", text
-    )
-    if match is None:
-        return []
-    values = [int(value) for value in match.groups()]
-    codes = []
-    for index in range(0, len(values) - 1, 2):
-        first, second = values[index], values[index + 1] - 256
-        if 0 <= first < 256 and 0 <= second < 256:
-            codes.append([first, second])
-    return codes
+def parse_mask_codes(text: str, mask_protocol: str) -> list[list[int]]:
+    return parse_mask_groups(text, codebook_size=256, protocol=mask_protocol)
+
+
+def has_matching_protocol(path: str, mask_protocol: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r") as file:
+            return json.load(file).get("mask_protocol") == mask_protocol
+    except (OSError, json.JSONDecodeError):
+        return False
 
 
 def compute_metrics(save_dir: str) -> dict:
@@ -168,7 +173,7 @@ def main():
     samples = all_samples[args.task_id * per_task : min((args.task_id + 1) * per_task, len(all_samples))]
     print(
         f"[task {args.task_id}/{args.num_tasks}] evaluating {len(samples)} RefCOCO samples "
-        f"on {device} with batch_size={args.batch_size}."
+        f"on {device} with batch_size={args.batch_size}, mask_protocol={args.mask_protocol}."
     )
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(args.model_path, torch_dtype="auto").to(device).eval()
@@ -187,12 +192,11 @@ def main():
     pending = [
         sample
         for sample in samples
-        if not os.path.exists(os.path.join(args.save_dir, f"{sample['case_id']}.json"))
+        if not has_matching_protocol(
+            os.path.join(args.save_dir, f"{sample['case_id']}.json"), args.mask_protocol
+        )
     ]
-    base_eos = model.generation_config.eos_token_id
-    eos_token_id = list(base_eos) if isinstance(base_eos, (list, tuple)) else [base_eos]
-    eos_token_id.append(processor.tokenizer.convert_tokens_to_ids("<|mt_end|>"))
-    eos_token_id = list(dict.fromkeys(token_id for token_id in eos_token_id if token_id is not None))
+    eos_token_id = generation_eos_token_id(model, processor, args.mask_protocol)
 
     for sample_batch in batched(pending, args.batch_size):
         messages = [
@@ -216,12 +220,14 @@ def main():
             padding=True,
         ).to(device)
         with torch.no_grad():
-            generated = model.generate(
+            generation_kwargs = dict(
                 **inputs,
                 max_new_tokens=128,
                 do_sample=False,
-                eos_token_id=eos_token_id,
             )
+            if eos_token_id is not None:
+                generation_kwargs["eos_token_id"] = eos_token_id
+            generated = model.generate(**generation_kwargs)
         responses = processor.batch_decode(
             generated[:, inputs.input_ids.shape[1] :],
             skip_special_tokens=False,
@@ -231,7 +237,7 @@ def main():
         for sample, response in zip(sample_batch, responses):
             image = Image.open(sample["image_path"]).convert("RGB")
             width, height = image.size
-            codes = parse_mask_codes(response)
+            codes = parse_mask_codes(response, args.mask_protocol)
             if codes:
                 pixels = torch.from_numpy(resize.apply_image(np.array(image))).permute(2, 0, 1).unsqueeze(0).to(vq_sam2.dtype).to(device)
                 pixels = pixels.repeat(len(codes), 1, 1, 1)
@@ -247,11 +253,8 @@ def main():
                         "target": sample["target"],
                         "prediction": encode_rle(prediction),
                         "response": response,
-                        "mask_group_count": len(
-                            re.findall(
-                                r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>", response
-                            )
-                        ),
+                        "mask_protocol": args.mask_protocol,
+                        "mask_group_count": complete_mask_group_count(response),
                     },
                     file,
                 )
