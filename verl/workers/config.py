@@ -69,3 +69,10 @@ class WorkerConfig:
             raise ValueError("direct_grounding requires actor.optimize_segmenter=true.")
         if self.supervised_anchors.direct_mask_ce.enabled and not self.actor.optimize_segmenter:
             raise ValueError("direct_mask_ce requires actor.optimize_segmenter=true.")
+        if self.supervised_anchors.direct_mask_ce.enabled and (
+            not self.supervised_anchors.direct_grounding.train_files
+            or self.supervised_anchors.direct_grounding.batch_size <= 0
+        ):
+            raise ValueError(
+                "direct_mask_ce uses direct_grounding.train_files and batch_size; both are required when enabled."
+            )

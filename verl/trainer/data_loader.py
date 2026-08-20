@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch.utils.data import RandomSampler, SequentialSampler
@@ -23,9 +23,16 @@ from ..utils.dataset import RLHFDataset, collate_fn
 from .config import DataConfig
 
 
-def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> None:
+def create_train_dataloader(
+    config: DataConfig,
+    tokenizer: PreTrainedTokenizer,
+    processor: Optional[ProcessorMixin],
+    train_files: Optional[Sequence[str]] = None,
+    batch_size: Optional[int] = None,
+) -> StatefulDataLoader:
+    """Create a resumable training loader, optionally for an isolated auxiliary stream."""
     train_dataset = RLHFDataset(
-        data_path=config.train_files,
+        data_path=list(train_files) if train_files is not None else config.train_files,
         tokenizer=tokenizer,
         processor=processor,
         cap_prompt_key=config.cap_prompt_key,
@@ -53,7 +60,9 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
     else:
         sampler = SequentialSampler(data_source=train_dataset)
 
-    if config.mini_rollout_batch_size is not None:
+    if batch_size is not None:
+        train_batch_size = batch_size
+    elif config.mini_rollout_batch_size is not None:
         train_batch_size = config.mini_rollout_batch_size
     else:
         train_batch_size = config.rollout_batch_size
@@ -68,6 +77,12 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         drop_last=True,
     )
 
+    assert len(train_dataloader) >= 1
+    return train_dataloader
+
+
+def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> None:
+    train_dataloader = create_train_dataloader(config, tokenizer, processor)
     val_dataset = RLHFDataset(
         data_path=config.val_files,
         tokenizer=tokenizer,
@@ -103,7 +118,6 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         drop_last=False,
     )
 
-    assert len(train_dataloader) >= 1
     assert len(val_dataloader) >= 1
     print(f"Size of train dataloader: {len(train_dataloader)}")
     print(f"Size of val dataloader: {len(val_dataloader)}")

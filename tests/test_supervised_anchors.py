@@ -40,10 +40,24 @@ class SupervisedAnchorsTest(unittest.TestCase):
     def test_configs_reject_invalid_enabled_values(self):
         with self.assertRaisesRegex(ValueError, "qa_jsonl"):
             CaptionQAConfig(enabled=True).post_init()
+        with self.assertRaisesRegex(ValueError, "train_files"):
+            CaptionQAConfig(
+                enabled=True,
+                qa_jsonl="qa.jsonl",
+                judge_base_url="http://judge",
+                judge_model="judge",
+            ).post_init()
         with self.assertRaisesRegex(ValueError, "at least 2"):
             DirectGroundingConfig(enabled=True, rollouts=1).post_init()
+        with self.assertRaisesRegex(ValueError, "train_files"):
+            DirectGroundingConfig(enabled=True).post_init()
         with self.assertRaisesRegex(ValueError, "must be false"):
-            DirectGroundingConfig(enabled=True, consume_no_target_caption=True).post_init()
+            DirectGroundingConfig(
+                enabled=True,
+                train_files=["refcoco_full.parquet"],
+                batch_size=8,
+                consume_no_target_caption=True,
+            ).post_init()
         with self.assertRaisesRegex(ValueError, "warmup steps"):
             DirectGroundingConfig(warmup_start_step=31, warmup_end_step=30).post_init()
         with self.assertRaisesRegex(ValueError, "include_positive_sources"):
@@ -53,6 +67,23 @@ class SupervisedAnchorsTest(unittest.TestCase):
         config = DirectGroundingConfig()
         self.assertEqual(config.rollouts, 6)
         self.assertFalse(config.consume_no_target_caption)
+
+    def test_auxiliary_streams_have_independent_batch_sizes(self):
+        direct = DirectGroundingConfig(
+            enabled=True, train_files=["refcoco_full.parquet"], batch_size=128
+        )
+        qa = CaptionQAConfig(
+            enabled=True,
+            train_files=["dlc_qa.parquet"],
+            batch_size=64,
+            qa_jsonl="qa.jsonl",
+            judge_base_url="http://judge",
+            judge_model="judge",
+        )
+        direct.post_init()
+        qa.post_init()
+        self.assertEqual(direct.batch_size, 128)
+        self.assertEqual(qa.batch_size, 64)
 
     def test_direct_grounding_weight_warmup_boundaries(self):
         self.assertEqual(direct_grounding_loss_weight(10, 0.15, 10, 30), 0.0)

@@ -87,6 +87,8 @@ def direct_mask_ce_response_fields(
 @dataclass
 class CaptionQAConfig:
     enabled: bool = False
+    train_files: list[str] = field(default_factory=list)
+    batch_size: int = 0
     qa_jsonl: str = ""
     judge_base_url: str = ""
     judge_model: str = ""
@@ -94,21 +96,28 @@ class CaptionQAConfig:
     max_concurrency: int = 16
     timeout_seconds: float = 60.0
     reward_weight: float = 1.0
+    loss_weight: float = 1.0
 
     def post_init(self):
         if not self.enabled:
             return
         if not self.qa_jsonl or not self.judge_base_url or not self.judge_model:
             raise ValueError("caption_qa requires qa_jsonl, judge_base_url, and judge_model when enabled.")
+        if not self.train_files or self.batch_size <= 0:
+            raise ValueError("caption_qa requires train_files and a positive batch_size when enabled.")
         if self.max_concurrency <= 0 or self.timeout_seconds <= 0:
             raise ValueError("caption_qa concurrency and timeout must be positive.")
         if self.reward_weight < 0:
             raise ValueError("caption_qa.reward_weight must be non-negative.")
+        if self.loss_weight < 0:
+            raise ValueError("caption_qa.loss_weight must be non-negative.")
 
 
 @dataclass
 class DirectGroundingConfig:
     enabled: bool = False
+    train_files: list[str] = field(default_factory=list)
+    batch_size: int = 0
     rollouts: int = 6
     loss_weight: float = 0.25
     warmup_start_step: int = 10
@@ -121,6 +130,8 @@ class DirectGroundingConfig:
     def post_init(self):
         if self.enabled and self.rollouts < 2:
             raise ValueError("direct_grounding.rollouts must be at least 2 for GRPO.")
+        if self.enabled and (not self.train_files or self.batch_size <= 0):
+            raise ValueError("direct_grounding requires train_files and a positive batch_size when enabled.")
         if self.loss_weight < 0:
             raise ValueError("direct_grounding.loss_weight must be non-negative.")
         if self.warmup_start_step < 0 or self.warmup_end_step < self.warmup_start_step:

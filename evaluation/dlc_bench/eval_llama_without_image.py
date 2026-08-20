@@ -50,6 +50,7 @@ def query(prompt, temperature, max_tokens, model):
         top_p=1,
         frequency_penalty=0,
         presence_penalty=0,
+        extra_body={"stop_token_ids": [128009]},
     )
 
     message = response.choices[0].message.content
@@ -452,7 +453,7 @@ if __name__ == "__main__":
             pred_caption=pred_value,
             model=args.model,
             temperature=0.0,
-            max_tokens=300,
+            max_tokens=16,
             response_override=response_override,
             key=key,
             verbose=args.verbose,

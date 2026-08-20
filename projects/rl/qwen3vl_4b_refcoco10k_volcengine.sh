@@ -58,6 +58,8 @@ REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
 REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
 DISTILL_MIN_CAPTION_SCORE="${DISTILL_MIN_CAPTION_SCORE:-0.65}"
 SUPERVISED_CAPTION_QA_ENABLED="${SUPERVISED_CAPTION_QA_ENABLED:-false}"
+CAPTION_QA_TRAIN_DATA="${CAPTION_QA_TRAIN_DATA:-}"
+CAPTION_QA_BATCH_SIZE="${CAPTION_QA_BATCH_SIZE:-128}"
 CAPTION_QA_JSONL="${CAPTION_QA_JSONL:-}"
 CAPTION_QA_JUDGE_BASE_URL="${CAPTION_QA_JUDGE_BASE_URL:-}"
 CAPTION_QA_JUDGE_MODEL="${CAPTION_QA_JUDGE_MODEL:-}"
@@ -65,10 +67,13 @@ CAPTION_QA_JUDGE_API_KEY="${CAPTION_QA_JUDGE_API_KEY:-EMPTY}"
 CAPTION_QA_MAX_CONCURRENCY="${CAPTION_QA_MAX_CONCURRENCY:-16}"
 CAPTION_QA_TIMEOUT_SECONDS="${CAPTION_QA_TIMEOUT_SECONDS:-60}"
 CAPTION_QA_REWARD_WEIGHT="${CAPTION_QA_REWARD_WEIGHT:-1.0}"
+CAPTION_QA_LOSS_WEIGHT="${CAPTION_QA_LOSS_WEIGHT:-1.0}"
 # Direct grounding is an external supervised-anchor ablation, not part of the
 # original CycleGRPO path.  Keep it opt-in so gRefCOCO no-target rows retain
 # their outer-caption GRPO update by default.
 DIRECT_GROUNDING_ENABLED="${DIRECT_GROUNDING_ENABLED:-false}"
+DIRECT_TRAIN_DATA="${DIRECT_TRAIN_DATA:-}"
+DIRECT_BATCH_SIZE="${DIRECT_BATCH_SIZE:-128}"
 DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-6}"
 DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
 DIRECT_GROUNDING_WARMUP_START_STEP="${DIRECT_GROUNDING_WARMUP_START_STEP:-10}"
@@ -79,6 +84,10 @@ DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES
 DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-false}"
 DIRECT_MASK_CE_ENABLED="${DIRECT_MASK_CE_ENABLED:-false}"
 DIRECT_MASK_CE_LOSS_WEIGHT="${DIRECT_MASK_CE_LOSS_WEIGHT:-0.02}"
+# Seven training GPUs can consume a single 2:4:1 parent-prompt batch while a
+# separately launched DLC judge occupies the eighth GPU. Keep this opt-in so
+# historical arbitrary auxiliary batch sizes remain supported.
+THREE_STREAM_2_4_1_ENABLED="${THREE_STREAM_2_4_1_ENABLED:-false}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SAVE_LIMIT="${SAVE_LIMIT:-20}"
 # A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
@@ -136,7 +145,8 @@ for bool_name in \
     DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES \
     DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
-    DIRECT_MASK_CE_ENABLED; do
+    DIRECT_MASK_CE_ENABLED \
+    THREE_STREAM_2_4_1_ENABLED; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
         echo "${bool_name} must be true or false: ${bool_value}" >&2
@@ -145,7 +155,7 @@ for bool_name in \
 done
 
 if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
-    for caption_qa_required in CAPTION_QA_JSONL CAPTION_QA_JUDGE_BASE_URL CAPTION_QA_JUDGE_MODEL; do
+    for caption_qa_required in CAPTION_QA_TRAIN_DATA CAPTION_QA_JSONL CAPTION_QA_JUDGE_BASE_URL CAPTION_QA_JUDGE_MODEL; do
         if [[ -z "${!caption_qa_required}" ]]; then
             echo "${caption_qa_required} is required when SUPERVISED_CAPTION_QA_ENABLED=true." >&2
             exit 1
@@ -155,12 +165,56 @@ if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
         echo "CAPTION_QA_JSONL not found: ${CAPTION_QA_JSONL}" >&2
         exit 1
     fi
+    if [[ ! -f "${CAPTION_QA_TRAIN_DATA}" ]]; then
+        echo "CAPTION_QA_TRAIN_DATA not found: ${CAPTION_QA_TRAIN_DATA}" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${DIRECT_GROUNDING_ENABLED}" == "true" || "${DIRECT_MASK_CE_ENABLED}" == "true" ]]; then
+    if [[ -z "${DIRECT_TRAIN_DATA}" || ! -f "${DIRECT_TRAIN_DATA}" ]]; then
+        echo "DIRECT_TRAIN_DATA must point to the standalone direct-supervision parquet." >&2
+        exit 1
+    fi
 fi
 
 if [[ ! "${DIRECT_GROUNDING_ROLLOUTS}" =~ ^[2-9][0-9]*$ ]] \
-    || [[ ! "${CAPTION_QA_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "DIRECT_GROUNDING_ROLLOUTS must be >=2 and CAPTION_QA_MAX_CONCURRENCY must be positive." >&2
+    || [[ ! "${CAPTION_QA_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${DIRECT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${CAPTION_QA_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Direct/DLC-QA rollout and batch-size settings must be positive; direct rollouts must be >=2." >&2
     exit 1
+fi
+
+if [[ "${THREE_STREAM_2_4_1_ENABLED}" == "true" ]]; then
+    if (( NUM_GPUS != 7 )); then
+        echo "THREE_STREAM_2_4_1_ENABLED requires NUM_GPUS=7; reserve the eighth GPU for the DLC judge." >&2
+        exit 1
+    fi
+    if [[ "${DIRECT_GROUNDING_ENABLED}" != "true" || "${DIRECT_MASK_CE_ENABLED}" != "true" || "${SUPERVISED_CAPTION_QA_ENABLED}" != "true" ]]; then
+        echo "THREE_STREAM_2_4_1_ENABLED requires direct GRPO, direct mask CE, and caption QA to all be enabled." >&2
+        exit 1
+    fi
+    if [[ "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" || "${ROUTING_ENABLED}" != "false" || "${EMA_TEACHER_ENABLED}" != "false" || "${TEACHER_ANALYSIS_ENABLED}" != "false" || "${GROUNDEDNESS_ENABLED}" != "false" || "${CAPTION_SAFETY_ENABLED}" != "false" ]]; then
+        echo "THREE_STREAM_2_4_1_ENABLED keeps the 20k stream pure CycleGRPO plus pixel-IoU OPSD: enable OPSD/pixel IoU and disable teacher routing, safety, and groundedness auxiliaries." >&2
+        exit 1
+    fi
+    if ! awk -v caption_kl="${CAPTION_ANCHOR_KL_COEF}" -v segmentation_kl="${SEGMENTATION_ANCHOR_KL_COEF}" 'BEGIN { exit !(caption_kl == 0 && segmentation_kl == 0) }'; then
+        echo "THREE_STREAM_2_4_1_ENABLED requires CAPTION_ANCHOR_KL_COEF=0 and SEGMENTATION_ANCHOR_KL_COEF=0." >&2
+        exit 1
+    fi
+    if (( ROLLOUT_BATCH_SIZE % NUM_GPUS != 0 || DIRECT_BATCH_SIZE % NUM_GPUS != 0 || CAPTION_QA_BATCH_SIZE % NUM_GPUS != 0 )); then
+        echo "All three parent-prompt batch sizes must be divisible by the 7 training GPUs." >&2
+        exit 1
+    fi
+    if (( DIRECT_BATCH_SIZE != 2 * ROLLOUT_BATCH_SIZE || ROLLOUT_BATCH_SIZE != 2 * CAPTION_QA_BATCH_SIZE )); then
+        echo "2:4:1 requires ROLLOUT_BATCH_SIZE:DIRECT_BATCH_SIZE:CAPTION_QA_BATCH_SIZE = 2:4:1." >&2
+        exit 1
+    fi
+    if (( ROLLOUT_BATCH_SIZE % ACTOR_GLOBAL_BATCH_SIZE != 0 )); then
+        echo "ACTOR_GLOBAL_BATCH_SIZE must divide the main ROLLOUT_BATCH_SIZE in 2:4:1 mode." >&2
+        exit 1
+    fi
 fi
 
 if [[ ! "${DIRECT_GROUNDING_WARMUP_START_STEP}" =~ ^[0-9]+$ ]] \
@@ -306,12 +360,15 @@ CAPTION_QA_OVERRIDES=(
 if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
     CAPTION_QA_OVERRIDES+=(
         "worker.supervised_anchors.caption_qa.qa_jsonl=${CAPTION_QA_JSONL}"
+        "worker.supervised_anchors.caption_qa.train_files=['${CAPTION_QA_TRAIN_DATA}']"
+        "worker.supervised_anchors.caption_qa.batch_size=${CAPTION_QA_BATCH_SIZE}"
         "worker.supervised_anchors.caption_qa.judge_base_url=${CAPTION_QA_JUDGE_BASE_URL}"
         "worker.supervised_anchors.caption_qa.judge_model=${CAPTION_QA_JUDGE_MODEL}"
         "worker.supervised_anchors.caption_qa.judge_api_key=${CAPTION_QA_JUDGE_API_KEY}"
         "worker.supervised_anchors.caption_qa.max_concurrency=${CAPTION_QA_MAX_CONCURRENCY}"
         "worker.supervised_anchors.caption_qa.timeout_seconds=${CAPTION_QA_TIMEOUT_SECONDS}"
         "worker.supervised_anchors.caption_qa.reward_weight=${CAPTION_QA_REWARD_WEIGHT}"
+        "worker.supervised_anchors.caption_qa.loss_weight=${CAPTION_QA_LOSS_WEIGHT}"
     )
 fi
 
@@ -467,8 +524,10 @@ echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_T
 echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
-echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
+echo "DLC-QA train data: ${CAPTION_QA_TRAIN_DATA:-<disabled>} (batch=${CAPTION_QA_BATCH_SIZE}, loss weight=${CAPTION_QA_LOSS_WEIGHT})"
+echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (data=${DIRECT_TRAIN_DATA:-<disabled>}, batch=${DIRECT_BATCH_SIZE}, K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
 echo "Direct GT-mask CE anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive expressions only)"
+echo "Three-stream parent-prompt ratio 2:4:1: ${THREE_STREAM_2_4_1_ENABLED} (main=${ROLLOUT_BATCH_SIZE}, direct=${DIRECT_BATCH_SIZE}, DLC-QA=${CAPTION_QA_BATCH_SIZE}, training GPUs=${NUM_GPUS})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
 echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
@@ -550,6 +609,8 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.groundedness.token_jsd_multiplier=1.0 \
     "${CAPTION_QA_OVERRIDES[@]}" \
     worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
+    "worker.supervised_anchors.direct_grounding.train_files=['${DIRECT_TRAIN_DATA}']" \
+    worker.supervised_anchors.direct_grounding.batch_size="${DIRECT_BATCH_SIZE}" \
     worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
     worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
     worker.supervised_anchors.direct_grounding.warmup_start_step="${DIRECT_GROUNDING_WARMUP_START_STEP}" \

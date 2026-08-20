@@ -197,6 +197,16 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
             )
 
+            caption_qa = (
+                self.caption_qa_by_id.get(str(dam_source_ids[i]))
+                if task == "caption" and dam_source_ids is not None
+                else None
+            )
+            if task == "caption" and data.non_tensor_batch["source"][i] == "supervised_caption_qa" and not caption_qa:
+                raise ValueError(
+                    "supervised_caption_qa sample has no matching caption QA entry for "
+                    f"dam_source_id={dam_source_ids[i]!r}."
+                )
             reward_inputs.append(
                 {
                     "response": response_str,
@@ -214,10 +224,7 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     "seg_ground_truth": seg_ground_truth[i] if task == 'segmentation' else None,
                     "groundedness": groundedness[i] if groundedness is not None and task == 'caption' else None,
                     "extra_info": data.non_tensor_batch["extra_info"][i] if "extra_info" in data.non_tensor_batch else None,
-                    "caption_qa": (
-                        self.caption_qa_by_id.get(str(dam_source_ids[i]))
-                        if task == "caption" and dam_source_ids is not None else None
-                    ),
+                    "caption_qa": caption_qa,
                     "caption_qa_settings": self.config.caption_qa if task == "caption" else None,
                     # "cap_images": cap_images[i] if task == 'segmentation' else None,
                     # "cap_responses": cap_responses[i] if task == 'segmentation' else None,

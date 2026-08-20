@@ -22,7 +22,7 @@ from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
 from .config import PPOConfig
-from .data_loader import create_dataloader
+from .data_loader import create_dataloader, create_train_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
 
@@ -82,6 +82,28 @@ class Runner:
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
 
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
+        direct_config = config.worker.supervised_anchors.direct_grounding
+        direct_train_dataloader = None
+        if direct_config.enabled or config.worker.supervised_anchors.direct_mask_ce.enabled:
+            direct_train_dataloader = create_train_dataloader(
+                config.data,
+                tokenizer,
+                processor,
+                train_files=direct_config.train_files,
+                batch_size=direct_config.batch_size,
+            )
+            print(f"Size of direct-supervision dataloader: {len(direct_train_dataloader)}")
+        caption_qa_config = config.worker.supervised_anchors.caption_qa
+        caption_qa_train_dataloader = None
+        if caption_qa_config.enabled:
+            caption_qa_train_dataloader = create_train_dataloader(
+                config.data,
+                tokenizer,
+                processor,
+                train_files=caption_qa_config.train_files,
+                batch_size=caption_qa_config.batch_size,
+            )
+            print(f"Size of DLC-QA dataloader: {len(caption_qa_train_dataloader)}")
 
         trainer = RayPPOTrainer(
             config=config,
@@ -89,6 +111,8 @@ class Runner:
             processor=processor,
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
+            direct_train_dataloader=direct_train_dataloader,
+            caption_qa_train_dataloader=caption_qa_train_dataloader,
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,

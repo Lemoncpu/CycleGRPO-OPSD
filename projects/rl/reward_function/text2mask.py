@@ -1097,6 +1097,21 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
         for i, reward_input in enumerate(reward_inputs):
             source = reward_input["source"]
 
+            if source == "supervised_caption_qa":
+                qa_result = qa_reward_map[i]
+                qa_settings = reward_input["caption_qa_settings"]
+                qa_reward = qa_settings.reward_weight * qa_result["reward"]
+                scores.append(
+                    {
+                        "cap_overall": qa_reward,
+                        "cap_dlc_qa_reward": qa_reward,
+                        "cap_dlc_qa_raw_reward": qa_result["reward"],
+                        "cap_dlc_qa_question_count": qa_result["question_count"],
+                        "cap_dlc_qa_failure_count": qa_result["failure_count"],
+                    }
+                )
+                continue
+
             if source in ['thinking_res', 'thinking_gres', 'thinking_ver', 'reasonseg']:
                 format_score = format_reward(reward_input["response"])
                 # print("===============>response: ", reward_input["response"])

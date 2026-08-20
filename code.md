@@ -263,6 +263,26 @@ OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数�
 - 图像 caption 可使用多图，segmentation 只保留第一张图；视频保留帧率和帧数元数据。
 - 返回 `cap_*` 和 `seg_*` 两套 input ids、attention mask、position ids、raw prompt ids 与多模态数据。
 
+主 `data.train_files` 是唯一决定 CycleGRPO epoch 长度、global step 与 checkpoint cadence 的数据流。
+开启外部监督时，`trainer/main.py` 会另建两个可恢复的 `StatefulDataLoader`：
+`worker.supervised_anchors.direct_grounding.train_files` 专供 full RefCOCO 的 direct GRPO/GT-mask CE，
+`worker.supervised_anchors.caption_qa.train_files` 专供 DLC-QA caption GRPO。两者各有独立
+`batch_size`，每个主 step 只各读取一批，并循环遍历自身数据；它们绝不消费、重排或缩短主
+CycleGRPO iterator。resume 时三个 loader 的 state 都保存到 checkpoint。
+
+服务器入口的 `THREE_STREAM_2_4_1_ENABLED=true` 是固定配额模式：要求 `NUM_GPUS=7`，并要求
+main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
+`ROLLOUT_BATCH_SIZE:DIRECT_BATCH_SIZE:CAPTION_QA_BATCH_SIZE=2:4:1`。推荐值为
+`28:56:14`，故每个 FSDP rank 概念上处理 `4:8:2` 个 parent prompt；经过 `G=6` caption 或
+`K=6` localization rollout 后，各流仍按相同 rank 对齐。第八张物理 GPU 不属于 Ray/FSDP world，
+只运行独立 Llama DLC judge service。`ACTOR_GLOBAL_BATCH_SIZE` 仍必须整除主
+`ROLLOUT_BATCH_SIZE`，推荐保持 `28`，不能设为三流 parent batch 总和 `98`。
+该模式还强制 20k 主流为纯 CycleGRPO + online pixel-IoU OPSD：`OPSD_ENABLED=true`、
+`PIXEL_IOU_ENABLED=true`，但 routing、EMA teacher、teacher analysis、caption safety、groundedness、
+caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、privileged JSD、KL anchor
+或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
+人工 referring/GT-mask 监督来自独立 full RefCOCO 流。
+
 ### 3.3 Phase 1：caption rollout
 
 `RayPPOTrainer._make_batch_data`：
@@ -304,19 +324,17 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
-启用 `worker.supervised_anchors.direct_grounding` 时，trainer 从 cycle 与 non-cycle 子批的每个原始 UID
-只取一次 `grounding_query`，另建 `K=6` text-to-mask rollout group。每个独立 direct parent 子批在 rollout
-前裁到 world size 的整倍数；不足一个 rank-shard 时跳过该子批并记录原因，以满足分布式 `DataProto` 等分约束。
-这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。`include_positive_sources` 控制 RefCOCO/gRefCOCO
-人工 expression，`include_label_sources` 独立控制 COCO-Stuff/PACO-LVIS 的类别模板 query，`include_no_target`
-控制 `gres_no_target`。无论来源，direct group 的 query 均按偶/奇 index 在 RefCOCO/GRES `Please segment {query} in this image.`
-与 GroundingSuite `Please carefully check ...` 模板之间 1:1 交替。火山引擎入口默认关闭整个 direct-grounding
-anchor，因此默认 no-target 只保留原始外层 caption GRPO；所有 direct source 都必须由实验命令显式选择。即使 no-target
-被选入 direct batch，`consume_no_target_caption` 也强制为 `false`，使 `K=6` 拒识辅助不会替换主 `G=6` caption
-GRPO。其 UID、优势和日志均独立；正例 direct anchor 用原始 RLE IoU，no-target 跳过无 target mask 的 VQ-SAM2
-解码并使用原有拒识语义。direct no-target 不写 `segmentation_anchor_kl_mask`，避免 frozen SAMTok 的 mask-token policy
-与正确空响应冲突。该 batch 不调用 cycle 的 `R_Ci` 合并函数，因而不会改变 caption cycle 的低/中/高路由、teacher
-regenerate 或 JSD。
+启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
+`direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
+该文件必须是完整 RefCOCO train 的人工 expression 行，且 `source` 集合严格为
+`{refcoco_cycle}`；否则在首 step 显式报错。每个 parent expression 建立一个独立 `K=6`
+text-to-mask rollout group，先裁到 world size 的整倍数；不足一个 rank-shard 时跳过并记录原因。
+这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。query 按偶/奇
+index 在 RefCOCO/GRES `Please segment {query} in this image.` 与 GroundingSuite `Please carefully check ...`
+模板之间 1:1 交替。direct batch 的 UID、优势和日志独立，正例用原始 RLE pixel IoU，不调用 cycle
+的 `R_Ci` 合并、OPSD routing、teacher regenerate 或 JSD。火山引擎入口默认关闭 direct anchor；开启时
+必须传 `DIRECT_TRAIN_DATA` 与 `DIRECT_BATCH_SIZE`。`include_label_sources`、`include_no_target` 和
+`consume_no_target_caption` 仍保留为历史配置，但此 RefCOCO-only 流不使用它们，后者始终为 `false`。
 
 `direct_grounding.loss_weight` 是目标权重，不直接以固定值累积。开启该 anchor 后，
 `direct_grounding.warmup_start_step=10` 前有效权重为零，`10..30` 之间线性升到目标值，
@@ -325,9 +343,9 @@ cycle localization。direct GRPO 仍按其单独 UID 的 `K=6` reward/advantage 
 caption 或 localization reward 拼接后共同 whiten。
 
 可选 `worker.supervised_anchors.direct_mask_ce` 是与 sampled direct GRPO 分开的 GT SAMTok
-teacher-forcing anchor。它只从 `refcoco_cycle`/`grefcoco_cycle` 的每个原始 UID 建立一条
-`grounding_query -> seg_answer` 正例，使用相同的两种 localization prompt 交替；不接收
-`gres_no_target`、COCO-Stuff/PACO label-template、rollout response、IoU 或 advantage。GT response
+teacher-forcing anchor。它从同一个 standalone full RefCOCO parent batch 的每个原始 UID 建立一条
+`grounding_query -> seg_answer` 正例，使用相同的两种 localization prompt 交替；不接收 rollout response、
+IoU 或 advantage，也不会从 20k 主混合数据派生。GT response
 由完整 mask-token group、EOS 和 padding 组成，但 CE loss mask 仅覆盖 GT mask tokens，EOS/padding
 只作为前向上下文。构造该 batch 时必须从保留 batch 维度的 non-tensor object array 取每个 parent 的图像
 metadata、GT 和 mask；不得先以 `DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定
@@ -376,10 +394,14 @@ localization positive:
 `No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或 `<|mt_end|>` 片段；任一
 完整或残缺 mask-token 都会使该项为 `0.0`。第二项仍是原有的非重复奖励。
 
-当 `worker.supervised_anchors.caption_qa.enabled=true` 时，reward actor 在初始化时读取已验证的 DAM QA
-JSONL，并按 `dam_source_id` join Stuff/PACO caption rollout。独立 Llama judge 只看到学生 caption、题目和
-选项；每条 rollout 对全部题目作答，`1/0/-1` 的均值乘 `reward_weight` 加到原 cycle caption reward。
-服务超时、请求失败或无唯一选项时该题贡献 `0`，不会中断训练，也不改变 `R_Ci` 或 OPSD routing。
+当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
+`caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
+`supervised_caption_qa`。reward actor 在初始化时读取已验证的 QA JSONL，并严格按 `dam_source_id`
+join 每一条 rollout；任何缺失 join 都会报错而不是静默给零分。独立 Llama judge 只看到学生 caption、题目和
+选项；每条 rollout 对全部题目作答，`1/0/-1` 的均值乘 `reward_weight` 就是**全部** caption reward。
+该流不计算或混入 cycle IoU、format/non-repeat、caption safety、groundedness、`R_Ci`、OPSD routing、
+teacher regenerate 或 JSD。服务超时、请求失败或无唯一选项时该题贡献 `0`；`caption_qa.loss_weight`
+在 actor 累积时控制此独立 GRPO 梯度的实际比例，因为组内 GRPO 标准化不保留 reward 的常数缩放。
 
 `supervised_grounding` 的正例 segmentation reward 对一条 response 内所有合法 group 的 decoded union
 计算 `10 * pixel_iou + format + non_repeat`；`supervised_grounding_no_target` 复用 `No target.`
@@ -437,6 +459,14 @@ CycleGRPO 的核心奖励或纯 on-policy self-distillation。
 指标共同检查。GT-mask CE 是原论文 CycleGRPO 之外的显式外部有监督消融，不能称为 image-mask-only
 cycle self-supervision。
 
+三流实验中，主 20k 混合数据只贡献上式的 cycle caption/localization 项及其 OPSD auxiliary 项；它不会
+产生 direct GRPO、GT-mask CE 或 DLC-QA reward。full RefCOCO 独立 loader 只贡献
+`lambda_direct(step)*L_direct_GRPO + L_direct_mask_CE`；DLC-QA 独立 loader 只贡献
+`caption_qa.loss_weight*L_DLC_QA_GRPO`。三条梯度仍在每个主 step 的单次 optimizer step 前累计。
+三个 `StatefulDataLoader` state 分别保存为主 `dataloader.pt` 与 checkpoint 内
+`auxiliary_dataloaders.pt`，所以 resume 不会重置 40k/10k 流的采样位置。该三流外部监督是论文
+image-mask-only CycleGRPO 之外的实验扩展。
+
 ## 4. SAMTok / VQ-SAM2 实现
 
 ### 4.1 离散 mask 表示
@@ -481,11 +511,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 模块 | 实现职责 |
 |---|---|
 | `protocol.py` | `DataProto`：tensor/non-tensor/meta 三类数据的 select、union、repeat、concat、chunk、Ray 序列化 |
-| `trainer/main.py` | CLI/YAML 配置合并、Ray runner、worker/reward/dataloader/trainer 组装 |
-| `trainer/ray_trainer.py` | Cycle/non-cycle 分流、双阶段 rollout、reward/advantage、caption/seg 联合更新、验证与 checkpoint |
+| `trainer/main.py` | CLI/YAML 配置合并、Ray runner、主 CycleGRPO 与独立 RefCOCO/DLC-QA loader、worker/reward/trainer 组装 |
+| `trainer/ray_trainer.py` | Cycle/non-cycle 分流、双阶段 rollout、三条独立监督流的 reward/advantage 与梯度累积、验证与 checkpoint |
 | `trainer/ray_trainer_old.py` | 上游/旧训练循环，仅供对照，不是主入口 |
 | `trainer/core_algos.py` | GAE、GRPO、RLOO、ReMax、REINFORCE++，PPO clip loss、KL/value loss |
-| `trainer/data_loader.py` | train/val `RLHFDataset` 和 sampler/DataLoader |
+| `trainer/data_loader.py` | 主 train/val 与可恢复的独立辅助 train `RLHFDataset`、sampler/DataLoader |
 | `trainer/metrics.py` | reward、length、timing、throughput 指标汇总 |
 | `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分，以及 regenerate/direct-mask CE 的独立梯度累积调用 |
 | `workers/actor/dp_actor.py` | log-prob 前向、动态 micro-batch、PPO loss、独立 caption anchor KL、命名的 teacher-forcing CE、梯度累积和 optimizer step |
@@ -517,7 +547,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 OPSD 入口；可通过 `SUPERVISED_CAPTION_QA_*` 和 `DIRECT_GROUNDING_*` 启用外部监督锚定 |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 OPSD 入口；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -600,6 +630,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt、192-token 上限和 caption-only special-token logits blocker，另写 `.stats.json` 记录 leak rate |
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
+无图 Llama judge 通过 `eval_llama_without_image.py` 调用 OpenAI-compatible vLLM。对于未在 tokenizer 内声明 chat template 的 Llama-3.1 HF 权重，服务端须显式提供 Llama 3 chat template；评测器还必须传入 `stop_token_ids=[128009]`，将 `<|eot_id|>` 视为每道选择题的结束 token。单题只需输出一个选项，生成上限为 16 token，避免在正确答案后继续生成下一轮 `assistant` header。
+
 评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
 
 ## 6. 当前实现中的关键注意事项
@@ -630,6 +662,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
 26. **正例 segmentation 使用 union 语义。** 在线 CycleGRPO 与 direct reward 都记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。该训练语义与 RefCOCO/GRES/GroundingSuite 默认 `legacy_union` 一致；`first_mask` 仍是仅用于离线诊断的显式协议，两种评测协议不能混合比较。
+27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 full RefCOCO（每行 `source=refcoco_cycle` 且有人工 `grounding_query`）；`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
+28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL、caption safety 与 groundedness，防止 20k 主流混入任一辅助描述或分割监督。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1234,3 +1268,24 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：追加本日志。
 - 行为：移除布尔环境变量校验列表中已删除的 `REQUIRE_EXACTLY_ONE_MASK`。union-IoU 改动已不再定义该变量；其残留会在脚本的 `set -u` 下于模型、Ray 或训练日志初始化前报 `!bool_name: unbound variable`。训练参数、direct GRPO/CE、数据和 checkpoint 行为均不变。
 - 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过。
+
+### 2026-08-20 - 隔离 CycleGRPO、RefCOCO direct 与 DLC-QA 三条训练流
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/workers/config.py`、`verl/trainer/data_loader.py`、`verl/trainer/main.py`、`verl/trainer/ray_trainer.py`、`verl/workers/reward/function.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.2、3.4、3.5、3.6、5.2、5.3、关键注意事项 27 及 `README.md` 的监督训练示例。
+- 行为：主 `data.train_files` 的 20k image-mask mix 现在只执行 CycleGRPO/OPSD，不再从其 cycle 或 non-cycle 子批派生 direct GRPO、GT-mask CE 或 caption-QA。新增可恢复的独立 RefCOCO loader（`direct_grounding.train_files`/`batch_size`）和独立 DLC-QA loader（`caption_qa.train_files`/`batch_size`），每个主 step 各读取一批且不改变主 epoch/global step/save cadence；checkpoint 新增 `auxiliary_dataloaders.pt` 保存二者位置。direct loader 强制全是 `source=refcoco_cycle` 的 human-expression full RefCOCO 行，direct GRPO 与 GT-mask CE 都只从该流构造。DLC-QA loader rollout 标为 `supervised_caption_qa`，要求每条 `dam_source_id` 可 join 已验证 QA JSONL，并且其 reward 只等于 judge QA 得分，不混入 cycle IoU、格式、caption safety、groundedness、OPSD routing 或 teacher 辅助项；`caption_qa.loss_weight` 单独控制该 GRPO 梯度比例。三流仍在一个 optimizer step 前累计，因此这是论文 image-mask-only CycleGRPO 之外的外部监督扩展。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/supervised_anchors.py verl/workers/config.py verl/trainer/data_loader.py verl/trainer/main.py verl/trainer/ray_trainer.py verl/workers/reward/function.py projects/rl/reward_function/text2mask.py tests/test_supervised_anchors.py`、`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（15 tests）、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 均通过。当前机器无项目 GPU/Ray/vLLM 环境，尚未执行 8-GPU end-to-end smoke；服务器应先以 `MAX_STEPS=1` 验证三条 loader 的 size、direct source guard、QA join 和 `auxiliary_dataloaders.pt`。
+
+### 2026-08-20 - 增加七卡训练的 2:4:1 三流 batch 配额校验
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 3.2、关键注意事项 28、`README.md` 的训练说明和本日志。
+- 行为：新增 opt-in `THREE_STREAM_2_4_1_ENABLED=true`。该模式固定使用 7 个 Ray/FSDP 训练 GPU，要求 direct GRPO、direct GT-mask CE 和 DLC-QA 都启用，三条 parent-prompt batch 均可被 7 整除，并强制 `ROLLOUT_BATCH_SIZE:DIRECT_BATCH_SIZE:CAPTION_QA_BATCH_SIZE=2:4:1`。推荐 `28:56:14`，对应每 rank `4:8:2` 个 parent prompt；第八张 GPU 由外部 `vllm serve` 独占用于 DLC judge。该检查不把三条 parquet 拼接，不改变三条 loader 的独立循环、同 step 梯度累积、rollout 数或主 20k epoch 定义。为保证 20k 流只含主 CycleGRPO/OPSD，该模式要求 online pixel IoU 开启并关闭 routing/EMA teacher/regenerate-JSD 路径、caption safety、groundedness 与两项 anchor KL。`ACTOR_GLOBAL_BATCH_SIZE` 继续只约束主 rollout batch，必须整除 `ROLLOUT_BATCH_SIZE`。
+- 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；当前机器无 8 张 H20、项目 Conda/Ray/vLLM 环境，服务器应先以 `MAX_STEPS=1` 确认 judge endpoint、日志中的 7 卡 world size 与 `4:8:2` 三流 loader batch。
+
+### 2026-08-21 - 修复 DLC Llama judge 的对话结束 token
+
+- 代码：修改 `evaluation/dlc_bench/eval_llama_without_image.py`。
+- 文档：更新第 5.6 节 DLC judge 约定并追加本日志。
+- 行为：每个 OpenAI-compatible vLLM 请求显式传递 Llama-3.1 `<|eot_id|>` 的 `stop_token_ids=[128009]`，并将选择题生成上限从 300 降至 16 token。缺失 tokenizer chat template 的本地 HF 权重此前会在生成 `A.` 后继续输出下一轮 `assistant` header，直至长度上限；此修复不改变 QA、选项解析或评分公式。
+- 验证：服务端 `curl` 已确认 `stop_token_ids=[128009]` 时响应仅输出 `A.`；本地执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/dlc_bench/eval_llama_without_image.py` 与 `git diff --check`。

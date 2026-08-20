@@ -363,6 +363,13 @@ all complete, codebook-valid SAMTok groups in one response are decoded and
 unioned before scoring. The default teacher/routing settings are documented in
 `code.md`.
 
+For the seven-training-GPU plus one-DLC-judge-GPU setup, set
+`THREE_STREAM_2_4_1_ENABLED=true`, `NUM_GPUS=7`, and use parent-prompt batches
+`28/56/14` for main/direct/DLC-QA. This gives every FSDP rank `4/8/2` parent
+prompts and accumulates all three losses before one optimizer step. Start the
+judge separately on the reserved eighth GPU; do not include it in the training
+process's `CUDA_VISIBLE_DEVICES`.
+
 ```bash
 RUN_NAME=gs25k_cycle
 RUN_ROOT=$REPO_DIR/logs/$RUN_NAME
@@ -381,10 +388,16 @@ bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
 usually indicates a full or quota-limited filesystem; check `df -h` and remove
 only checkpoints you no longer need before restarting.
 
-### Optional direct referring supervision
+### Isolated direct referring supervision
 
-Direct supervision is disabled by default. When enabled it is **additive** to
-the cycle update:
+Direct supervision is disabled by default. The production three-stream setup
+keeps its data separate: the main 20k image-mask mix only runs CycleGRPO/OPSD;
+full RefCOCO only runs direct GRPO plus GT-mask CE; DLC-QA only runs caption
+GRPO with the language-judge reward. The two auxiliary loaders each consume one
+batch per main step and never draw from, or change the epoch length of, the main
+loader.
+
+The RefCOCO term is additive to the cycle update:
 
 ```text
 L_total = 0.5 L_cycle_caption + 0.5 L_cycle_localization
@@ -392,14 +405,14 @@ L_total = 0.5 L_cycle_caption + 0.5 L_cycle_localization
         + existing regenerate / JSD / KL auxiliary losses
 ```
 
-- Direct GRPO samples `K=6` masks from stored human referring expressions and
-  uses independent GRPO UID groups.
+- Direct GRPO samples `K=6` masks from stored human referring expressions in
+  `DIRECT_TRAIN_DATA` and uses independent GRPO UID groups.
 - The default schedule is zero through step 10, linearly grows until step 30,
   then reaches `DIRECT_GROUNDING_LOSS_WEIGHT`.
-- GT-mask CE teacher-forces one RefCOCO/gRefCOCO positive expression per
-  original UID. It excludes no-target and Stuff/PACO label templates.
-- gRefCOCO no-target remains in the original outer caption GRPO path even if
-  it is also selected for direct supervision.
+- GT-mask CE teacher-forces one full-RefCOCO positive expression per direct
+  parent UID. It excludes no-target and label-template sources.
+- The launcher rejects a direct file containing any source other than
+  `refcoco_cycle`, so a mixed 20k Parquet cannot silently become supervision.
 
 #### Export the full RefCOCO train Parquet
 
@@ -425,16 +438,16 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
   --split train --max-samples 42404 --seed 20260815 --device cuda
 ```
 
-Use `TRAIN_DATA="$REF_FULL_PA"` in the direct training command below when
-running this RefCOCO-only specialization. The converter writes absolute image
-paths, so rerun it after moving the COCO 2014 image directory.
+The converter writes absolute image paths, so rerun it after moving the COCO
+2014 image directory. Keep `TRAIN_DATA` below on the 20k cycle mix; pass this
+file only as `DIRECT_TRAIN_DATA`.
 
 Enable the two direct terms for a controlled experiment:
 
 ```bash
-RUN_NAME=gs25k_direct_ce
+RUN_NAME=gs20k_ref40k_direct_ce
 RUN_ROOT=$REPO_DIR/logs/$RUN_NAME
-TRAIN_DATA=$BASE_DIR/datasets/groundingsuite_25k.parquet
+TRAIN_DATA=$BASE_DIR/datasets/cyclegrpo_20k.parquet
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 MODEL_PATH="$MODEL_PATH" RUN_NAME="$RUN_NAME" RUN_ROOT="$RUN_ROOT" \
@@ -443,12 +456,13 @@ TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
 OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
 GROUNDEDNESS_ENABLED=false TRAINER_LOGGERS='["file"]' \
 DIRECT_GROUNDING_ENABLED=true \
+DIRECT_TRAIN_DATA="$REF_FULL_PA" DIRECT_BATCH_SIZE=128 \
 DIRECT_GROUNDING_ROLLOUTS=6 \
 DIRECT_GROUNDING_LOSS_WEIGHT=0.15 \
 DIRECT_GROUNDING_WARMUP_START_STEP=10 \
 DIRECT_GROUNDING_WARMUP_END_STEP=30 \
 DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES=true \
-DIRECT_GROUNDING_INCLUDE_NO_TARGET=true \
+DIRECT_GROUNDING_INCLUDE_NO_TARGET=false \
 DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES=false \
 DIRECT_MASK_CE_ENABLED=true \
 DIRECT_MASK_CE_LOSS_WEIGHT=0.02 \
@@ -475,10 +489,14 @@ the exported HF directory (after adding the two VQ-SAM2/SAM2 links), choose a
 new `RUN_ROOT`, and use `RESUME=false`. This intentionally resets optimizer and
 global-step state.
 
-## Optional DAM/DLC-QA supervision
+## Isolated DLC-QA description supervision
 
-DAM captions are never put into the actor caption prompt. They are used only
-to create a text-only QA sidecar for the selected DAM-backed Stuff/PACO rows.
+DLC-QA is a third independent training stream. Its 10k Parquet is used only to
+form caption prompts, and every row must expose a `dam_source_id` with a
+matching accepted entry in the QA JSONL. The reward is only the Llama judge's
+mean QA score: it has no cycle IoU, mask format, caption-safety, groundedness,
+teacher regenerate, or JSD term. `CAPTION_QA_LOSS_WEIGHT` controls the actual
+actor-gradient contribution after GRPO normalization.
 
 1. Convert DAM regions with `prepare_dam_cycle_dataset.py`, once per source.
    Its `--caption-manifest` output records `dam_source_id`, caption and source.
@@ -498,42 +516,32 @@ PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
   --max-concurrency 8 --generation-attempts 5 --request-retries 3 --seed 20260815
 ```
 
-3. Mix the **accepted** QA sidecar into a DAM-backed parquet. The mixer requires
-exactly 3,000 Stuff and 2,000 PACO accepted IDs unless its QA count arguments
-are explicitly changed:
+3. Prepare a dedicated QA Parquet containing the selected 10k rows. Do not mix
+it into the main 20k CycleGRPO Parquet. Every `dam_source_id` in this file must
+occur exactly once in the accepted QA sidecar.
 
 ```bash
-PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" projects/rl/datasets/prepare_balanced_cyclegrpo_dataset.py \
-  --refcoco /path/to/refcoco.parquet --grefcoco /path/to/grefcoco.parquet \
-  --cocostuff /path/to/dam_stuff.parquet --paco-parts /path/to/dam_paco.parquet \
-  --caption-qa-manifest "$BASE_DIR/datasets/dam/dam_caption_qa_5k.jsonl" \
-  --output /path/to/dam_balanced_25k.parquet \
-  --single-count 8750 --multi-count 6250 --stuff-count 5000 --part-count 2500 --no-target-count 2500 \
-  --seed 20260815
+QA_TRAIN_DATA=$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.parquet
+CAPTION_QA_JSONL=$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.jsonl
 ```
 
-DAM rows intentionally have `grounding_query=null`, so do **not** pass
-`--require-grounding-query` to this DAM-backed mixture. That flag is for a
-five-source direct-grounding experiment in which every selected row has a
-localization query.
-
-4. Add these variables to a complete training invocation (including its
-   `CUDA_VISIBLE_DEVICES`, `MODEL_PATH`, `RUN_ROOT`, and `TRAIN_DATA`):
+4. Add these variables to the full three-stream training invocation:
 
 ```bash
 SUPERVISED_CAPTION_QA_ENABLED=true \
-CAPTION_QA_JSONL="$BASE_DIR/datasets/dam/dam_caption_qa_5k.jsonl" \
+CAPTION_QA_TRAIN_DATA="$QA_TRAIN_DATA" CAPTION_QA_BATCH_SIZE=128 \
+CAPTION_QA_JSONL="$CAPTION_QA_JSONL" \
 CAPTION_QA_JUDGE_BASE_URL=http://127.0.0.1:8007/v1 \
 CAPTION_QA_JUDGE_MODEL=llama3.1-8b \
 CAPTION_QA_JUDGE_API_KEY=sk-abc123 \
 CAPTION_QA_REWARD_WEIGHT=1.0 \
+CAPTION_QA_LOSS_WEIGHT=1.0 \
 bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
 ```
 
-The QA reward is an external caption reward added to eligible DAM caption
-rollouts. It does not change cycle `R_Ci`, pixel-IoU calculation, or teacher
-routing. Inspect rejected QA JSONL and resume incomplete generation with
-`--resume`; do not add rejected records to the mixer.
+The runner fails before reward scoring if an auxiliary row lacks a matching QA
+entry. Inspect rejected QA JSONL and resume incomplete generation with
+`--resume`; do not add rejected records to the dedicated QA data.
 
 ## Exporting and evaluating checkpoints
 

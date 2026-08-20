@@ -39,6 +39,8 @@ worker:
   supervised_anchors:
     caption_qa:
       enabled: false
+      train_files: []
+      batch_size: 0
       qa_jsonl: ""
       judge_base_url: ""
       judge_model: ""
@@ -46,8 +48,11 @@ worker:
       max_concurrency: 16
       timeout_seconds: 60.0
       reward_weight: 1.0
+      loss_weight: 1.0
     direct_grounding:
       enabled: false
+      train_files: []
+      batch_size: 0
       rollouts: 6
       loss_weight: 0.25
       warmup_start_step: 10

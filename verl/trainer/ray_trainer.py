@@ -256,11 +256,15 @@ class RayPPOTrainer:
         ray_worker_group_cls: Type[RayWorkerGroup] = RayWorkerGroup,
         reward_fn: Optional[FunctionRewardManager] = None,
         val_reward_fn: Optional[FunctionRewardManager] = None,
+        direct_train_dataloader: Optional[StatefulDataLoader] = None,
+        caption_qa_train_dataloader: Optional[StatefulDataLoader] = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.direct_train_dataloader = direct_train_dataloader
+        self.caption_qa_train_dataloader = caption_qa_train_dataloader
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
@@ -412,6 +416,12 @@ class RayPPOTrainer:
         dataloader_path = os.path.join(folder_path, "dataloader.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_path)
+        auxiliary_dataloader_states = {}
+        if self.direct_train_dataloader is not None:
+            auxiliary_dataloader_states["direct"] = self.direct_train_dataloader.state_dict()
+        if self.caption_qa_train_dataloader is not None:
+            auxiliary_dataloader_states["caption_qa"] = self.caption_qa_train_dataloader.state_dict()
+        torch.save(auxiliary_dataloader_states, os.path.join(folder_path, "auxiliary_dataloaders.pt"))
 
         checkpointer_tracker_info = {
             "best_global_step": self.best_global_step,
@@ -455,6 +465,13 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
             else:
                 print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+            auxiliary_path = os.path.join(load_checkpoint_path, "auxiliary_dataloaders.pt")
+            if os.path.exists(auxiliary_path):
+                auxiliary_states = torch.load(auxiliary_path, weights_only=False)
+                if self.direct_train_dataloader is not None and "direct" in auxiliary_states:
+                    self.direct_train_dataloader.load_state_dict(auxiliary_states["direct"])
+                if self.caption_qa_train_dataloader is not None and "caption_qa" in auxiliary_states:
+                    self.caption_qa_train_dataloader.load_state_dict(auxiliary_states["caption_qa"])
 
     def export_huggingface_checkpoint(self, output_path: str) -> None:
         """Load an existing FSDP checkpoint and export its actor for offline evaluation."""
@@ -710,6 +727,108 @@ class RayPPOTrainer:
                 non_cycle_batch_ret = non_cycle_batch[: non_cycle_groups * n] if non_cycle_groups > 0 else None
                 return cycle_batch_ret, non_cycle_batch_ret
 
+    def _next_auxiliary_parent_batch(self, kind: str) -> Optional[DataProto]:
+        """Read one independent auxiliary batch without touching the CycleGRPO iterator."""
+        loader = (
+            self.direct_train_dataloader
+            if kind == "direct"
+            else self.caption_qa_train_dataloader
+        )
+        if loader is None:
+            return None
+        iterator_name = f"_{kind}_data_iterator"
+        iterator = getattr(self, iterator_name, None)
+        if iterator is None:
+            iterator = iter(loader)
+        try:
+            batch_dict = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            batch_dict = next(iterator)
+        setattr(self, iterator_name, iterator)
+        parent = DataProto.from_single_dict(
+            batch_dict,
+            meta_info={
+                "min_pixels": self.config.data.min_pixels,
+                "max_pixels": self.config.data.max_pixels,
+                "video_fps": self.config.data.video_fps,
+            },
+        )
+        parent.non_tensor_batch["uid"] = np.array(
+            [str(uuid.uuid4()) for _ in range(len(parent.batch))], dtype=object
+        )
+        return parent
+
+    def _make_caption_qa_batch(self, parent: DataProto) -> DataProto:
+        """Sample captions from the DLC-QA stream and mark them as judge-only."""
+        if "dam_source_id" not in parent.non_tensor_batch:
+            raise ValueError("caption_qa train_files must contain dam_source_id values that match qa_jsonl.")
+        world_size = self.actor_rollout_ref_wg.world_size
+        rollout_count = self.config.worker.rollout.n
+        group_align = world_size // math.gcd(rollout_count, world_size)
+        aligned_count = (len(parent) // group_align) * group_align
+        if aligned_count == 0:
+            raise ValueError(
+                "caption_qa.batch_size is too small for equal rollout dispatch: "
+                f"need a multiple of {group_align} prompts for world_size={world_size}."
+            )
+        if aligned_count != len(parent):
+            print(
+                f"[caption_qa] trim prompts {len(parent)}->{aligned_count} "
+                f"(rollout/world-size aligned)"
+            )
+            parent = parent[:aligned_count]
+        task_dict = {
+            key.replace("cap_", ""): parent.batch[key]
+            for key in ("cap_input_ids", "cap_attention_mask", "cap_position_ids")
+        }
+        task_dict.update(
+            {
+                key.replace("cap_", ""): parent.non_tensor_batch[key]
+                for key in ("cap_raw_prompt_ids", "cap_multi_modal_data")
+            }
+        )
+        gen_batch = DataProto.from_single_dict(task_dict, meta_info=dict(parent.meta_info))
+        gen_batch.meta_info["task"] = "caption"
+        generated = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+        qa_batch = parent.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+        qa_batch = qa_batch.union(generated)
+        qa_batch.non_tensor_batch["source"] = np.full(
+            len(qa_batch), "supervised_caption_qa", dtype=object
+        )
+        return qa_batch
+
+    def _prepare_caption_qa_advantage(
+        self, batch: DataProto, metrics: dict[str, Any], timing_raw: dict[str, Any]
+    ) -> DataProto:
+        """Compute GRPO advantages from DLC judge rewards only."""
+        self._balance_batch(batch, metrics=metrics, logging_prefix="caption_qa_seqlen")
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        with timer("caption_qa_reward", timing_raw):
+            reward_ref = self.reward_fn.compute_reward.remote(self.global_step, batch, task="caption")
+        with timer("caption_qa_old", timing_raw):
+            batch = batch.union(self.actor_rollout_ref_wg.compute_log_probs(batch))
+        if self.use_reference_policy:
+            with timer("caption_qa_ref", timing_raw):
+                batch = batch.union(self.actor_rollout_ref_wg.compute_ref_log_probs(batch))
+        with timer("caption_qa_adv", timing_raw):
+            reward_tensor, reward_metrics = ray.get(reward_ref)
+            batch.batch["token_level_scores"] = reward_tensor
+            batch.batch["token_level_rewards"] = reward_tensor
+            metrics.update(
+                {
+                    f"reward/caption_qa_{key}": value
+                    for key, value in reduce_metrics(reward_metrics).items()
+                }
+            )
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+            )
+        return batch
+
     def _make_seg_batch_data_for_caption(
         self,
         batch: DataProto,
@@ -718,6 +837,7 @@ class RayPPOTrainer:
         seg_problem_overrides: Optional[list[str]] = None,
         source_overrides: Optional[list[str]] = None,
         localization_prompt_variant_overrides: Optional[list[str]] = None,
+        dataset: Optional[Any] = None,
     ) -> DataProto:
 
         all_seg_problems = []
@@ -765,7 +885,8 @@ class RayPPOTrainer:
                 example['nframes'] = seg_mm_data.get('nframes')
                 example['cap_videos'] = cap_mm_data['videos']
 
-            gen_seg_batch_list.append(self.train_dataloader.dataset._gen_seg_preprocess(example))
+            preprocessing_dataset = dataset or self.train_dataloader.dataset
+            gen_seg_batch_list.append(preprocessing_dataset._gen_seg_preprocess(example))
 
         gen_seg_batch_dict = {}
         for k in gen_seg_batch_list[0].keys():
@@ -870,7 +991,9 @@ class RayPPOTrainer:
         # gen_batch_output.non_tensor_batch.keys(): ['multi_modal_data', 'mask_token_accuracy', 'format_correct', 'iou_scores']
         return batch, gen_batch_output
 
-    def _make_direct_grounding_batch(self, cycle_batch: DataProto) -> Optional[DataProto]:
+    def _make_direct_grounding_batch(
+        self, cycle_batch: DataProto, dataset: Optional[Any] = None
+    ) -> Optional[DataProto]:
         """Generate a separate query-to-mask grounding GRPO batch.
 
         The source batch contains G caption rollouts per original image. Keep one
@@ -934,11 +1057,14 @@ class RayPPOTrainer:
             localization_prompt_variant_overrides=alternating_localization_prompt_variants(
                 len(queries)
             ),
+            dataset=dataset,
         )
         direct_batch.non_tensor_batch["direct_grounding"] = np.ones(len(direct_batch), dtype=object)
         return direct_batch
 
-    def _make_direct_mask_ce_batch(self, cycle_batch: DataProto) -> Optional[DataProto]:
+    def _make_direct_mask_ce_batch(
+        self, cycle_batch: DataProto, dataset: Optional[Any] = None
+    ) -> Optional[DataProto]:
         """Build one human-expression GT-mask CE target per original sample UID.
 
         This intentionally does not reuse direct GRPO rollouts: sampled direct
@@ -977,7 +1103,7 @@ class RayPPOTrainer:
         if not indices:
             return None
 
-        dataset = self.train_dataloader.dataset
+        dataset = dataset or self.train_dataloader.dataset
         prompt_records = []
         target_ids = []
         selected_uids = []
@@ -1879,6 +2005,14 @@ class RayPPOTrainer:
                 return
 
         self.data_iterator = iter(self.train_dataloader)
+        self._direct_data_iterator = (
+            iter(self.direct_train_dataloader) if self.direct_train_dataloader is not None else None
+        )
+        self._caption_qa_data_iterator = (
+            iter(self.caption_qa_train_dataloader)
+            if self.caption_qa_train_dataloader is not None
+            else None
+        )
         while self.global_step < self.training_steps:
             self.global_step += 1
 
@@ -1971,6 +2105,16 @@ class RayPPOTrainer:
                 seg_batch = None
                 direct_grounding_batch = None
                 direct_mask_ce_batch = None
+                caption_qa_batch = None
+                direct_parent_batch = self._next_auxiliary_parent_batch("direct")
+                caption_qa_parent_batch = self._next_auxiliary_parent_batch("caption_qa")
+                if direct_parent_batch is not None:
+                    direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
+                    if direct_sources != {"refcoco_cycle"}:
+                        raise ValueError(
+                            "DIRECT_TRAIN_DATA must be RefCOCO human-expression rows only "
+                            f"(source=refcoco_cycle); got {sorted(direct_sources)}."
+                        )
                 if cycle_batch is not None and (
                     self.config.worker.actor.optimize_captioner or self.config.worker.actor.optimize_segmenter
                 ):
@@ -1979,20 +2123,6 @@ class RayPPOTrainer:
                         cycle_batch.meta_info["n"] = self.config.worker.opsd.localization_rollouts
                         self.actor_rollout_ref_wg.prepare_rollout_engine()
                         cycle_cap_batch, cycle_seg_batch = self._make_seg_batch_data_for_caption(cycle_batch)
-                        direct_batches = [
-                            direct_batch
-                            for parent_batch in (cycle_batch, non_cycle_batch)
-                            if parent_batch is not None
-                            for direct_batch in [self._make_direct_grounding_batch(parent_batch)]
-                            if direct_batch is not None
-                        ]
-                        if direct_batches:
-                            direct_grounding_batch = (
-                                direct_batches[0]
-                                if len(direct_batches) == 1
-                                else DataProto.concat(direct_batches)
-                            )
-                        direct_mask_ce_batch = self._make_direct_mask_ce_batch(cycle_batch)
                         cycle_cap_batch.meta_info.pop("n", None)
                         self.actor_rollout_ref_wg.release_rollout_engine()
                         if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:
@@ -2101,6 +2231,41 @@ class RayPPOTrainer:
                                 cycle_cap_batch
                             )
                             metrics.update(regenerate_metrics)
+
+                # External grounding supervision is intentionally sourced only
+                # from its own RefCOCO loader, never from the 20k CycleGRPO mix.
+                if direct_parent_batch is not None:
+                    direct_dataset = self.direct_train_dataloader.dataset
+                    with timer("direct_grounding_gen", timing_raw):
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        direct_grounding_batch = self._make_direct_grounding_batch(
+                            direct_parent_batch, dataset=direct_dataset
+                        )
+                        self.actor_rollout_ref_wg.release_rollout_engine()
+                    direct_mask_ce_batch = self._make_direct_mask_ce_batch(
+                        direct_parent_batch, dataset=direct_dataset
+                    )
+                    if (
+                        direct_grounding_batch is not None
+                        and self.config.worker.opsd.enabled
+                        and self.config.worker.opsd.pixel_iou.enabled
+                    ):
+                        self.actor_rollout_ref_wg.prepare_mask_decoder()
+                        direct_grounding_batch = self.actor_rollout_ref_wg.compute_pixel_mask_ious(
+                            direct_grounding_batch
+                        )
+                        direct_grounding_batch.non_tensor_batch["iou_scores"] = (
+                            direct_grounding_batch.non_tensor_batch["pixel_iou"].copy()
+                        )
+                        self.actor_rollout_ref_wg.release_mask_decoder()
+
+                # DLC-QA has a separate caption stream and is scored solely by
+                # the configured judge, without cycle IoU or OPSD routing.
+                if caption_qa_parent_batch is not None:
+                    with timer("caption_qa_gen", timing_raw):
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        caption_qa_batch = self._make_caption_qa_batch(caption_qa_parent_batch)
+                        self.actor_rollout_ref_wg.release_rollout_engine()
 
                 if cycle_cap_batch is not None and self.config.worker.actor.optimize_captioner:
 
@@ -2288,6 +2453,15 @@ class RayPPOTrainer:
                         // self.config.worker.supervised_anchors.direct_grounding.rollouts
                     )
 
+                if caption_qa_batch is not None and self.config.worker.actor.optimize_captioner:
+                    caption_qa_batch = self._prepare_caption_qa_advantage(
+                        caption_qa_batch, metrics, timing_raw
+                    )
+                    metrics["supervised_anchors/caption_qa_rollouts"] = len(caption_qa_batch)
+                    metrics["supervised_anchors/caption_qa_prompt_count"] = (
+                        len(caption_qa_batch) // self.config.worker.rollout.n
+                    )
+
                 # Groundedness is fully consumed by the reward and optional
                 # auxiliary JSD batch. Keep it off every main PPO actor batch.
                 if cycle_cap_batch is not None:
@@ -2345,7 +2519,14 @@ class RayPPOTrainer:
                     seg_batch_size = len(seg_batch) if seg_batch is not None else 0
                     direct_grounding_size = len(direct_grounding_batch) if direct_grounding_batch is not None else 0
                     direct_mask_ce_size = len(direct_mask_ce_batch) if direct_mask_ce_batch is not None else 0
-                    total_size = cap_batch_size + seg_batch_size + direct_grounding_size + direct_mask_ce_size
+                    caption_qa_size = len(caption_qa_batch) if caption_qa_batch is not None else 0
+                    total_size = (
+                        cap_batch_size
+                        + seg_batch_size
+                        + direct_grounding_size
+                        + direct_mask_ce_size
+                        + caption_qa_size
+                    )
                     
                     cap_grad_weight = self.config.worker.opsd.caption_loss_weight
                     seg_grad_weight = self.config.worker.opsd.localization_loss_weight
@@ -2368,6 +2549,12 @@ class RayPPOTrainer:
                                 else 0.0
                             ),
                             "supervised_anchors/direct_mask_ce_samples": direct_mask_ce_size,
+                            "supervised_anchors/caption_qa_loss_weight": (
+                                self.config.worker.supervised_anchors.caption_qa.loss_weight
+                                if self.config.worker.supervised_anchors.caption_qa.enabled
+                                else 0.0
+                            ),
+                            "supervised_anchors/caption_qa_samples": caption_qa_size,
                         }
                     )
 
@@ -2385,6 +2572,25 @@ class RayPPOTrainer:
                                 actor_metrics.update({f"cap_{k}": v for k, v in reduce_metrics(cap_output.non_tensor_batch).items()})
                             
                             def accumulate_caption_auxiliary_gradients() -> None:
+                                if caption_qa_batch is not None and caption_qa_size > 0:
+                                    caption_qa_batch.meta_info["grad_weight"] = (
+                                        self.config.worker.supervised_anchors.caption_qa.loss_weight
+                                    )
+                                    caption_qa_batch.meta_info["global_batch_size_per_device"] = (
+                                        len(caption_qa_batch) // self.actor_rollout_ref_wg.world_size
+                                    )
+                                    qa_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(
+                                        caption_qa_batch
+                                    )
+                                    actor_metrics.update(
+                                        {
+                                            f"caption_qa_{key}": value
+                                            for key, value in reduce_metrics(
+                                                qa_output.non_tensor_batch
+                                            ).items()
+                                        }
+                                    )
+
                                 if regenerate_batch is not None and len(regenerate_batch) > 0:
                                     regen_count = len(regenerate_batch)
                                     regen_batch, regen_pad = pad_dataproto_to_divisor(
