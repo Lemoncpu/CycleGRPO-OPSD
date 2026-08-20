@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--max-tokens", type=int, default=900)
+    parser.add_argument(
+        "--stop-token-id",
+        type=int,
+        help="Optional vLLM stop token ID passed to generation and validation requests.",
+    )
     parser.add_argument("--resume", action="store_true", help="Append missing IDs to an existing JSONL output.")
     parser.add_argument("--overwrite", action="store_true", help="Permit replacing companion JSON outputs.")
     return parser.parse_args()
@@ -205,19 +210,21 @@ def request_completion(
     prompt: str,
     temperature: float,
     max_tokens: int,
+    stop_token_id: int | None,
     timeout: float,
     retries: int,
 ) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-            "top_p": 1,
-            "max_tokens": max_tokens,
-        }
-    ).encode("utf-8")
+    payload_data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "top_p": 1,
+        "max_tokens": max_tokens,
+    }
+    if stop_token_id is not None:
+        payload_data["stop_token_ids"] = [stop_token_id]
+    payload = json.dumps(payload_data).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=payload,
@@ -295,6 +302,7 @@ def validate_with_llm(
         prompt=prompt,
         temperature=0.0,
         max_tokens=250,
+        stop_token_id=args.stop_token_id,
         timeout=args.timeout,
         retries=args.request_retries,
     )
@@ -317,6 +325,7 @@ def generate_one(row: dict[str, Any], args: argparse.Namespace) -> tuple[dict[st
                 prompt=GENERATION_PROMPT.format(caption=row["caption"].strip()),
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                stop_token_id=args.stop_token_id,
                 timeout=args.timeout,
                 retries=args.request_retries,
             )

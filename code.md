@@ -565,7 +565,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并写入 canonical semantic-label `grounding_query`。
 - `grounding_queries.py`：COCO-Stuff 官方 91 类 PNG-to-label 映射，以及 Stuff/PACO label-template query 的唯一构造器；不读取模型、图像或评测数据。
 - `prepare_dam_cycle_dataset.py`：从 DAM `COCOStuff`/`PACO` 的 `mask_rle + caption` annotation 构造 DAM-backed `cocostuff_cycle` 或 `paco_part_cycle` parquet；PACO 与官方 part annotation 交叉校验，caption 写入独立 manifest。
-- `generate_dam_caption_qa.py`：从 DAM caption manifest 离线生成、LLM 验证并可恢复写出 text-only DLC 风格 QA；可额外导出 DLC judge 兼容的 QA/class-name JSON，不读取图像且不修改训练数据或 reward。
+- `generate_dam_caption_qa.py`：从 DAM caption manifest 离线生成、LLM 验证并可恢复写出 text-only DLC 风格 QA；可额外导出 DLC judge 兼容的 QA/class-name JSON，不读取图像且不修改训练数据或 reward。`--stop-token-id` 可将特定 vLLM token 作为生成/验证的请求级结束 token；Llama-3.1 使用 `128009`（`<|eot_id|>`）。
 - `prepare_balanced_cyclegrpo_dataset.py`：按可配置配额抽取；默认 `8k/4k/5k/2k/1k`，multi 仅接受多实例 gRefCOCO，QA manifest ID 强制优先纳入 DAM 配额。
 - `prepare_refcoco_rl_dataset.py`：标准 RefCOCO train split 转单目标 CycleGRPO parquet；编码 mask token、保留原始 RLE，并写出独立 `grounding_query`。
 - `prepare_gres_no_target_rl_dataset.py`：构造 no-target/null 拒识样本，是主 shell 的第二个数据源。
@@ -1283,9 +1283,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：新增 opt-in `THREE_STREAM_2_4_1_ENABLED=true`。该模式固定使用 7 个 Ray/FSDP 训练 GPU，要求 direct GRPO、direct GT-mask CE 和 DLC-QA 都启用，三条 parent-prompt batch 均可被 7 整除，并强制 `ROLLOUT_BATCH_SIZE:DIRECT_BATCH_SIZE:CAPTION_QA_BATCH_SIZE=2:4:1`。推荐 `28:56:14`，对应每 rank `4:8:2` 个 parent prompt；第八张 GPU 由外部 `vllm serve` 独占用于 DLC judge。该检查不把三条 parquet 拼接，不改变三条 loader 的独立循环、同 step 梯度累积、rollout 数或主 20k epoch 定义。为保证 20k 流只含主 CycleGRPO/OPSD，该模式要求 online pixel IoU 开启并关闭 routing/EMA teacher/regenerate-JSD 路径、caption safety、groundedness 与两项 anchor KL。`ACTOR_GLOBAL_BATCH_SIZE` 继续只约束主 rollout batch，必须整除 `ROLLOUT_BATCH_SIZE`。
 - 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；当前机器无 8 张 H20、项目 Conda/Ray/vLLM 环境，服务器应先以 `MAX_STEPS=1` 确认 judge endpoint、日志中的 7 卡 world size 与 `4:8:2` 三流 loader batch。
 
-### 2026-08-21 - 修复 DLC Llama judge 的对话结束 token
+### 2026-08-21 - 修复 DLC Llama judge 与 QA 生成的对话结束 token
 
-- 代码：修改 `evaluation/dlc_bench/eval_llama_without_image.py`。
+- 代码：修改 `evaluation/dlc_bench/eval_llama_without_image.py` 和 `projects/rl/datasets/generate_dam_caption_qa.py`。
 - 文档：更新第 5.6 节 DLC judge 约定并追加本日志。
-- 行为：每个 OpenAI-compatible vLLM 请求显式传递 Llama-3.1 `<|eot_id|>` 的 `stop_token_ids=[128009]`，并将选择题生成上限从 300 降至 16 token。缺失 tokenizer chat template 的本地 HF 权重此前会在生成 `A.` 后继续输出下一轮 `assistant` header，直至长度上限；此修复不改变 QA、选项解析或评分公式。
-- 验证：服务端 `curl` 已确认 `stop_token_ids=[128009]` 时响应仅输出 `A.`；本地执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/dlc_bench/eval_llama_without_image.py` 与 `git diff --check`。
+- 行为：DLC evaluator 每个 OpenAI-compatible vLLM 请求显式传递 Llama-3.1 `<|eot_id|>` 的 `stop_token_ids=[128009]`，并将选择题生成上限从 300 降至 16 token。DAM QA 生成器新增可选 `--stop-token-id`，将相同结束 token 同时传给生成与 validator 请求，不影响其他服务的默认请求格式。缺失 tokenizer chat template 的本地 HF 权重此前会在生成 `A.` 或 JSON 后继续输出下一轮 `assistant` header，直至长度上限；此修复不改变 QA schema、选项解析或评分公式。
+- 验证：服务端 `curl` 已确认 `stop_token_ids=[128009]` 时响应仅输出 `A.`；本地执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/dlc_bench/eval_llama_without_image.py projects/rl/datasets/generate_dam_caption_qa.py`、`python3 -m unittest tests.test_dam_caption_qa` 与 `git diff --check`。
