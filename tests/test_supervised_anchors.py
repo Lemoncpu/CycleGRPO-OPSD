@@ -21,6 +21,7 @@ direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
 direct_mask_ce_response_fields = _CONFIG_MODULE.direct_mask_ce_response_fields
 direct_mask_ce_source = _CONFIG_MODULE.direct_mask_ce_source
 direct_grounding_source = _CONFIG_MODULE.direct_grounding_source
+localization_media_keys = _CONFIG_MODULE.localization_media_keys
 non_tensor_batch_row = _CONFIG_MODULE.non_tensor_batch_row
 
 
@@ -121,6 +122,22 @@ class SupervisedAnchorsTest(unittest.TestCase):
     def test_direct_mask_ce_keeps_non_tensor_batch_axis_for_media(self):
         media_rows = [{"images": ["first.jpg"]}, {"images": ["second.jpg"]}]
         self.assertEqual(non_tensor_batch_row(media_rows, 1), {"images": ["second.jpg"]})
+
+    def test_localization_media_keys_support_main_and_auxiliary_batches(self):
+        self.assertEqual(
+            localization_media_keys(
+                {"seg_multi_modal_data": [], "multi_modal_data": []}
+            ),
+            ("seg_multi_modal_data", "multi_modal_data"),
+        )
+        self.assertEqual(
+            localization_media_keys(
+                {"seg_multi_modal_data": [], "cap_multi_modal_data": []}
+            ),
+            ("seg_multi_modal_data", "cap_multi_modal_data"),
+        )
+        with self.assertRaisesRegex(KeyError, "caption media"):
+            localization_media_keys({"seg_multi_modal_data": []})
 
     def test_direct_grounding_keeps_no_target_out_of_cycle_sources(self):
         self.assertEqual(direct_grounding_source("refcoco_cycle", True), "supervised_grounding")

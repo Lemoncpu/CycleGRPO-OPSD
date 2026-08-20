@@ -1,7 +1,7 @@
 """Configuration for external rewards that do not alter CycleGRPO routing."""
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 
 def direct_grounding_source(
@@ -72,6 +72,20 @@ def direct_mask_ce_source(
 def non_tensor_batch_row(values: Any, index: int) -> Any:
     """Select a row before DataProto indexing can collapse an object array."""
     return values[index]
+
+
+def localization_media_keys(non_tensor_batch: Mapping[str, Any]) -> tuple[str, str]:
+    """Return segmentation and caption media keys for main or auxiliary batches."""
+    seg_key = "seg_multi_modal_data"
+    if seg_key not in non_tensor_batch:
+        raise KeyError(f"Localization batch is missing {seg_key!r}.")
+    for cap_key in ("multi_modal_data", "cap_multi_modal_data"):
+        if cap_key in non_tensor_batch:
+            return seg_key, cap_key
+    raise KeyError(
+        "Localization batch is missing caption media; expected 'multi_modal_data' "
+        "or 'cap_multi_modal_data'."
+    )
 
 
 def direct_mask_ce_response_fields(

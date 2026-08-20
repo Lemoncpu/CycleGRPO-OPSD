@@ -66,6 +66,7 @@ from ..workers.supervised_anchors import (
     direct_mask_ce_response_fields,
     direct_mask_ce_source,
     direct_grounding_source,
+    localization_media_keys,
     non_tensor_batch_row,
 )
 from .config import PPOConfig
@@ -842,13 +843,14 @@ class RayPPOTrainer:
 
         all_seg_problems = []
         gen_seg_batch_list = []
-        for i in range(len(batch.non_tensor_batch['multi_modal_data'])):
+        seg_media_key, cap_media_key = localization_media_keys(batch.non_tensor_batch)
+        for i in range(len(batch.non_tensor_batch[seg_media_key])):
             seg_problem = (
                 seg_problem_overrides[i]
                 if seg_problem_overrides is not None
                 else self.tokenizer.decode(batch.batch['responses'][i], skip_special_tokens=True)
             )
-            seg_mm_data = batch.non_tensor_batch['seg_multi_modal_data'][i]
+            seg_mm_data = batch.non_tensor_batch[seg_media_key][i]
             # Remove empty thinking tags if present
             seg_problem = re.sub(r'<think>\s*</think>\s*', '', seg_problem)
             # Strip vision-related markers the captioner may have echoed back; otherwise
@@ -862,7 +864,7 @@ class RayPPOTrainer:
             if 'videos' in seg_mm_data:
                 seg_problem = strip_temporal_priors(seg_problem)
             all_seg_problems.append(seg_problem)
-            cap_mm_data = batch.non_tensor_batch['multi_modal_data'][i]
+            cap_mm_data = batch.non_tensor_batch[cap_media_key][i]
             # Use both downstream image-localization phrasings for cycle captions.
             # Direct no-target grounding passes an explicit RefCOCO/GRES variant so
             # its prompt has positive cycle counterparts instead of standing alone.
@@ -1107,6 +1109,7 @@ class RayPPOTrainer:
             return None
 
         dataset = dataset or self.train_dataloader.dataset
+        seg_media_key, cap_media_key = localization_media_keys(cycle_batch.non_tensor_batch)
         prompt_records = []
         target_ids = []
         selected_uids = []
@@ -1117,10 +1120,10 @@ class RayPPOTrainer:
             # DataProto[parent_index] unwraps an object-array row to its dict.
             # Select from the parent batch so list/array indexing remains valid.
             seg_media = non_tensor_batch_row(
-                cycle_batch.non_tensor_batch["seg_multi_modal_data"], parent_index
+                cycle_batch.non_tensor_batch[seg_media_key], parent_index
             )
             cap_media = non_tensor_batch_row(
-                cycle_batch.non_tensor_batch["multi_modal_data"], parent_index
+                cycle_batch.non_tensor_batch[cap_media_key], parent_index
             )
             example = {
                 "seg_problem": queries[output_index],

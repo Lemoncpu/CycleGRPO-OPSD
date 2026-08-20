@@ -360,7 +360,9 @@ anchor。正例从 standalone RefCOCO parent batch 的每个原始 UID 建立
 `grounding_query -> <answer>No target.</answer>` SFT 目标。二者都使用同样的两种 localization prompt
 交替，不接收 rollout response、IoU 或 advantage，也不会从 20k 主混合数据派生。CE loss mask 覆盖正例
 的完整 mask token 或 no-target 的完整拒识文本 token，EOS/padding 只作为前向上下文。构造该 batch 时必须从
-保留 batch 维度的 non-tensor object array 取每个 parent 的图像 metadata、GT 和 mask；不得先以
+保留 batch 维度的 non-tensor object array 取每个 parent 的图像 metadata、GT 和 mask。主 cycle rollout
+的 caption media 字段名是 `multi_modal_data`，独立 direct loader 则保留
+`cap_multi_modal_data`；两者共享 `seg_multi_modal_data`，trainer 必须兼容这两种合法输入。不得先以
 `DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定 `loss_weight=0.02`，并在同一
 optimizer step 中独立累积，不通过 K 次 rollout 放大。
 
@@ -1324,3 +1326,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.4、3.5、关键注意事项 27 和本日志；未新增、移动或删除模块。
 - 行为：direct loader 现在可拼接 RefCOCO 正例 `DIRECT_TRAIN_DATA` 与 gRefCOCO no-target `DIRECT_NO_TARGET_TRAIN_DATA`。允许 source 由启用的 positive/no-target 配置严格决定，拒绝 label/template 或未启用的 source。no-target direct GRPO 使用与主 GRES 相同的 text 或 opt-in pixel-empty reward。新增 `direct_mask_ce.include_no_target` / `DIRECT_MASK_CE_INCLUDE_NO_TARGET`；启用时 no-target SFT teacher-force 原始 `<answer>No target.</answer>` token，CE 覆盖该完整文本、仍屏蔽 EOS/padding，和正例 mask-token SFT 在同一步独立累积。训练日志新增 direct GRPO rollout 与 direct SFT sample 的正例/no-target 计数。gRefCOCO 转换器允许 `--positive-samples 0 --no-target-samples N`，纯 negative 导出不初始化 VQ-SAM2 且不写空正例 parquet。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile projects/rl/datasets/prepare_grefcoco_cycle_dataset.py verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（16 tests）、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过。本机因 Python 未安装 `torch`，`tests.test_no_target_reward tests.test_opsd_core` 无法导入；服务器仍需以两个各 20k parquet、`MAX_STEPS=1` 检查 no-target GRPO/SFT count 和 no-target reward。
+
+### 2026-08-21 - 修复独立 direct loader 的多模态字段兼容性
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4 节独立 direct GRPO/SFT 的 media 字段契约并追加本日志；未新增、移动或删除模块。
+- 行为：direct GRPO 和 direct SFT 构造 localization batch 时，现在同时接受主 cycle rollout 的 `multi_modal_data` 与独立 dataloader 保留的 `cap_multi_modal_data`，并始终以 `seg_multi_modal_data` 作为 segmentation media。此前独立 direct loader 在第一个 batch 尚未经过 caption rollout 字段重命名时，访问不存在的 `multi_modal_data`，使训练在 step 1 抛出 `KeyError`。数据比例、prompt、reward、SFT target 和梯度权重均未改变。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（17 tests）、受影响 Python 的 AST 语法检查和 `git diff --check` 通过。本机缺少 PyTorch，无法构造真实 `DataProto`/FSDP batch；服务器以 `MAX_STEPS=1` 重新启动三流训练，确认通过 direct GRPO/SFT batch 构造。
