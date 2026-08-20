@@ -57,9 +57,16 @@ def direct_grounding_loss_weight(
     return target_weight * (step - warmup_start_step) / (warmup_end_step - warmup_start_step)
 
 
-def direct_mask_ce_source(source: object, include_positive_sources: bool = True) -> bool:
-    """GT mask CE is deliberately restricted to human positive expressions."""
-    return bool(include_positive_sources and source in {"refcoco_cycle", "grefcoco_cycle"})
+def direct_mask_ce_source(
+    source: object,
+    include_positive_sources: bool = True,
+    include_no_target: bool = False,
+) -> bool:
+    """Select human-expression teacher-forcing rows for direct grounding SFT."""
+    return bool(
+        (include_positive_sources and source in {"refcoco_cycle", "grefcoco_cycle"})
+        or (include_no_target and source == "gres_no_target")
+    )
 
 
 def non_tensor_batch_row(values: Any, index: int) -> Any:
@@ -70,9 +77,9 @@ def non_tensor_batch_row(values: Any, index: int) -> Any:
 def direct_mask_ce_response_fields(
     target_token_ids: list[list[int]], eos_token_id: int, pad_token_id: int
 ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
-    """Pad GT targets while excluding EOS and padding from the CE loss mask."""
+    """Pad teacher-forcing targets while excluding EOS and padding from CE."""
     if not target_token_ids or any(not tokens for tokens in target_token_ids):
-        raise ValueError("direct_mask_ce requires at least one non-empty GT mask-token target.")
+        raise ValueError("direct_mask_ce requires at least one non-empty target.")
     response_length = max(len(tokens) for tokens in target_token_ids) + 1
     responses, response_masks, attention_masks = [], [], []
     for tokens in target_token_ids:
@@ -147,18 +154,19 @@ class DirectGroundingConfig:
 
 @dataclass
 class DirectMaskCEConfig:
-    """Small GT SAMTok teacher-forcing anchor for human referring expressions."""
+    """Small teacher-forcing anchor for human referring expressions."""
 
     enabled: bool = False
     loss_weight: float = 0.02
     include_positive_sources: bool = True
+    include_no_target: bool = False
 
     def post_init(self):
         if self.loss_weight < 0:
             raise ValueError("direct_mask_ce.loss_weight must be non-negative.")
-        if self.enabled and not self.include_positive_sources:
+        if self.enabled and not (self.include_positive_sources or self.include_no_target):
             raise ValueError(
-                "direct_mask_ce requires include_positive_sources=true because no-target has no GT mask CE target."
+                "direct_mask_ce requires include_positive_sources or include_no_target."
             )
 
 

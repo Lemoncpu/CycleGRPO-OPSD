@@ -392,10 +392,12 @@ only checkpoints you no longer need before restarting.
 
 Direct supervision is disabled by default. The production three-stream setup
 keeps its data separate: the main 20k image-mask mix only runs CycleGRPO/OPSD;
-full RefCOCO only runs direct GRPO plus GT-mask CE; DLC-QA only runs caption
-GRPO with the language-judge reward. The two auxiliary loaders each consume one
-batch per main step and never draw from, or change the epoch length of, the main
-loader.
+The direct stream can pair 20k RefCOCO positive expressions with 20k gRefCOCO
+no-target expressions. Both receive direct segmentation GRPO; SFT teacher-forces
+GT SAMTok groups for positives and `<answer>No target.</answer>` for negatives.
+DLC-QA remains caption GRPO with the language-judge reward. The two auxiliary
+loaders each consume one batch per main step and never draw from, or change the
+epoch length of, the main loader.
 
 The RefCOCO term is additive to the cycle update:
 
@@ -405,47 +407,58 @@ L_total = 0.5 L_cycle_caption + 0.5 L_cycle_localization
         + existing regenerate / JSD / KL auxiliary losses
 ```
 
-- Direct GRPO samples `K=6` masks from stored human referring expressions in
-  `DIRECT_TRAIN_DATA` and uses independent GRPO UID groups.
+- Direct GRPO samples `K=6` responses from stored human referring expressions in
+  `DIRECT_TRAIN_DATA` and `DIRECT_NO_TARGET_TRAIN_DATA`, with independent GRPO
+  UID groups.
 - The default schedule is zero through step 10, linearly grows until step 30,
   then reaches `DIRECT_GROUNDING_LOSS_WEIGHT`.
-- GT-mask CE teacher-forces one full-RefCOCO positive expression per direct
-  parent UID. It excludes no-target and label-template sources.
-- The launcher rejects a direct file containing any source other than
-  `refcoco_cycle`, so a mixed 20k Parquet cannot silently become supervision.
+- Direct SFT teacher-forces one positive mask-token or no-target refusal target
+  per direct parent UID. EOS and padding remain outside the CE loss mask.
+- The launcher accepts only `refcoco_cycle` positives and enabled
+  `gres_no_target` rows, rejecting label/template sources.
 
-#### Export the full RefCOCO train Parquet
+#### Export the 20k + 20k direct data
 
-For a direct/GT-mask CE specialization after a mixed-data run, export the full
-RefCOCO train split rather than reusing the 10k subset. The official
-`refs(unc).p` train split contains 42,404 references; this converter validates
-each image and target mask before writing the Parquet.
+For direct GRPO/SFT, export a 20k RefCOCO positive file and a separate 20k
+gRefCOCO no-target file. The RefCOCO converter validates each image and target
+mask; pure no-target export only validates the gRefCOCO records and images.
 
 ```bash
-REF_FULL_DIR=$BASE_DIR/datasets/refcoco_full_train
-REF_FULL_PA=$REF_FULL_DIR/refcoco_train_full_42404_seed20260815.parquet
-mkdir -p "$REF_FULL_DIR"
+REF_DIRECT_DIR=$BASE_DIR/datasets/refcoco_direct_20k
+REF_DIRECT_PA=$REF_DIRECT_DIR/refcoco_train_20k_seed20260821.parquet
+GREF_NO_TARGET_DIR=$BASE_DIR/datasets/grefcoco_no_target_direct_20k
+GREF_NO_TARGET_PA=$GREF_NO_TARGET_DIR/grefcoco_train_0pos_20000notarget_seed20260821_no_target.parquet
+mkdir -p "$REF_DIRECT_DIR" "$GREF_NO_TARGET_DIR"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
   projects/rl/datasets/prepare_refcoco_rl_dataset.py \
   --instances "$BASE_DIR/refcoco-train2014-assets/instances.json" \
   --refs "$BASE_DIR/refcoco-train2014-assets/refs(unc).p" \
   --images-dir "$BASE_DIR/refcoco-train2014-assets/train2014" \
-  --output "$REF_FULL_PA" \
+  --output "$REF_DIRECT_PA" \
   --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" \
   --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" \
   --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" \
-  --split train --max-samples 42404 --seed 20260815 --device cuda
+  --split train --max-samples 20000 --seed 20260821 --device cuda
+
+PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
+  projects/rl/datasets/prepare_grefcoco_cycle_dataset.py \
+  --instances "$BASE_DIR/gRefCOCO/instances.json" \
+  --grefs "$BASE_DIR/gRefCOCO/grefs(unc).json" \
+  --images-dir "$BASE_DIR/refcoco-train2014-assets/train2014" \
+  --output-dir "$GREF_NO_TARGET_DIR" \
+  --split train --positive-samples 0 --no-target-samples 20000 \
+  --seed 20260821
 ```
 
 The converter writes absolute image paths, so rerun it after moving the COCO
-2014 image directory. Keep `TRAIN_DATA` below on the 20k cycle mix; pass this
-file only as `DIRECT_TRAIN_DATA`.
+2014 image directory. Keep `TRAIN_DATA` below on the 20k cycle mix; pass the
+two direct files only through the direct variables below.
 
 Enable the two direct terms for a controlled experiment:
 
 ```bash
-RUN_NAME=gs20k_ref40k_direct_ce
+RUN_NAME=gs20k_ref20k_notarget_direct_grpo_sft
 RUN_ROOT=$REPO_DIR/logs/$RUN_NAME
 TRAIN_DATA=$BASE_DIR/datasets/cyclegrpo_20k.parquet
 
@@ -456,16 +469,19 @@ TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
 OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
 GROUNDEDNESS_ENABLED=false TRAINER_LOGGERS='["file"]' \
 DIRECT_GROUNDING_ENABLED=true \
-DIRECT_TRAIN_DATA="$REF_FULL_PA" DIRECT_BATCH_SIZE=128 \
+DIRECT_TRAIN_DATA="$REF_DIRECT_PA" \
+DIRECT_NO_TARGET_TRAIN_DATA="$GREF_NO_TARGET_PA" \
+DIRECT_BATCH_SIZE=128 \
 DIRECT_GROUNDING_ROLLOUTS=6 \
 DIRECT_GROUNDING_LOSS_WEIGHT=0.15 \
 DIRECT_GROUNDING_WARMUP_START_STEP=10 \
 DIRECT_GROUNDING_WARMUP_END_STEP=30 \
 DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES=true \
-DIRECT_GROUNDING_INCLUDE_NO_TARGET=false \
+DIRECT_GROUNDING_INCLUDE_NO_TARGET=true \
 DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES=false \
 DIRECT_MASK_CE_ENABLED=true \
 DIRECT_MASK_CE_LOSS_WEIGHT=0.02 \
+DIRECT_MASK_CE_INCLUDE_NO_TARGET=true \
 bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
 ```
 

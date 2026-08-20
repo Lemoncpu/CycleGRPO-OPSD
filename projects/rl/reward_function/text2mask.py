@@ -204,6 +204,21 @@ def no_target_check(response: str, ground_truth: str) -> float:
         return 0.2
     return 0.0
 
+
+def no_target_reward_score(reward_input: dict) -> float:
+    """Select the historical textual proxy or decoded-union GRES semantics."""
+    mode = reward_input.get("no_target_reward_mode") or "text"
+    if mode == "text":
+        return no_target_check(reward_input["response"], "No target.")
+    if mode != "pixel_empty":
+        raise ValueError(f"Unknown no-target reward mode: {mode!r}")
+    pixel_empty = reward_input.get("no_target_pixel_empty")
+    if pixel_empty not in (0.0, 1.0):
+        raise ValueError(
+            "pixel_empty no-target reward requires GPU-decoded no_target_pixel_empty metadata."
+        )
+    return float(pixel_empty)
+
 def no_target_check_bbox(response: str, ground_truth: str) -> float:
     """
     检查 response 是否不包含任何 bbox 格式。
@@ -1184,10 +1199,7 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             #         }
             #     )
             elif source in ['gres_no_target']:
-                reward_input["ground_truth"] = 'No target.'
-                # GRES is a mask-token task. A bbox-only check treats a hallucinated
-                # SAMTok mask as a valid refusal, so reject every mask-token fragment.
-                accuracy_score = no_target_check(reward_input["response"], reward_input["ground_truth"])
+                accuracy_score = no_target_reward_score(reward_input)
                 no_repeat_score = non_repeat_reward(reward_input["response"])
                 scores.append(
                     {
@@ -1381,7 +1393,7 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 })
                 continue
             if source == "supervised_grounding_no_target":
-                no_target_score = no_target_check(reward_input["response"], "No target.")
+                no_target_score = no_target_reward_score(reward_input)
                 no_repeat_score = non_repeat_reward(reward_input["response"])
                 scores.append({
                     "seg_overall": no_target_score + no_repeat_score,

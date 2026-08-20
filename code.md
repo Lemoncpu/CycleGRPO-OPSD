@@ -219,6 +219,12 @@ no-target 继续沿用已有 `gres_no_target` schema 与原有 rejection reward�
 输入 parquet、seed、五类数量与最终 source counts；任一来源不足请求数量时 fail-fast。该数据配方是当前
 OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数据或方法公式的一部分。
 
+`prepare_grefcoco_cycle_dataset.py` 也支持 `--positive-samples 0 --no-target-samples N` 的纯
+negative 导出：它不加载 VQ-SAM2、不写空的 positive parquet，而写出带人工 `grounding_query`、
+`seg_answer=<answer>No target.</answer>` 和 `source=gres_no_target` 的 no-target parquet。这是 20k
+RefCOCO 正例 + 20k gRefCOCO negative direct GRPO/SFT 流的负样本输入，不应混入主 20k CycleGRPO
+parquet。
+
 ## 3. 主训练调用链
 
 ### 3.1 启动与配置合并
@@ -265,7 +271,8 @@ OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数�
 
 主 `data.train_files` 是唯一决定 CycleGRPO epoch 长度、global step 与 checkpoint cadence 的数据流。
 开启外部监督时，`trainer/main.py` 会另建两个可恢复的 `StatefulDataLoader`：
-`worker.supervised_anchors.direct_grounding.train_files` 专供 full RefCOCO 的 direct GRPO/GT-mask CE，
+`worker.supervised_anchors.direct_grounding.train_files` 专供 RefCOCO 正例和可选 gRefCOCO no-target 的
+direct GRPO/SFT，
 `worker.supervised_anchors.caption_qa.train_files` 专供 DLC-QA caption GRPO。两者各有独立
 `batch_size`，每个主 step 只各读取一批，并循环遍历自身数据；它们绝不消费、重排或缩短主
 CycleGRPO iterator。resume 时三个 loader 的 state 都保存到 checkpoint。
@@ -281,7 +288,7 @@ main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
 `PIXEL_IOU_ENABLED=true`，但 routing、EMA teacher、teacher analysis、caption safety、groundedness、
 caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、privileged JSD、KL anchor
 或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
-人工 referring/GT-mask 监督来自独立 full RefCOCO 流。
+人工 referring/GT-mask 或 no-target refusal 监督来自独立 direct 流。
 
 ### 3.3 Phase 1：caption rollout
 
@@ -326,15 +333,19 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
-该文件必须是完整 RefCOCO train 的人工 expression 行，且 `source` 集合严格为
-`{refcoco_cycle}`；否则在首 step 显式报错。每个 parent expression 建立一个独立 `K=6`
+这些文件可以是 `DIRECT_TRAIN_DATA` 的 RefCOCO 正例和可选
+`DIRECT_NO_TARGET_TRAIN_DATA` 的 gRefCOCO no-target 行；按启用项，允许的 `source` 集合是
+`{refcoco_cycle}` 或 `{refcoco_cycle, gres_no_target}`，其余 source 在首 step 显式报错。每个
+parent expression 建立一个独立 `K=6`
 text-to-mask rollout group，先裁到 world size 的整倍数；不足一个 rank-shard 时跳过并记录原因。
 这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。query 按偶/奇
 index 在 RefCOCO/GRES `Please segment {query} in this image.` 与 GroundingSuite `Please carefully check ...`
 模板之间 1:1 交替。direct batch 的 UID、优势和日志独立，正例用原始 RLE pixel IoU，不调用 cycle
-的 `R_Ci` 合并、OPSD routing、teacher regenerate 或 JSD。火山引擎入口默认关闭 direct anchor；开启时
-必须传 `DIRECT_TRAIN_DATA` 与 `DIRECT_BATCH_SIZE`。`include_label_sources`、`include_no_target` 和
-`consume_no_target_caption` 仍保留为历史配置，但此 RefCOCO-only 流不使用它们，后者始终为 `false`。
+的 `R_Ci` 合并、OPSD routing、teacher regenerate 或 JSD。no-target direct GRPO 复用选定的
+`text|pixel_empty` no-target reward；后者与离线 `N_acc` 一致。火山引擎入口默认关闭 direct anchor；
+开启正例时必须传 `DIRECT_TRAIN_DATA` 与 `DIRECT_BATCH_SIZE`，开启 no-target GRPO 或 SFT 时还必须传
+`DIRECT_NO_TARGET_TRAIN_DATA`。`consume_no_target_caption` 始终为 `false`，保证 direct 是对主 no-target
+caption GRPO 的附加训练。
 
 `direct_grounding.loss_weight` 是目标权重，不直接以固定值累积。开启该 anchor 后，
 `direct_grounding.warmup_start_step=10` 前有效权重为零，`10..30` 之间线性升到目标值，
@@ -342,14 +353,16 @@ index 在 RefCOCO/GRES `Please segment {query} in this image.` 与 GroundingSuit
 cycle localization。direct GRPO 仍按其单独 UID 的 `K=6` reward/advantage group 正规化，绝不能与 cycle
 caption 或 localization reward 拼接后共同 whiten。
 
-可选 `worker.supervised_anchors.direct_mask_ce` 是与 sampled direct GRPO 分开的 GT SAMTok
-teacher-forcing anchor。它从同一个 standalone full RefCOCO parent batch 的每个原始 UID 建立一条
-`grounding_query -> seg_answer` 正例，使用相同的两种 localization prompt 交替；不接收 rollout response、
-IoU 或 advantage，也不会从 20k 主混合数据派生。GT response
-由完整 mask-token group、EOS 和 padding 组成，但 CE loss mask 仅覆盖 GT mask tokens，EOS/padding
-只作为前向上下文。构造该 batch 时必须从保留 batch 维度的 non-tensor object array 取每个 parent 的图像
-metadata、GT 和 mask；不得先以 `DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定
-`loss_weight=0.02`，并在同一 optimizer step 中独立累积，不通过 K 次 rollout 放大。
+可选 `worker.supervised_anchors.direct_mask_ce` 是与 sampled direct GRPO 分开的 teacher-forcing
+anchor。正例从 standalone RefCOCO parent batch 的每个原始 UID 建立
+`grounding_query -> seg_answer`，target 是完整 GT SAMTok group；当
+`direct_mask_ce.include_no_target=true` 时，gRefCOCO no-target row 同样建立一条
+`grounding_query -> <answer>No target.</answer>` SFT 目标。二者都使用同样的两种 localization prompt
+交替，不接收 rollout response、IoU 或 advantage，也不会从 20k 主混合数据派生。CE loss mask 覆盖正例
+的完整 mask token 或 no-target 的完整拒识文本 token，EOS/padding 只作为前向上下文。构造该 batch 时必须从
+保留 batch 维度的 non-tensor object array 取每个 parent 的图像 metadata、GT 和 mask；不得先以
+`DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定 `loss_weight=0.02`，并在同一
+optimizer step 中独立累积，不通过 K 次 rollout 放大。
 
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
@@ -390,9 +403,16 @@ localization positive:
 | `dam_grounding` / `tg_grounding` | 独立 grounding 任务，分别做 mask-token 或时间区间奖励 |
 | `gcg`、`psg` 等 | grounded caption/scene graph 的 token、短语、格式奖励或保留分支 |
 
-`gres_no_target` 的正确性项保持原来的 `1.0 / 0.2 / 0.0` 取值：响应必须含
-`No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或 `<|mt_end|>` 片段；任一
-完整或残缺 mask-token 都会使该项为 `0.0`。第二项仍是原有的非重复奖励。
+`worker.opsd.pixel_iou.no_target_reward_mode` 控制 `gres_no_target` 与历史可用的
+`supervised_grounding_no_target` 的正确性项。默认 `text` 保持原来的 `1.0 / 0.2 / 0.0`
+取值：响应必须含 `No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或
+`<|mt_end|>` 片段；任一完整或残缺 mask-token 都会使该项为 `0.0`。选择 opt-in
+`pixel_empty` 时，FSDP worker 对同图的每条 response 解析全部完整、codebook 合法的
+depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；union
+为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）时该正确性项为 `1.0`，否则为
+`0.0`。此模式不检查 `No target.` 文本，因而与 GRES `N_acc` 的 `not pred_mask.any()` 语义一致。
+它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，
+不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -455,12 +475,13 @@ CycleGRPO 的核心奖励或纯 on-policy self-distillation。
 当同时开启两项 direct anchor 时，有效目标为
 `L_total=0.5*L_cycle_caption + 0.5*L_cycle_segmentation + lambda_direct(step)*L_direct_GRPO + 0.02*L_direct_mask_CE + existing auxiliary losses`。
 标量日志 `supervised_anchors/direct_loss_weight_{effective,target}`、
-`supervised_anchors/direct_mask_ce_{weight,samples,loss}` 必须与 direct single-mask/no-target reward
+`supervised_anchors/direct_mask_ce_{weight,samples,loss}`、`direct_mask_ce_{positive,no_target}_samples`
+必须与 direct single-mask/no-target reward
 指标共同检查。GT-mask CE 是原论文 CycleGRPO 之外的显式外部有监督消融，不能称为 image-mask-only
 cycle self-supervision。
 
 三流实验中，主 20k 混合数据只贡献上式的 cycle caption/localization 项及其 OPSD auxiliary 项；它不会
-产生 direct GRPO、GT-mask CE 或 DLC-QA reward。full RefCOCO 独立 loader 只贡献
+产生 direct GRPO、SFT 或 DLC-QA reward。20k RefCOCO 加 20k gRefCOCO no-target 的独立 loader 只贡献
 `lambda_direct(step)*L_direct_GRPO + L_direct_mask_CE`；DLC-QA 独立 loader 只贡献
 `caption_qa.loss_weight*L_DLC_QA_GRPO`。三条梯度仍在每个主 step 的单次 optimizer step 前累计。
 三个 `StatefulDataLoader` state 分别保存为主 `dataloader.pt` 与 checkpoint 内
@@ -662,7 +683,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
 26. **正例 segmentation 使用 union 语义。** 在线 CycleGRPO 与 direct reward 都记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。该训练语义与 RefCOCO/GRES/GroundingSuite 默认 `legacy_union` 一致；`first_mask` 仍是仅用于离线诊断的显式协议，两种评测协议不能混合比较。
-27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 full RefCOCO（每行 `source=refcoco_cycle` 且有人工 `grounding_query`）；`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
+27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
 28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL、caption safety 与 groundedness，防止 20k 主流混入任一辅助描述或分割监督。
 
 ## 7. 修改代码时的文档维护规则
@@ -1289,3 +1310,17 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 5.6 节 DLC judge 约定并追加本日志。
 - 行为：DLC evaluator 每个 OpenAI-compatible vLLM 请求显式传递 Llama-3.1 `<|eot_id|>` 的 `stop_token_ids=[128009]`，并将选择题生成上限从 300 降至 16 token。DAM QA 生成器新增可选 `--stop-token-id`，将相同结束 token 同时传给生成与 validator 请求，不影响其他服务的默认请求格式。缺失 tokenizer chat template 的本地 HF 权重此前会在生成 `A.` 或 JSON 后继续输出下一轮 `assistant` header，直至长度上限；此修复不改变 QA schema、选项解析或评分公式。
 - 验证：服务端 `curl` 已确认 `stop_token_ids=[128009]` 时响应仅输出 `A.`；本地执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/dlc_bench/eval_llama_without_image.py projects/rl/datasets/generate_dam_caption_qa.py`、`python3 -m unittest tests.test_dam_caption_qa` 与 `git diff --check`。
+
+### 2026-08-21 - 增加与离线 GRES N_acc 对齐的 no-target reward 配置
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/workers/config.py`、`verl/workers/opsd/mask_iou.py`、`verl/workers/opsd/__init__.py`、`verl/workers/fsdp_workers.py`、`verl/trainer/ray_trainer.py`、`verl/workers/reward/function.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 3.5 节 no-target 奖励契约并追加本日志；未新增、移动或删除模块。
+- 行为：新增 `worker.opsd.pixel_iou.no_target_reward_mode=text|pixel_empty`，默认 `text` 保持原有的 `No target.`/mask-fragment 文本代理和无额外 VQ-SAM2 解码。opt-in `pixel_empty` 要求 OPSD pixel-IoU 已启用；FSDP worker 在 reward 前解析每条 no-target response 的所有完整、codebook 合法 SAMTok group，用与离线 `legacy_union` 相同的 VQ-SAM2 threshold 解码并集。空并集（含无合法 group、残缺 group 与零像素解码）奖励 `1.0`，非空并集奖励 `0.0`，不依赖 `No target.` 文本，因此和离线 GRES `N_acc` 的 `not pred_mask.any()` 完全同义。此二元正确性项仍与既有 non-repeat 项相加，未改变其权重或正例 CycleGRPO reward。
+- 验证：本机 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile` 覆盖全部改动 Python 文件、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 均通过。`python3 -m unittest tests.test_no_target_reward tests.test_opsd_core` 在导入前因本机 Python 未安装 `torch` 失败，未执行测试主体；完整 FSDP decoder smoke 仍必须在服务器以包含 `gres_no_target` 的 `MAX_STEPS=1` 运行确认。
+
+### 2026-08-21 - 允许 20k RefCOCO 与 20k no-target 共同进行 direct GRPO 和 SFT
+
+- 代码：修改 `projects/rl/datasets/prepare_grefcoco_cycle_dataset.py`、`verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4、3.5、关键注意事项 27 和本日志；未新增、移动或删除模块。
+- 行为：direct loader 现在可拼接 RefCOCO 正例 `DIRECT_TRAIN_DATA` 与 gRefCOCO no-target `DIRECT_NO_TARGET_TRAIN_DATA`。允许 source 由启用的 positive/no-target 配置严格决定，拒绝 label/template 或未启用的 source。no-target direct GRPO 使用与主 GRES 相同的 text 或 opt-in pixel-empty reward。新增 `direct_mask_ce.include_no_target` / `DIRECT_MASK_CE_INCLUDE_NO_TARGET`；启用时 no-target SFT teacher-force 原始 `<answer>No target.</answer>` token，CE 覆盖该完整文本、仍屏蔽 EOS/padding，和正例 mask-token SFT 在同一步独立累积。训练日志新增 direct GRPO rollout 与 direct SFT sample 的正例/no-target 计数。gRefCOCO 转换器允许 `--positive-samples 0 --no-target-samples N`，纯 negative 导出不初始化 VQ-SAM2 且不写空正例 parquet。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile projects/rl/datasets/prepare_grefcoco_cycle_dataset.py verl/workers/supervised_anchors.py verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（16 tests）、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过。本机因 Python 未安装 `torch`，`tests.test_no_target_reward tests.test_opsd_core` 无法导入；服务器仍需以两个各 20k parquet、`MAX_STEPS=1` 检查 no-target GRPO/SFT count 和 no-target reward。

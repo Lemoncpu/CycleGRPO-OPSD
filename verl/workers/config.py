@@ -60,6 +60,13 @@ class WorkerConfig:
         self.ref.use_torch_compile = self.actor.use_torch_compile
         if self.opsd.enabled and self.actor.ulysses_size != 1:
             raise ValueError("OPSD privileged distillation currently requires actor.ulysses_size=1.")
+        if self.opsd.pixel_iou.no_target_reward_mode == "pixel_empty" and (
+            not self.opsd.enabled or not self.opsd.pixel_iou.enabled
+        ):
+            raise ValueError(
+                "pixel_iou.no_target_reward_mode=pixel_empty requires "
+                "opsd.enabled=true and pixel_iou.enabled=true."
+            )
         self.supervised_anchors.post_init()
         if self.supervised_anchors.direct_grounding.enabled and (
             not self.opsd.enabled or not self.opsd.pixel_iou.enabled

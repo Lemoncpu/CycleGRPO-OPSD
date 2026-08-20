@@ -72,6 +72,11 @@ def compute_binary_iou(target: torch.Tensor, prediction: torch.Tensor) -> torch.
     return torch.where(union > 0, intersection / union, torch.zeros_like(union))
 
 
+def pixel_empty_reward(prediction: Optional[torch.Tensor]) -> float:
+    """Return the offline GRES no-target correctness for one decoded union."""
+    return 1.0 if prediction is None or not bool(prediction.any()) else 0.0
+
+
 def coerce_raw_mask(value, image_size: tuple[int, int]) -> Optional[torch.Tensor]:
     """Convert common dense, PIL, COCO RLE, or polygon annotations to one 2D mask."""
     if value is None:

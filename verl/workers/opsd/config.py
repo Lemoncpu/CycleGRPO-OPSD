@@ -11,6 +11,9 @@ class PixelIoUConfig:
     prefer_raw_gt: bool = True
     invalid_iou: float = 0.0
     segmentation_max_response_tokens: int = 32
+    # ``text`` preserves the historical refusal proxy. ``pixel_empty`` uses
+    # the decoded SAMTok union, matching offline GRES N_acc semantics.
+    no_target_reward_mode: str = "text"
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -21,6 +24,10 @@ class PixelIoUConfig:
             raise ValueError("pixel_iou.invalid_iou must be in [0, 1].")
         if self.segmentation_max_response_tokens <= 0:
             raise ValueError("pixel_iou.segmentation_max_response_tokens must be positive.")
+        if self.no_target_reward_mode not in {"text", "pixel_empty"}:
+            raise ValueError(
+                "pixel_iou.no_target_reward_mode must be one of {'text', 'pixel_empty'}."
+            )
 
 
 @dataclass

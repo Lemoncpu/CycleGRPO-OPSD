@@ -97,6 +97,7 @@ from .opsd import (
     decode_mask_tokens,
     extract_mask_token,
     mask_group_metadata,
+    pixel_empty_reward,
 )
 
 class DirectResize:
@@ -1573,6 +1574,58 @@ class FSDPWorker(Worker):
         data.non_tensor_batch["route"] = routes
         data.non_tensor_batch["iou_reference"] = reference_sources
         data.non_tensor_batch["privileged_context"] = privileged_contexts
+        return data
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_no_target_pixel_empty(self, data: DataProto):
+        """Attach GRES-compatible no-target correctness from decoded mask unions."""
+        if self.vq_sam2 is None:
+            raise RuntimeError("VQ-SAM2 mask decoder is not available.")
+
+        response_ids = data.batch["responses"]
+        response_lengths = torch.sum(data.batch["response_mask"], dim=-1)
+        responses = [
+            self.tokenizer.decode(
+                response_ids[index][: int(response_lengths[index].item())],
+                skip_special_tokens=False,
+            )
+            for index in range(len(data))
+        ]
+        sources = data.non_tensor_batch["source"]
+        media = data.non_tensor_batch["multi_modal_data"]
+        sample_uids = data.non_tensor_batch.get("sample_uid", data.non_tensor_batch["uid"])
+        pixel_config = self.config.opsd.pixel_iou
+        rewards = np.full(len(data), None, dtype=object)
+
+        sample_groups = {}
+        for index, uid in enumerate(sample_uids):
+            sample_groups.setdefault(str(uid), []).append(index)
+        for sample_uid, indices in sample_groups.items():
+            first = indices[0]
+            if sources[first] not in {"gres_no_target", "supervised_grounding_no_target"}:
+                continue
+            mm_data = media[first]
+            if "images" not in mm_data or not mm_data["images"]:
+                raise ValueError(
+                    "pixel_empty no-target reward requires an image for "
+                    f"source={sources[first]!r}, sample_uid={sample_uid!r}."
+                )
+            decoded, _ = decode_mask_tokens(
+                vq_sam2=self.vq_sam2,
+                image=mm_data["images"][0],
+                token_texts=[responses[index] for index in indices],
+                codebook_size=self.config.reward.codebook_size,
+                codebook_depth=self.config.reward.codebook_depth,
+                threshold=pixel_config.mask_threshold,
+                decode_batch_size=pixel_config.decode_batch_size,
+            )
+            for data_index, prediction in zip(indices, decoded):
+                rewards[data_index] = pixel_empty_reward(prediction)
+
+        data.non_tensor_batch["no_target_pixel_empty"] = rewards
+        data.non_tensor_batch["no_target_reward_mode"] = np.full(
+            len(data), pixel_config.no_target_reward_mode, dtype=object
+        )
         return data
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

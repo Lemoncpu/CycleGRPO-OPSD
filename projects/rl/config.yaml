@@ -65,6 +65,7 @@ worker:
       enabled: false
       loss_weight: 0.02
       include_positive_sources: true
+      include_no_target: false
   opsd:
     enabled: true
     localization_rollouts: 6
@@ -88,6 +89,9 @@ worker:
       prefer_raw_gt: true
       invalid_iou: 0.0
       segmentation_max_response_tokens: 32
+      # ``pixel_empty`` decodes all legal groups and rewards an empty union,
+      # matching offline gRefCOCO N_acc. ``text`` preserves historical training.
+      no_target_reward_mode: text
     routing:
       enabled: true
       low_threshold: 0.5

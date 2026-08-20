@@ -1065,11 +1065,12 @@ class RayPPOTrainer:
     def _make_direct_mask_ce_batch(
         self, cycle_batch: DataProto, dataset: Optional[Any] = None
     ) -> Optional[DataProto]:
-        """Build one human-expression GT-mask CE target per original sample UID.
+        """Build one human-expression teacher-forcing target per original UID.
 
         This intentionally does not reuse direct GRPO rollouts: sampled direct
-        responses retain their own independent GRPO advantages, whereas this
-        batch teacher-forces the stored SAMTok target exactly once.
+        responses retain their own independent GRPO advantages. Positive rows
+        teacher-force GT SAMTok tokens; enabled no-target rows teacher-force
+        their stored ``No target.`` response.
         """
         config = self.config.worker.supervised_anchors.direct_mask_ce
         if not config.enabled or "grounding_query" not in cycle_batch.non_tensor_batch:
@@ -1091,7 +1092,9 @@ class RayPPOTrainer:
                 continue
             seen_uids.add(uid_text)
             if (
-                not direct_mask_ce_source(source, config.include_positive_sources)
+                not direct_mask_ce_source(
+                    source, config.include_positive_sources, config.include_no_target
+                )
                 or not isinstance(query, str)
                 or not query.strip()
                 or not isinstance(target, str)
@@ -1107,8 +1110,10 @@ class RayPPOTrainer:
         prompt_records = []
         target_ids = []
         selected_uids = []
+        selected_sources = []
         prompt_variants = alternating_localization_prompt_variants(len(indices))
         for output_index, parent_index in enumerate(indices):
+            parent_source = cycle_batch.non_tensor_batch["source"][parent_index]
             # DataProto[parent_index] unwraps an object-array row to its dict.
             # Select from the parent batch so list/array indexing remains valid.
             seg_media = non_tensor_batch_row(
@@ -1123,7 +1128,11 @@ class RayPPOTrainer:
                 "seg_ground_truth": non_tensor_batch_row(
                     cycle_batch.non_tensor_batch["seg_ground_truth"], parent_index
                 ),
-                "source": "supervised_grounding",
+                "source": (
+                    "supervised_grounding_no_target"
+                    if parent_source == "gres_no_target"
+                    else "supervised_grounding"
+                ),
                 "masks": non_tensor_batch_row(cycle_batch.non_tensor_batch["masks"], parent_index),
                 "cap_ground_truth": non_tensor_batch_row(
                     cycle_batch.non_tensor_batch["cap_ground_truth"], parent_index
@@ -1143,6 +1152,7 @@ class RayPPOTrainer:
                 self.tokenizer.encode(record["seg_ground_truth"], add_special_tokens=False)
             )
             selected_uids.append(str(cycle_batch.non_tensor_batch["uid"][parent_index]))
+            selected_sources.append(str(parent_source))
         if not prompt_records:
             return None
 
@@ -1195,6 +1205,7 @@ class RayPPOTrainer:
                     selected_uids,
                     dtype=object,
                 ),
+                "source": np.array(selected_sources, dtype=object),
             },
             meta_info=dict(cycle_batch.meta_info),
         )
@@ -2040,6 +2051,17 @@ class RayPPOTrainer:
 
                 if non_cycle_batch is not None:
 
+                    if (
+                        self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty"
+                        and any(source == "gres_no_target" for source in non_cycle_batch.non_tensor_batch["source"])
+                    ):
+                        with timer("no_target_pixel_empty", timing_raw):
+                            self.actor_rollout_ref_wg.prepare_mask_decoder()
+                            non_cycle_batch = self.actor_rollout_ref_wg.compute_no_target_pixel_empty(
+                                non_cycle_batch
+                            )
+                            self.actor_rollout_ref_wg.release_mask_decoder()
+
                     if "token_level_scores" not in non_cycle_batch.batch:
                         with timer("reward", timing_raw):
                             reward_ref = self.reward_fn.compute_reward.remote(self.global_step, non_cycle_batch, task='caption')
@@ -2110,10 +2132,36 @@ class RayPPOTrainer:
                 caption_qa_parent_batch = self._next_auxiliary_parent_batch("caption_qa")
                 if direct_parent_batch is not None:
                     direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
-                    if direct_sources != {"refcoco_cycle"}:
+                    direct_grounding_config = self.config.worker.supervised_anchors.direct_grounding
+                    direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
+                    allowed_direct_sources = set()
+                    if (
+                        (
+                            direct_grounding_config.enabled
+                            and direct_grounding_config.include_positive_sources
+                        )
+                        or (
+                            direct_mask_ce_config.enabled
+                            and direct_mask_ce_config.include_positive_sources
+                        )
+                    ):
+                        allowed_direct_sources.add("refcoco_cycle")
+                    if (
+                        (
+                            direct_grounding_config.enabled
+                            and direct_grounding_config.include_no_target
+                        )
+                        or (
+                            direct_mask_ce_config.enabled
+                            and direct_mask_ce_config.include_no_target
+                        )
+                    ):
+                        allowed_direct_sources.add("gres_no_target")
+                    if not direct_sources or not direct_sources.issubset(allowed_direct_sources):
                         raise ValueError(
-                            "DIRECT_TRAIN_DATA must be RefCOCO human-expression rows only "
-                            f"(source=refcoco_cycle); got {sorted(direct_sources)}."
+                            "Direct supervision data may contain only enabled human-expression sources "
+                            "refcoco_cycle and gres_no_target; "
+                            f"allowed={sorted(allowed_direct_sources)}, got={sorted(direct_sources)}."
                         )
                 if cycle_batch is not None and (
                     self.config.worker.actor.optimize_captioner or self.config.worker.actor.optimize_segmenter
@@ -2245,6 +2293,16 @@ class RayPPOTrainer:
                     direct_mask_ce_batch = self._make_direct_mask_ce_batch(
                         direct_parent_batch, dataset=direct_dataset
                     )
+                    if direct_mask_ce_batch is not None:
+                        ce_sources = np.asarray(
+                            direct_mask_ce_batch.non_tensor_batch["source"], dtype=object
+                        )
+                        metrics["supervised_anchors/direct_mask_ce_no_target_samples"] = int(
+                            np.sum(ce_sources == "gres_no_target")
+                        )
+                        metrics["supervised_anchors/direct_mask_ce_positive_samples"] = int(
+                            np.sum(ce_sources == "refcoco_cycle")
+                        )
                     if (
                         direct_grounding_batch is not None
                         and self.config.worker.opsd.enabled
@@ -2257,6 +2315,19 @@ class RayPPOTrainer:
                         direct_grounding_batch.non_tensor_batch["iou_scores"] = (
                             direct_grounding_batch.non_tensor_batch["pixel_iou"].copy()
                         )
+                        direct_rollout_sources = np.asarray(
+                            direct_grounding_batch.non_tensor_batch["source"], dtype=object
+                        )
+                        metrics["supervised_anchors/direct_grpo_no_target_rollouts"] = int(
+                            np.sum(direct_rollout_sources == "supervised_grounding_no_target")
+                        )
+                        metrics["supervised_anchors/direct_grpo_positive_rollouts"] = int(
+                            np.sum(direct_rollout_sources == "supervised_grounding")
+                        )
+                        if self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty":
+                            direct_grounding_batch = self.actor_rollout_ref_wg.compute_no_target_pixel_empty(
+                                direct_grounding_batch
+                            )
                         self.actor_rollout_ref_wg.release_mask_decoder()
 
                 # DLC-QA has a separate caption stream and is scored solely by

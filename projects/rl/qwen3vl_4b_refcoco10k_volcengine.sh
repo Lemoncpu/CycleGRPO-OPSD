@@ -18,6 +18,7 @@ LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
 PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
 SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-32}"
+NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
@@ -73,6 +74,7 @@ CAPTION_QA_LOSS_WEIGHT="${CAPTION_QA_LOSS_WEIGHT:-1.0}"
 # their outer-caption GRPO update by default.
 DIRECT_GROUNDING_ENABLED="${DIRECT_GROUNDING_ENABLED:-false}"
 DIRECT_TRAIN_DATA="${DIRECT_TRAIN_DATA:-}"
+DIRECT_NO_TARGET_TRAIN_DATA="${DIRECT_NO_TARGET_TRAIN_DATA:-}"
 DIRECT_BATCH_SIZE="${DIRECT_BATCH_SIZE:-128}"
 DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-6}"
 DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
@@ -84,6 +86,7 @@ DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES
 DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-false}"
 DIRECT_MASK_CE_ENABLED="${DIRECT_MASK_CE_ENABLED:-false}"
 DIRECT_MASK_CE_LOSS_WEIGHT="${DIRECT_MASK_CE_LOSS_WEIGHT:-0.02}"
+DIRECT_MASK_CE_INCLUDE_NO_TARGET="${DIRECT_MASK_CE_INCLUDE_NO_TARGET:-false}"
 # Seven training GPUs can consume a single 2:4:1 parent-prompt batch while a
 # separately launched DLC judge occupies the eighth GPU. Keep this opt-in so
 # historical arbitrary auxiliary batch sizes remain supported.
@@ -130,6 +133,16 @@ if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
     exit 1
 fi
 
+if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
+    echo "NO_TARGET_REWARD_MODE must be text or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
+    exit 1
+fi
+
+if [[ "${NO_TARGET_REWARD_MODE}" == "pixel_empty" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
+    echo "NO_TARGET_REWARD_MODE=pixel_empty requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
+    exit 1
+fi
+
 for bool_name in \
     PIXEL_IOU_ENABLED \
     ROUTING_ENABLED \
@@ -146,6 +159,7 @@ for bool_name in \
     DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
     DIRECT_MASK_CE_ENABLED \
+    DIRECT_MASK_CE_INCLUDE_NO_TARGET \
     THREE_STREAM_2_4_1_ENABLED; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
@@ -173,7 +187,14 @@ fi
 
 if [[ "${DIRECT_GROUNDING_ENABLED}" == "true" || "${DIRECT_MASK_CE_ENABLED}" == "true" ]]; then
     if [[ -z "${DIRECT_TRAIN_DATA}" || ! -f "${DIRECT_TRAIN_DATA}" ]]; then
-        echo "DIRECT_TRAIN_DATA must point to the standalone direct-supervision parquet." >&2
+        echo "DIRECT_TRAIN_DATA must point to the standalone RefCOCO direct-supervision parquet." >&2
+        exit 1
+    fi
+fi
+
+if [[ "${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" == "true" || "${DIRECT_MASK_CE_INCLUDE_NO_TARGET}" == "true" ]]; then
+    if [[ -z "${DIRECT_NO_TARGET_TRAIN_DATA}" || ! -f "${DIRECT_NO_TARGET_TRAIN_DATA}" ]]; then
+        echo "DIRECT_NO_TARGET_TRAIN_DATA must point to the gRefCOCO no-target parquet when no-target direct GRPO or SFT is enabled." >&2
         exit 1
     fi
 fi
@@ -372,6 +393,12 @@ if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
     )
 fi
 
+DIRECT_TRAIN_FILES_OVERRIDE="worker.supervised_anchors.direct_grounding.train_files=['${DIRECT_TRAIN_DATA}'"
+if [[ -n "${DIRECT_NO_TARGET_TRAIN_DATA}" ]]; then
+    DIRECT_TRAIN_FILES_OVERRIDE+=", '${DIRECT_NO_TARGET_TRAIN_DATA}'"
+fi
+DIRECT_TRAIN_FILES_OVERRIDE+="]"
+
 if [[ "${CONDA_PREFIX:-}" != "${ENV_DIR}" ]] && command -v conda >/dev/null 2>&1; then
     CONDA_BASE="$(conda info --base)"
     # shellcheck disable=SC1091
@@ -513,6 +540,7 @@ echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
 echo "Positive segmentation mask protocol: union of all complete legal SAMTok groups"
 echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
+echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -526,7 +554,7 @@ echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate sc
 echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
 echo "DLC-QA train data: ${CAPTION_QA_TRAIN_DATA:-<disabled>} (batch=${CAPTION_QA_BATCH_SIZE}, loss weight=${CAPTION_QA_LOSS_WEIGHT})"
 echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (data=${DIRECT_TRAIN_DATA:-<disabled>}, batch=${DIRECT_BATCH_SIZE}, K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
-echo "Direct GT-mask CE anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive expressions only)"
+echo "Direct SFT anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, no-target=${DIRECT_MASK_CE_INCLUDE_NO_TARGET})"
 echo "Three-stream parent-prompt ratio 2:4:1: ${THREE_STREAM_2_4_1_ENABLED} (main=${ROLLOUT_BATCH_SIZE}, direct=${DIRECT_BATCH_SIZE}, DLC-QA=${CAPTION_QA_BATCH_SIZE}, training GPUs=${NUM_GPUS})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
@@ -582,6 +610,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
     worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
     worker.opsd.pixel_iou.segmentation_max_response_tokens="${SEGMENTATION_MAX_RESPONSE_TOKENS}" \
+    worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
@@ -609,7 +638,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.groundedness.token_jsd_multiplier=1.0 \
     "${CAPTION_QA_OVERRIDES[@]}" \
     worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
-    "worker.supervised_anchors.direct_grounding.train_files=['${DIRECT_TRAIN_DATA}']" \
+    "${DIRECT_TRAIN_FILES_OVERRIDE}" \
     worker.supervised_anchors.direct_grounding.batch_size="${DIRECT_BATCH_SIZE}" \
     worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
     worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
@@ -622,6 +651,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.supervised_anchors.direct_mask_ce.enabled="${DIRECT_MASK_CE_ENABLED}" \
     worker.supervised_anchors.direct_mask_ce.loss_weight="${DIRECT_MASK_CE_LOSS_WEIGHT}" \
     worker.supervised_anchors.direct_mask_ce.include_positive_sources=true \
+    worker.supervised_anchors.direct_mask_ce.include_no_target="${DIRECT_MASK_CE_INCLUDE_NO_TARGET}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \

@@ -7,7 +7,7 @@ from verl.workers.opsd.distillation import (
     caption_blocked_special_token_ids,
     chunked_weighted_jsd_loss,
 )
-from verl.workers.opsd.config import OPSDConfig, TeacherConfidenceConfig
+from verl.workers.opsd.config import OPSDConfig, PixelIoUConfig, TeacherConfidenceConfig
 from verl.workers.opsd.groundedness import (
     disabled_groundedness,
     groundedness_penalty,
@@ -20,6 +20,7 @@ from verl.workers.opsd.mask_iou import (
     decode_mask_tokens,
     mask_group_metadata,
     parse_mask_codes,
+    pixel_empty_reward,
 )
 from projects.rl.reward_function.text2mask import compute_score
 from verl.workers.opsd.routing import (
@@ -37,6 +38,7 @@ from verl.workers.opsd.routing import (
     teacher_caption_is_safe,
     uses_original_grpo,
 )
+from verl.workers.config import WorkerConfig
 
 
 class OPSDCoreTest(unittest.TestCase):
@@ -89,6 +91,42 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertTrue(OPSDConfig(asymmetric_gradient_projection=True).asymmetric_gradient_projection)
         with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
             OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
+
+    def test_no_target_reward_mode_validation(self):
+        self.assertEqual(PixelIoUConfig().no_target_reward_mode, "text")
+        PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
+        with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
+            PixelIoUConfig(no_target_reward_mode="unknown").post_init()
+        with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):
+            WorkerConfig(
+                opsd=OPSDConfig(
+                    enabled=False,
+                    pixel_iou=PixelIoUConfig(no_target_reward_mode="pixel_empty"),
+                )
+            ).post_init()
+
+    def test_pixel_empty_reward_matches_empty_union_semantics(self):
+        self.assertEqual(pixel_empty_reward(None), 1.0)
+        self.assertEqual(pixel_empty_reward(torch.zeros((2, 2), dtype=torch.bool)), 1.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]])), 0.0)
+
+    def test_no_target_reward_score_uses_decoded_union_when_requested(self):
+        response = "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>"
+        empty_score = compute_score(
+            [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 1.0}],
+            task="caption",
+        )[0]
+        nonempty_score = compute_score(
+            [{"source": "supervised_grounding_no_target", "response": "No target.", "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 0.0}],
+            task="segmentation",
+        )[0]
+        self.assertEqual(empty_score["no_target_accuracy"], 1.0)
+        self.assertEqual(nonempty_score["seg_supervised_grounding_no_target"], 0.0)
+        with self.assertRaisesRegex(ValueError, "GPU-decoded"):
+            compute_score(
+                [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty"}],
+                task="caption",
+            )
 
     def test_teacher_confidence_thresholds_are_unit_intervals(self):
         config = OPSDConfig(

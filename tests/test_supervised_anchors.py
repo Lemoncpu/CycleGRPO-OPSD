@@ -60,8 +60,10 @@ class SupervisedAnchorsTest(unittest.TestCase):
             ).post_init()
         with self.assertRaisesRegex(ValueError, "warmup steps"):
             DirectGroundingConfig(warmup_start_step=31, warmup_end_step=30).post_init()
-        with self.assertRaisesRegex(ValueError, "include_positive_sources"):
-            DirectMaskCEConfig(enabled=True, include_positive_sources=False).post_init()
+        with self.assertRaisesRegex(ValueError, "include_positive_sources or include_no_target"):
+            DirectMaskCEConfig(
+                enabled=True, include_positive_sources=False, include_no_target=False
+            ).post_init()
 
     def test_direct_grounding_defaults_to_six_additive_rollouts(self):
         config = DirectGroundingConfig()
@@ -92,12 +94,21 @@ class SupervisedAnchorsTest(unittest.TestCase):
         self.assertEqual(direct_grounding_loss_weight(29, 0.15, 30, 30), 0.0)
         self.assertEqual(direct_grounding_loss_weight(30, 0.15, 30, 30), 0.15)
 
-    def test_direct_mask_ce_uses_human_positive_sources_only(self):
+    def test_direct_mask_ce_source_selection_supports_opt_in_no_target(self):
         self.assertTrue(direct_mask_ce_source("refcoco_cycle"))
         self.assertTrue(direct_mask_ce_source("grefcoco_cycle"))
         self.assertFalse(direct_mask_ce_source("gres_no_target"))
+        self.assertTrue(direct_mask_ce_source("gres_no_target", include_no_target=True))
         self.assertFalse(direct_mask_ce_source("cocostuff_cycle"))
         self.assertFalse(direct_mask_ce_source("paco_part_cycle"))
+
+    def test_direct_mask_ce_can_train_no_target_text_target(self):
+        responses, loss_masks, attention_masks = direct_mask_ce_response_fields(
+            [[71, 72, 73]], eos_token_id=2, pad_token_id=0
+        )
+        self.assertEqual(responses, [[71, 72, 73, 2]])
+        self.assertEqual(loss_masks, [[1, 1, 1, 0]])
+        self.assertEqual(attention_masks, [[1, 1, 1, 1]])
 
     def test_direct_mask_ce_masks_eos_and_padding(self):
         responses, loss_masks, attention_masks = direct_mask_ce_response_fields(

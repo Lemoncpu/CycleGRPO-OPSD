@@ -37,8 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grefs", type=Path, required=True, help="grefs(unc).json")
     parser.add_argument("--images-dir", type=Path, required=True, help="COCO train2014 image directory")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--mask-tokenizer-path", type=Path, required=True)
-    parser.add_argument("--sam2-checkpoint", type=Path, required=True)
+    parser.add_argument("--mask-tokenizer-path", type=Path)
+    parser.add_argument("--sam2-checkpoint", type=Path)
     parser.add_argument(
         "--sam2-config-dir",
         type=Path,
@@ -114,8 +114,8 @@ def select_records(
     single_fraction: float,
     seed: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    if positive_samples <= 0 or no_target_samples <= 0:
-        raise ValueError("Positive and no-target sample counts must be positive.")
+    if positive_samples < 0 or no_target_samples < 0 or positive_samples + no_target_samples == 0:
+        raise ValueError("At least one positive or no-target sample must be requested.")
     if not 0.0 <= single_fraction <= 1.0:
         raise ValueError("--single-fraction must be in [0, 1].")
     single = [ref for ref in refs if len(annotation_ids(ref)) == 1 and annotation_ids(ref)[0] >= 0]
@@ -138,13 +138,15 @@ def select_records(
 
 def main() -> None:
     args = parse_args()
-    for path in (
-        args.instances,
-        args.grefs,
-        args.images_dir,
-        args.mask_tokenizer_path,
-        args.sam2_checkpoint,
-    ):
+    required_paths = [args.instances, args.grefs, args.images_dir]
+    if args.positive_samples > 0:
+        if args.mask_tokenizer_path is None or args.sam2_checkpoint is None:
+            raise ValueError(
+                "--mask-tokenizer-path and --sam2-checkpoint are required when "
+                "--positive-samples is greater than zero."
+            )
+        required_paths.extend((args.mask_tokenizer_path, args.sam2_checkpoint))
+    for path in required_paths:
         if not path.exists():
             raise FileNotFoundError(path)
 
@@ -162,9 +164,11 @@ def main() -> None:
         seed=args.seed,
     )
 
-    model = build_mask_tokenizer(args)
+    model = build_mask_tokenizer(args) if single_refs or multiple_refs else None
     positive_records: list[dict[str, Any]] = []
     for ref in single_refs + multiple_refs:
+        if model is None:
+            raise RuntimeError("Positive gRefCOCO records require a mask tokenizer.")
         path = image_path_for_ref(ref, images, args.images_dir)
         with Image.open(path) as image_file:
             image = image_file.convert("RGB")
@@ -209,7 +213,8 @@ def main() -> None:
     random.Random(args.seed).shuffle(combined_records)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"grefcoco_{args.split}_{len(positive_records)}pos_{len(no_target_records)}notarget_seed{args.seed}"
-    Dataset.from_list(positive_records).to_parquet(str(args.output_dir / f"{prefix}_positive.parquet"))
+    if positive_records:
+        Dataset.from_list(positive_records).to_parquet(str(args.output_dir / f"{prefix}_positive.parquet"))
     Dataset.from_list(no_target_records).to_parquet(str(args.output_dir / f"{prefix}_no_target.parquet"))
     Dataset.from_list(combined_records).to_parquet(str(args.output_dir / f"{prefix}_combined.parquet"))
     manifest = {
