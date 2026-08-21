@@ -3,14 +3,14 @@
 set -euo pipefail
 
 ACTION=${1:-help}
-BASE_DIR=${BASE_DIR:-/mnt/cxzx/workspace/data_transfer/houzhiyan}
+BASE_DIR=${BASE_DIR:-/volume/ybo/xyc}
 REPO_DIR=${REPO_DIR:-${BASE_DIR}/CycleGRPO-OPSD}
 ENV_DIR=${ENV_DIR:-${BASE_DIR}/envs/cyclegrpo}
 TRAIN_MODEL_PATH=${TRAIN_MODEL_PATH:-${BASE_DIR}/Qwen3-VL-4B-SAMTok}
-TRAIN_DATA=${TRAIN_DATA:-${BASE_DIR}/refcoco-train2014-assets/refcoco_train_10k_seed20260722_workspace_paths.parquet}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-${REPO_DIR}/logs/refcoco10k_opsd/checkpoints/global_step_78}
-HF_MODEL_PATH=${HF_MODEL_PATH:-${REPO_DIR}/logs/refcoco10k_opsd/evaluation/hf_global_step_78}
-EVAL_ROOT=${EVAL_ROOT:-${REPO_DIR}/logs/refcoco10k_opsd/evaluation}
+TRAIN_DATA=${TRAIN_DATA:-${BASE_DIR}/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-${REPO_DIR}/logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k/checkpoints/global_step_714}
+HF_MODEL_PATH=${HF_MODEL_PATH:-${REPO_DIR}/logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k/evaluation/step_714/hf_global_step_714}
+EVAL_ROOT=${EVAL_ROOT:-${REPO_DIR}/logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k/evaluation/step_714}
 REFCOCO_ROOT=${REFCOCO_ROOT:-${BASE_DIR}/refcoco-train2014-assets}
 GROUNDINGSUITE_ROOT=${GROUNDINGSUITE_ROOT:-${BASE_DIR}/GSEval}
 DLC_ROOT=${DLC_ROOT:-${BASE_DIR}/describe-anything/evaluation/DLC-Bench}
@@ -19,7 +19,7 @@ GRES_REFS_FILE=${GRES_REFS_FILE:-$GRES_ROOT/grefs(unc).json}
 GRES_INSTANCES_FILE=${GRES_INSTANCES_FILE:-$GRES_ROOT/instances.json}
 GRES_IMAGE_ROOT=${GRES_IMAGE_ROOT:-$REFCOCO_ROOT/train2014}
 GRES_SPLIT=${GRES_SPLIT:-val}
-NUM_GPUS=${NUM_GPUS:-8}
+NUM_GPUS=${NUM_GPUS:-7}
 MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
 RAY_SHORT_ROOT=${RAY_SHORT_ROOT:-/tmp/cgrpo-export-${UID:-$(id -u)}}
 

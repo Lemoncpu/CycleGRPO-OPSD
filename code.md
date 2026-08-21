@@ -121,9 +121,13 @@ Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 入口以 `set -u` 运行时，未设置或显式清空 `MAX_STEPS` 不会向 Hydra 传入空位置参数；仅在该变量为正整数时
 才附加 `trainer.max_steps=<value>`。因此完整 epoch 与分段运行共用同一入口，不需要为完整 epoch 人为设置步数。
 
-火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。训练 checkpoint 中的
-`actor/model_world_size_8_rank_*.pt` 是 FSDP shard，`actor/huggingface/` 只包含配置和
-processor；因此必须先执行 `export` action，以相同 8-rank FSDP 拓扑只加载 actor model shard 并导出
+火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。当前服务器默认将
+`BASE_DIR` 固定为 `/volume/ybo/xyc`，使用 `/volume/ybo/xyc/envs/cyclegrpo`、
+`/volume/ybo/xyc/Qwen3-VL-4B-SAMTok` 与 `global_step_714` 的评测输出目录；默认
+`NUM_GPUS=7`，因此评测命令只应暴露 `cuda:0-6`，将 `cuda:7` 留给独立 Llama judge。
+所有默认值仍可通过同名环境变量覆盖。训练 checkpoint 中的
+`actor/model_world_size_<N>_rank_*.pt` 是 FSDP shard，`actor/huggingface/` 只包含配置和
+processor；因此必须先执行 `export` action，并以与 shard 文件名相同的 `NUM_GPUS=N` 拓扑只加载 actor model shard 并导出
 标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite`、`gres` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
@@ -608,7 +612,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 文件 | 职责 |
 |---|---|
-| `qwen3vl_4b_volcengine.sh` | export-only FSDP actor 转 HF safetensors，并顺序启动标准 RefCOCO、GroundingSuite mask GIoU、GRES/gRefCOCO 与 DLC-Bench prediction 生成；设置服务器路径、Conda、缓存和 Ray 地址隔离 |
+| `qwen3vl_4b_volcengine.sh` | export-only FSDP actor 转 HF safetensors，并顺序启动标准 RefCOCO、GroundingSuite mask GIoU、GRES/gRefCOCO 与 DLC-Bench prediction 生成；默认使用当前 `/volume/ybo/xyc` 服务器路径、7 卡评测和独立 cuda:7 judge |
 
 ### 5.4 `projects/transformers/`：模型定义
 
@@ -1333,3 +1337,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 3.4 节独立 direct GRPO/SFT 的 media 字段契约并追加本日志；未新增、移动或删除模块。
 - 行为：direct GRPO 和 direct SFT 构造 localization batch 时，现在同时接受主 cycle rollout 的 `multi_modal_data` 与独立 dataloader 保留的 `cap_multi_modal_data`，并始终以 `seg_multi_modal_data` 作为 segmentation media。此前独立 direct loader 在第一个 batch 尚未经过 caption rollout 字段重命名时，访问不存在的 `multi_modal_data`，使训练在 step 1 抛出 `KeyError`。数据比例、prompt、reward、SFT target 和梯度权重均未改变。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（17 tests）、受影响 Python 的 AST 语法检查和 `git diff --check` 通过。本机缺少 PyTorch，无法构造真实 `DataProto`/FSDP batch；服务器以 `MAX_STEPS=1` 重新启动三流训练，确认通过 direct GRPO/SFT batch 构造。
+
+### 2026-08-22 - 固定当前服务器的默认离线评测路径
+
+- 代码：修改 `projects/eval/qwen3vl_4b_volcengine.sh`。
+- 文档：更新第 2.2、5.3 节的评测入口默认值并追加本日志；未新增、移动或删除模块。
+- 行为：统一评测入口默认使用 `/volume/ybo/xyc`、`envs/cyclegrpo`、`Qwen3-VL-4B-SAMTok`、`cyclegrpo20k_direct30k_notarget10k_dlcqa10k/checkpoints/global_step_714` 及对应 `evaluation/step_714` 输出目录；默认 FSDP/benchmark GPU 数改为 7，为 `cuda:7` 的 Llama judge 保留独立设备。所有路径和 `NUM_GPUS` 仍可通过环境变量覆盖。
+- 验证：`bash -n projects/eval/qwen3vl_4b_volcengine.sh` 与 `git diff --check` 通过；服务器需确认 checkpoint shard 为 world-size 7 并依次运行 export、各 benchmark action。
