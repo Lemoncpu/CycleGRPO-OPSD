@@ -132,7 +132,10 @@ processor；因此必须先执行 `export` action，并以与 shard 文件名相
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
-目录计算 mask GIoU。GroundingSuite 的 JSONL 若只保存
+目录计算 mask GIoU。当前服务器的默认 GroundingSuite 根目录是
+`/volume/ybo/xyc/third_party/GroundingSuite`，其评测 JSONL 为
+`/volume/ybo/xyc/third_party/GroundingSuite/GroundingSuite-Eval.jsonl`；可分别通过
+`GROUNDINGSUITE_ROOT` 与 `GROUNDINGSUITE_DATASET` 覆盖。GroundingSuite 的 JSONL 若只保存
 12 位 COCO image ID（如 `000000123456.jpg`），推理器会在 `data_root`、其 `assets/`、
 `unlabeled2017/`、可用的 `train2014/` 子目录及 `coco_root/train2014` 中同时尝试该名称及官方的
 `COCO_train2014_000000123456.jpg` 名称；无法
@@ -1344,3 +1347,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 文档：更新第 2.2、5.3 节的评测入口默认值并追加本日志；未新增、移动或删除模块。
 - 行为：统一评测入口默认使用 `/volume/ybo/xyc`、`envs/cyclegrpo`、`Qwen3-VL-4B-SAMTok`、`cyclegrpo20k_direct30k_notarget10k_dlcqa10k/checkpoints/global_step_714` 及对应 `evaluation/step_714` 输出目录；默认 FSDP/benchmark GPU 数改为 7，为 `cuda:7` 的 Llama judge 保留独立设备。所有路径和 `NUM_GPUS` 仍可通过环境变量覆盖。
 - 验证：`bash -n projects/eval/qwen3vl_4b_volcengine.sh` 与 `git diff --check` 通过；服务器需确认 checkpoint shard 为 world-size 7 并依次运行 export、各 benchmark action。
+
+### 2026-08-22 - 修正 GroundingSuite 发布包默认路径
+
+- 代码：修改 `projects/eval/qwen3vl_4b_volcengine.sh` 和 `README.md`。
+- 文档：更新第 2.2、导出与评测章节，明确当前服务器的 GroundingSuite JSONL 与资源根目录。
+- 行为：GroundingSuite 默认根目录从旧的 `/volume/ybo/xyc/GSEval` 改为
+  `/volume/ybo/xyc/third_party/GroundingSuite`，默认数据文件因此解析为该目录下的
+  `GroundingSuite-Eval.jsonl`；仍可用 `GROUNDINGSUITE_ROOT` 和
+  `GROUNDINGSUITE_DATASET` 覆盖。评测协议、mask 解码和输出目录不变。
+- 验证：执行 `bash -n projects/eval/qwen3vl_4b_volcengine.sh` 与 `git diff --check`。

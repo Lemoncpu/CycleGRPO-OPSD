@@ -263,7 +263,7 @@ evaluation-only assets that should not be mixed into training data.
 |---|---|---|
 | gRefCOCO | [gRefCOCO](https://github.com/heng-hw/GRIT) release/instructions | `$BASE_DIR/gRefCOCO/grefs(unc).json` and `$BASE_DIR/gRefCOCO/instances.json` |
 | Describe Anything (DAM) | [Describe Anything](https://github.com/ttxskk/Describe-Anything) release/instructions | `$BASE_DIR/datasets/dam_data/COCOStuff` and `$BASE_DIR/datasets/dam_data/PACO` |
-| GroundingSuite | [GroundingSuite](https://github.com/hustvl/GroundingSuite) release/instructions | `$BASE_DIR/GSEval/GroundingSuite-Eval.jsonl` and its released assets |
+| GroundingSuite | [GroundingSuite](https://github.com/hustvl/GroundingSuite) release/instructions | `$BASE_DIR/third_party/GroundingSuite/GroundingSuite-Eval.jsonl` and its released assets |
 | DLC-Bench | the official Describe Anything release | `$BASE_DIR/describe-anything/evaluation/DLC-Bench/annotations.json` and images |
 
 For a supplied gRefCOCO package that contains an instance JSON under a
@@ -585,7 +585,9 @@ bash "$EVAL_SCRIPT" refcoco
 
 # GroundingSuite mask GIoU. legacy_union is the historical SAMTok-compatible protocol.
 HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" TRAIN_MODEL_PATH="$MODEL_PATH" MASK_PROTOCOL=legacy_union \
-GROUNDINGSUITE_ROOT="$BASE_DIR/GSEval" REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" NUM_GPUS=8 \
+GROUNDINGSUITE_ROOT="$BASE_DIR/third_party/GroundingSuite" \
+GROUNDINGSUITE_DATASET="$BASE_DIR/third_party/GroundingSuite/GroundingSuite-Eval.jsonl" \
+REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" NUM_GPUS=8 \
 bash "$EVAL_SCRIPT" groundingsuite
 
 # gRefCOCO/GRES target and no-target metrics.
