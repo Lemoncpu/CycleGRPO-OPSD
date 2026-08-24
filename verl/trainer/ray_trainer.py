@@ -2732,6 +2732,13 @@ class RayPPOTrainer:
                                 and cap_batch_size > 0
                                 and seg_batch_size > 0
                             )
+                            direct_ce_cosine_enabled = bool(
+                                direct_mask_ce_config.enabled
+                                and direct_mask_ce_config.record_base_gradient_cosine
+                                and direct_mask_ce_batch is not None
+                                and direct_mask_ce_size > 0
+                            )
+                            caption_auxiliary_accumulated = False
                             if projection_enabled:
                                 # Keep every caption-side loss separate before taking segmentation gradients.
                                 accumulate_caption_auxiliary_gradients()
@@ -2761,6 +2768,14 @@ class RayPPOTrainer:
                                     }
                                 )
 
+                            if direct_ce_cosine_enabled:
+                                # Include DLC-QA and other caption auxiliaries in the measured non-CE base.
+                                accumulate_caption_auxiliary_gradients()
+                                caption_auxiliary_accumulated = True
+                                stash_output = self.actor_rollout_ref_wg.stash_direct_ce_base_gradients()
+                                if stash_output and hasattr(stash_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(reduce_metrics(stash_output[0].non_tensor_batch))
+
                             if direct_mask_ce_batch is not None and direct_mask_ce_size > 0:
                                 ce_batch, ce_pad = pad_dataproto_to_divisor(
                                     direct_mask_ce_batch,
@@ -2786,13 +2801,18 @@ class RayPPOTrainer:
                                 )
                                 actor_metrics.update(reduce_metrics(ce_output.non_tensor_batch))
 
-                            if not projection_enabled:
-                                # Preserve the historical accumulation order when projection is disabled.
-                                accumulate_caption_auxiliary_gradients()
-                            else:
+                            if direct_ce_cosine_enabled:
+                                merge_output = self.actor_rollout_ref_wg.merge_direct_ce_base_gradients()
+                                if merge_output and hasattr(merge_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(reduce_metrics(merge_output[0].non_tensor_batch))
+
+                            if projection_enabled:
                                 projection_output = self.actor_rollout_ref_wg.merge_asymmetric_actor_gradients()
                                 if projection_output and hasattr(projection_output[0], "non_tensor_batch"):
                                     actor_metrics.update(reduce_metrics(projection_output[0].non_tensor_batch))
+                            elif not caption_auxiliary_accumulated:
+                                # Preserve the historical accumulation order when projection is disabled.
+                                accumulate_caption_auxiliary_gradients()
                             
                             # Step 3: Perform optimizer step with accumulated gradients
                             opt_output = self.actor_rollout_ref_wg.step_actor_optimizer()

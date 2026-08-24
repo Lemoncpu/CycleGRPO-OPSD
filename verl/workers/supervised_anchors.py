@@ -174,6 +174,7 @@ class DirectMaskCEConfig:
     loss_weight: float = 0.02
     include_positive_sources: bool = True
     include_no_target: bool = False
+    record_base_gradient_cosine: bool = False
 
     def post_init(self):
         if self.loss_weight < 0:
@@ -181,6 +182,10 @@ class DirectMaskCEConfig:
         if self.enabled and not (self.include_positive_sources or self.include_no_target):
             raise ValueError(
                 "direct_mask_ce requires include_positive_sources or include_no_target."
+            )
+        if self.record_base_gradient_cosine and not self.enabled:
+            raise ValueError(
+                "direct_mask_ce.record_base_gradient_cosine requires direct_mask_ce.enabled=true."
             )
 
 

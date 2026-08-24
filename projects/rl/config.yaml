@@ -66,6 +66,7 @@ worker:
       loss_weight: 0.02
       include_positive_sources: true
       include_no_target: false
+      record_base_gradient_cosine: false
   opsd:
     enabled: true
     localization_rollouts: 6

@@ -373,6 +373,17 @@ anchor。正例从 standalone RefCOCO parent batch 的每个原始 UID 建立
 `DataProto[index]` 解包再用 `[0]` 索引字典。该项默认关闭，推荐开启时固定 `loss_weight=0.02`，并在同一
 optimizer step 中独立累积，不通过 K 次 rollout 放大。
 
+用于梯度冲突诊断时可设置
+`worker.supervised_anchors.direct_mask_ce.record_base_gradient_cosine=true`。trainer 会先累积该 step
+中所有非 CE 梯度（CycleGRPO caption/localization、direct GRPO、DLC-QA 以及其他已启用的 caption auxiliary），
+由 FSDP 跨 rank 统计其与 direct mask CE 的 dot product、两侧范数和余弦相似度，并记录
+`supervised_anchors/direct_ce_base_grad_cosine`、
+`supervised_anchors/direct_ce_base_gradient_conflict`、
+`supervised_anchors/direct_ce_base_grad_norm` 和
+`supervised_anchors/direct_ce_grad_norm`。统计后会恢复原非 CE 梯度并原样加回 CE 梯度，因此该开关不改变
+optimizer 更新；它与 `worker.opsd.asymmetric_gradient_projection` 互斥，避免 caption-first 投影暂存顺序
+使 base 定义不明确。
+
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
 ### 3.5 奖励
@@ -1357,3 +1368,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   `GroundingSuite-Eval.jsonl`；仍可用 `GROUNDINGSUITE_ROOT` 和
   `GROUNDINGSUITE_DATASET` 覆盖。评测协议、mask 解码和输出目录不变。
 - 验证：执行 `bash -n projects/eval/qwen3vl_4b_volcengine.sh` 与 `git diff --check`。
+
+### 2026-08-24 - 增加 direct CE 与三流非 CE 梯度余弦诊断
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/workers/config.py`、`verl/workers/fsdp_workers.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml` 和 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 行为：新增 `direct_mask_ce.record_base_gradient_cosine` 及对应环境变量。启用且存在 direct CE batch 时，trainer 先累积 CycleGRPO caption/localization、direct GRPO、DLC-QA 和其他 caption auxiliary，FSDP 暂存完整非 CE 梯度；direct CE backward 后跨 rank 记录 base/CE 范数、dot-product cosine 与冲突指示，再恢复 base 并合并 CE，训练更新保持不变。该诊断与非对称 caption-to-segmentation 梯度投影互斥。
+- 文档：更新第 3.4 节，说明诊断指标、包含的梯度范围和不改变 optimizer 更新的保证；未新增、移动或删除模块。
+- 验证：执行受影响 Python 文件 AST/compile 检查、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check`；本机无 CUDA/Ray/FSDP 环境，未执行多卡端到端训练。

@@ -83,3 +83,8 @@ class WorkerConfig:
             raise ValueError(
                 "direct_mask_ce uses direct_grounding.train_files and batch_size; both are required when enabled."
             )
+        if self.supervised_anchors.direct_mask_ce.record_base_gradient_cosine and self.opsd.asymmetric_gradient_projection:
+            raise ValueError(
+                "direct_mask_ce.record_base_gradient_cosine is incompatible with "
+                "opsd.asymmetric_gradient_projection; disable the projection for an unambiguous base gradient."
+            )

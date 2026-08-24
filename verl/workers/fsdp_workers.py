@@ -1299,6 +1299,94 @@ class FSDPWorker(Worker):
         return output.to("cpu")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stash_direct_ce_base_gradients(self):
+        """Stash all non-CE gradients before direct mask CE backward."""
+        assert self._has_actor
+        if getattr(self, "_direct_ce_base_gradients", None) is not None:
+            raise RuntimeError("Direct CE base gradients are already stashed.")
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        params = list(self.fsdp_module.parameters())
+        self._direct_ce_base_gradients = [
+            None if parameter.grad is None else parameter.grad.detach().clone()
+            for parameter in params
+        ]
+        local_base_norm_sq = torch.zeros((), device=torch.cuda.current_device(), dtype=torch.float32)
+        for gradient in self._direct_ce_base_gradients:
+            if gradient is not None:
+                local_base_norm_sq.add_(gradient.float().square().sum())
+        dist.all_reduce(local_base_norm_sq, op=dist.ReduceOp.SUM)
+
+        for parameter in params:
+            parameter.grad = None
+
+        return DataProto(
+            non_tensor_batch={
+                "supervised_anchors/direct_ce_base_grad_norm": np.array([local_base_norm_sq.sqrt().item()])
+            }
+        ).to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def merge_direct_ce_base_gradients(self):
+        """Measure CE/base cosine, then restore the unchanged base+CE gradient."""
+        assert self._has_actor
+        base_gradients = getattr(self, "_direct_ce_base_gradients", None)
+        if base_gradients is None:
+            raise RuntimeError("Direct CE base gradients must be stashed before merging.")
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        params = list(self.fsdp_module.parameters())
+        if len(params) != len(base_gradients):
+            self._direct_ce_base_gradients = None
+            raise RuntimeError("Actor parameter layout changed while direct CE gradients were stashed.")
+
+        stats = torch.zeros(3, device=torch.cuda.current_device(), dtype=torch.float32)
+        for parameter, base_gradient in zip(params, base_gradients, strict=True):
+            ce_gradient = parameter.grad
+            if base_gradient is not None:
+                stats[0].add_(base_gradient.float().square().sum())
+            if ce_gradient is not None:
+                stats[1].add_(ce_gradient.float().square().sum())
+            if base_gradient is not None and ce_gradient is not None:
+                stats[2].add_((base_gradient.float() * ce_gradient.float()).sum())
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        if not torch.isfinite(stats).all():
+            self._direct_ce_base_gradients = None
+            raise FloatingPointError("Non-finite direct CE/base gradient statistics.")
+
+        base_norm_sq, ce_norm_sq, dot_product = stats.unbind()
+        denominator = torch.sqrt(base_norm_sq * ce_norm_sq).clamp_min(1e-12)
+        cosine = dot_product / denominator
+        conflict = bool((dot_product < 0).item() and (base_norm_sq > 0).item() and (ce_norm_sq > 0).item())
+
+        for parameter, base_gradient in zip(params, base_gradients, strict=True):
+            ce_gradient = parameter.grad
+            if base_gradient is None:
+                continue
+            if ce_gradient is None:
+                parameter.grad = base_gradient
+            else:
+                ce_gradient.add_(base_gradient.to(dtype=ce_gradient.dtype))
+
+        self._direct_ce_base_gradients = None
+        return DataProto(
+            non_tensor_batch={
+                "supervised_anchors/direct_ce_base_grad_cosine": np.array([cosine.item()]),
+                "supervised_anchors/direct_ce_base_gradient_conflict": np.array([float(conflict)]),
+                "supervised_anchors/direct_ce_base_grad_norm": np.array([base_norm_sq.sqrt().item()]),
+                "supervised_anchors/direct_ce_grad_norm": np.array([ce_norm_sq.sqrt().item()]),
+            }
+        ).to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def merge_asymmetric_actor_gradients(self):
         """Project only caption gradient components that oppose the segmentation gradient."""
         assert self._has_actor
