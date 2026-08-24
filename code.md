@@ -447,6 +447,10 @@ join 每一条 rollout；任何缺失 join 都会报错而不是静默给零分�
 该流不计算或混入 cycle IoU、format/non-repeat、caption safety、groundedness、`R_Ci`、OPSD routing、
 teacher regenerate 或 JSD。服务超时、请求失败或无唯一选项时该题贡献 `0`；`caption_qa.loss_weight`
 在 actor 累积时控制此独立 GRPO 梯度的实际比例，因为组内 GRPO 标准化不保留 reward 的常数缩放。
+训练期每个 QA judge 请求还显式传递 Llama-3.1 的 `<|eot_id|>` `stop_token_ids=[128009]`。
+当前转换后的 HF tokenizer 没有 chat template；不传该停止 token 时，vLLM 会在模型输出选项后继续生成
+下一轮 `assistant` header（例如 `Aassistant`），从而被严格选项解析器判为失败。该参数与离线
+`evaluation/dlc_bench/eval_llama_without_image.py` 的 judge 请求保持一致，不改变题目、选项或奖励公式。
 
 `supervised_grounding` 的正例 segmentation reward 对一条 response 内所有合法 group 的 decoded union
 计算 `10 * pixel_iou + format + non_repeat`；`supervised_grounding_no_target` 复用 `No target.`
@@ -1394,3 +1398,14 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：新增 `direct_mask_ce.warmup_start_step/end_step` 及对应环境变量。CE 在 start 及之前为零，在 start 与 end 之间线性升至 `loss_weight`，end 及之后保持目标权重；默认 `0/0`，保持历史固定 CE 权重。每 step 记录 `supervised_anchors/direct_mask_ce_weight_effective`。这用于消除诊断中 step 1-10 的高强度 CE 反向梯度窗口，不改数据、direct GRPO、DLC-QA 或后期 CE 权重。
 - 文档：更新第 3.4 节，说明权重函数和日志指标；未新增、移动或删除模块。
 - 验证：执行受影响 Python 文件 compile、训练入口 `bash -n` 和 `git diff --check`；本机没有 CUDA/Ray/FSDP，未运行端到端训练。
+
+### 2026-08-24 - 修复训练期 DLC-QA Llama judge 的输出截断
+
+- 代码：修改 `projects/rl/reward_function/llm_judge_reward.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.5 节 caption QA judge 的请求契约；未新增、移动或删除模块。
+- 行为：训练期 QA 请求显式传递 Llama-3.1 `<|eot_id|>` 的 `stop_token_ids=[128009]`。没有该参数时，缺失
+  chat template 的 HF tokenizer 会让服务在 `A` 后继续输出 `assistant`，严格 `_parse_option` 将其记为失败，
+  造成 QA reward 被大量置零；现在与离线 DLC evaluator 使用相同的停止语义。
+- 验证：新增 mock OpenAI client 单测，检查停止 token 且确认 `A` 可解析；执行
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile projects/rl/reward_function/llm_judge_reward.py tests/test_supervised_anchors.py`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。

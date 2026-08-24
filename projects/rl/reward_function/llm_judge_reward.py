@@ -299,6 +299,10 @@ Choices:
 
 Reply with exactly one option letter and nothing else."""
 
+# Llama-3.1's end-of-turn token. The local vLLM judge can otherwise continue
+# with the next assistant header because the converted tokenizer has no chat template.
+LLAMA31_EOT_TOKEN_ID = 128009
+
 
 def _parse_option(text: str, count: int) -> Optional[int]:
     if not isinstance(text, str):
@@ -333,6 +337,7 @@ async def _caption_qa_one(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=4,
+                extra_body={"stop_token_ids": [LLAMA31_EOT_TOKEN_ID]},
             )
         index = _parse_option(completion.choices[0].message.content, len(choices))
         if index is None:

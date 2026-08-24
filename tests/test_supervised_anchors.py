@@ -1,8 +1,12 @@
+import asyncio
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from projects.rl.reward_function.llm_judge_reward import (
+    LLAMA31_EOT_TOKEN_ID,
+    _caption_qa_one,
     _parse_option,
     aggregate_caption_qa_outcomes,
 )
@@ -26,6 +30,35 @@ non_tensor_batch_row = _CONFIG_MODULE.non_tensor_batch_row
 
 
 class SupervisedAnchorsTest(unittest.TestCase):
+    def test_caption_qa_uses_llama_end_of_turn_stop_token(self):
+        captured = {}
+
+        class Completions:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="A"))]
+                )
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        question = {
+            "question": "Which caption is correct?",
+            "choices": [["correct", 1.0], ["incorrect", 0.0]],
+        }
+        score, failed = asyncio.run(
+            _caption_qa_one(
+                client,
+                "llama3.1-8b",
+                "a caption",
+                question,
+                asyncio.Semaphore(1),
+            )
+        )
+
+        self.assertEqual(score, 1.0)
+        self.assertFalse(failed)
+        self.assertEqual(captured["extra_body"], {"stop_token_ids": [LLAMA31_EOT_TOKEN_ID]})
+
     def test_caption_qa_averages_positive_and_negative_scores(self):
         result = aggregate_caption_qa_outcomes(1, [0, 0, 0], [(1.0, False), (0.0, False), (-1.0, False)])
         self.assertEqual(result[0]["reward"], 0.0)
