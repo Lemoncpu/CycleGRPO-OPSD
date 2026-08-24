@@ -14,3 +14,28 @@
 ## 终端命令交付
 
 给用户提供手动执行的服务器训练、数据导出、评测和诊断命令时，默认不得使用 `set -e`、`set -u` 或 `set -o pipefail`（包括 `set -euo pipefail`）。命令失败时必须保留 Python/bash 的原始错误输出和 traceback，便于用户在同一终端直接定位并继续执行后续诊断。只有用户明确要求 fail-fast 行为时，才可以加入这些 shell 选项。
+
+## 当前服务器训练数据路径
+
+以下路径来自实际执行的 disjoint 诊断训练命令，后续命令默认以此为基准：
+
+```text
+BASE_DIR=/volume/ybo/xyc
+REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD
+ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo
+MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok
+
+TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet
+DIRECT_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet
+NO_TARGET_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet
+DLC_DATA=/volume/ybo/xyc/datasets/dlc_qa/dlc_qa_10000.parquet
+DLC_QA=/volume/ybo/xyc/datasets/dlc_qa/dam_caption_qa_10000.jsonl
+
+RUN_NAME=cyclegrpo20k_direct30k_notarget10k_dlcqa10k_ce002_disjoint
+RUN_ROOT=/volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k_ce002_disjoint
+```
+
+数据流对应关系：`TRAIN_DATA` 是 20k CycleGRPO 主数据，`DIRECT_DATA` 是 disjoint RefCOCO
+正例，`NO_TARGET_DATA` 是 disjoint gRefCOCO no-target，`DLC_DATA` 是 DLC-QA parquet，
+`DLC_QA` 是对应的 QA JSONL。启用 no-target direct GRPO/SFT 前仍需在服务器执行
+`test -f "$NO_TARGET_DATA"`，确认该实际文件存在。

@@ -65,6 +65,7 @@ from ..workers.supervised_anchors import (
     direct_grounding_loss_weight,
     direct_mask_ce_response_fields,
     direct_mask_ce_source,
+    direct_mask_ce_loss_weight,
     direct_grounding_source,
     localization_media_keys,
     non_tensor_batch_row,
@@ -2613,6 +2614,16 @@ class RayPPOTrainer:
                         direct_config.warmup_end_step,
                     )
                     direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
+                    direct_ce_weight = (
+                        direct_mask_ce_loss_weight(
+                            self.global_step,
+                            direct_mask_ce_config.loss_weight,
+                            direct_mask_ce_config.warmup_start_step,
+                            direct_mask_ce_config.warmup_end_step,
+                        )
+                        if direct_mask_ce_config.enabled
+                        else 0.0
+                    )
                     metrics.update(
                         {
                             "supervised_anchors/direct_loss_weight_effective": direct_grad_weight,
@@ -2622,6 +2633,7 @@ class RayPPOTrainer:
                                 if direct_mask_ce_config.enabled
                                 else 0.0
                             ),
+                            "supervised_anchors/direct_mask_ce_weight_effective": direct_ce_weight,
                             "supervised_anchors/direct_mask_ce_samples": direct_mask_ce_size,
                             "supervised_anchors/caption_qa_loss_weight": (
                                 self.config.worker.supervised_anchors.caption_qa.loss_weight
@@ -2792,7 +2804,7 @@ class RayPPOTrainer:
                                 ce_batch.meta_info["global_token_num"] = torch.sum(
                                     ce_batch.batch["attention_mask"], dim=-1
                                 ).tolist()
-                                ce_batch.meta_info["grad_weight"] = direct_mask_ce_config.loss_weight
+                                ce_batch.meta_info["grad_weight"] = direct_ce_weight
                                 ce_batch.meta_info["global_batch_size_per_device"] = (
                                     len(ce_batch) // self.actor_rollout_ref_wg.world_size
                                 )

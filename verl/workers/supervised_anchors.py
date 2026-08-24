@@ -57,6 +57,16 @@ def direct_grounding_loss_weight(
     return target_weight * (step - warmup_start_step) / (warmup_end_step - warmup_start_step)
 
 
+def direct_mask_ce_loss_weight(
+    step: int,
+    target_weight: float,
+    warmup_start_step: int,
+    warmup_end_step: int,
+) -> float:
+    """Return the direct-CE weight, optionally linearly warmed up by step."""
+    return direct_grounding_loss_weight(step, target_weight, warmup_start_step, warmup_end_step)
+
+
 def direct_mask_ce_source(
     source: object,
     include_positive_sources: bool = True,
@@ -175,10 +185,16 @@ class DirectMaskCEConfig:
     include_positive_sources: bool = True
     include_no_target: bool = False
     record_base_gradient_cosine: bool = False
+    warmup_start_step: int = 0
+    warmup_end_step: int = 0
 
     def post_init(self):
         if self.loss_weight < 0:
             raise ValueError("direct_mask_ce.loss_weight must be non-negative.")
+        if self.warmup_start_step < 0 or self.warmup_end_step < self.warmup_start_step:
+            raise ValueError(
+                "direct_mask_ce warmup steps must satisfy 0 <= warmup_start_step <= warmup_end_step."
+            )
         if self.enabled and not (self.include_positive_sources or self.include_no_target):
             raise ValueError(
                 "direct_mask_ce requires include_positive_sources or include_no_target."

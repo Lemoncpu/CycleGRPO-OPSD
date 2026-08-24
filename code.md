@@ -384,6 +384,11 @@ optimizer step 中独立累积，不通过 K 次 rollout 放大。
 optimizer 更新；它与 `worker.opsd.asymmetric_gradient_projection` 互斥，避免 caption-first 投影暂存顺序
 使 base 定义不明确。
 
+`direct_mask_ce.warmup_start_step` 与 `warmup_end_step` 可将 CE 权重从 0 线性升到目标
+`loss_weight`；例如 `10/30` 表示 step 1-10 不施加 CE，step 11-30 线性升至 `0.02`，之后保持。
+默认均为 `0`，保持历史固定 CE 权重行为。实际每 step 权重记录为
+`supervised_anchors/direct_mask_ce_weight_effective`，用于和梯度余弦、范数共同分析。
+
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
 ### 3.5 奖励
@@ -705,6 +710,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 26. **正例 segmentation 使用 union 语义。** 在线 CycleGRPO 与 direct reward 都记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。该训练语义与 RefCOCO/GRES/GroundingSuite 默认 `legacy_union` 一致；`first_mask` 仍是仅用于离线诊断的显式协议，两种评测协议不能混合比较。
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
 28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL、caption safety 与 groundedness，防止 20k 主流混入任一辅助描述或分割监督。
+29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1375,3 +1381,16 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 行为：新增 `direct_mask_ce.record_base_gradient_cosine` 及对应环境变量。启用且存在 direct CE batch 时，trainer 先累积 CycleGRPO caption/localization、direct GRPO、DLC-QA 和其他 caption auxiliary，FSDP 暂存完整非 CE 梯度；direct CE backward 后跨 rank 记录 base/CE 范数、dot-product cosine 与冲突指示，再恢复 base 并合并 CE，训练更新保持不变。该诊断与非对称 caption-to-segmentation 梯度投影互斥。
 - 文档：更新第 3.4 节，说明诊断指标、包含的梯度范围和不改变 optimizer 更新的保证；未新增、移动或删除模块。
 - 验证：执行受影响 Python 文件 AST/compile 检查、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check`；本机无 CUDA/Ray/FSDP 环境，未执行多卡端到端训练。
+
+### 2026-08-24 - 记录 disjoint 诊断训练环境变量契约
+
+- 代码：仅修改 `code.md`，未修改训练实现或默认配置。
+- 行为：记录当前服务器的基础路径、7 卡拓扑、20k 主 cycle 数据、2:4:1 batch 配额、direct/CE/DLC-QA 环境变量及权重；明确 `DIRECT_NO_TARGET_TRAIN_DATA` 必须由服务器实际文件校验后传入，避免使用未验证的历史路径。
+- 验证：检索 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`README.md`、`code.md` 中的环境变量契约；此前启动失败输出确认 no-target 文件检查是唯一阻断项。
+
+### 2026-08-24 - 增加 direct mask CE 线性 warmup
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml` 和 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 行为：新增 `direct_mask_ce.warmup_start_step/end_step` 及对应环境变量。CE 在 start 及之前为零，在 start 与 end 之间线性升至 `loss_weight`，end 及之后保持目标权重；默认 `0/0`，保持历史固定 CE 权重。每 step 记录 `supervised_anchors/direct_mask_ce_weight_effective`。这用于消除诊断中 step 1-10 的高强度 CE 反向梯度窗口，不改数据、direct GRPO、DLC-QA 或后期 CE 权重。
+- 文档：更新第 3.4 节，说明权重函数和日志指标；未新增、移动或删除模块。
+- 验证：执行受影响 Python 文件 compile、训练入口 `bash -n` 和 `git diff --check`；本机没有 CUDA/Ray/FSDP，未运行端到端训练。
