@@ -206,10 +206,18 @@ class DirectMaskCEConfig:
 
 
 @dataclass
+class GradientDiagnosticsConfig:
+    """Opt-in, observation-only pairwise gradients for the active task streams."""
+
+    enabled: bool = False
+
+
+@dataclass
 class SupervisedAnchorsConfig:
     caption_qa: CaptionQAConfig = field(default_factory=CaptionQAConfig)
     direct_grounding: DirectGroundingConfig = field(default_factory=DirectGroundingConfig)
     direct_mask_ce: DirectMaskCEConfig = field(default_factory=DirectMaskCEConfig)
+    gradient_diagnostics: GradientDiagnosticsConfig = field(default_factory=GradientDiagnosticsConfig)
 
     def post_init(self):
         self.caption_qa.post_init()

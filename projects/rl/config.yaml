@@ -69,6 +69,8 @@ worker:
       record_base_gradient_cosine: false
       warmup_start_step: 0
       warmup_end_step: 0
+    gradient_diagnostics:
+      enabled: false
   opsd:
     enabled: true
     localization_rollouts: 6

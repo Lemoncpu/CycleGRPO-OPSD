@@ -88,6 +88,7 @@ DIRECT_MASK_CE_ENABLED="${DIRECT_MASK_CE_ENABLED:-false}"
 DIRECT_MASK_CE_LOSS_WEIGHT="${DIRECT_MASK_CE_LOSS_WEIGHT:-0.02}"
 DIRECT_MASK_CE_INCLUDE_NO_TARGET="${DIRECT_MASK_CE_INCLUDE_NO_TARGET:-false}"
 DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE="${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE:-false}"
+MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED="${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED:-false}"
 DIRECT_MASK_CE_WARMUP_START_STEP="${DIRECT_MASK_CE_WARMUP_START_STEP:-0}"
 DIRECT_MASK_CE_WARMUP_END_STEP="${DIRECT_MASK_CE_WARMUP_END_STEP:-0}"
 # Seven training GPUs can consume a single 2:4:1 parent-prompt batch while a
@@ -163,6 +164,7 @@ for bool_name in \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
     DIRECT_MASK_CE_ENABLED \
     DIRECT_MASK_CE_INCLUDE_NO_TARGET \
+    MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED \
     THREE_STREAM_2_4_1_ENABLED; do
     bool_value="${!bool_name}"
     if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
@@ -572,6 +574,7 @@ echo "DLC-QA train data: ${CAPTION_QA_TRAIN_DATA:-<disabled>} (batch=${CAPTION_Q
 echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (data=${DIRECT_TRAIN_DATA:-<disabled>}, batch=${DIRECT_BATCH_SIZE}, K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
 echo "Direct SFT anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, no-target=${DIRECT_MASK_CE_INCLUDE_NO_TARGET})"
 echo "Direct CE/base gradient cosine diagnostic: ${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}"
+echo "Pairwise multitask gradient diagnostic: ${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}"
 echo "Direct CE warmup: ${DIRECT_MASK_CE_WARMUP_START_STEP}-${DIRECT_MASK_CE_WARMUP_END_STEP} (target=${DIRECT_MASK_CE_LOSS_WEIGHT})"
 echo "Three-stream parent-prompt ratio 2:4:1: ${THREE_STREAM_2_4_1_ENABLED} (main=${ROLLOUT_BATCH_SIZE}, direct=${DIRECT_BATCH_SIZE}, DLC-QA=${CAPTION_QA_BATCH_SIZE}, training GPUs=${NUM_GPUS})"
 echo "Resume: ${RESUME}"
@@ -673,6 +676,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.supervised_anchors.direct_mask_ce.record_base_gradient_cosine="${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}" \
     worker.supervised_anchors.direct_mask_ce.warmup_start_step="${DIRECT_MASK_CE_WARMUP_START_STEP}" \
     worker.supervised_anchors.direct_mask_ce.warmup_end_step="${DIRECT_MASK_CE_WARMUP_END_STEP}" \
+    worker.supervised_anchors.gradient_diagnostics.enabled="${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
     trainer.project_name=cyclegrpo \

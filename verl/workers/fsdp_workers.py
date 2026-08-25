@@ -1387,6 +1387,88 @@ class FSDPWorker(Worker):
         ).to("cpu")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def capture_multitask_gradient_component(self, component: str):
+        """Record an unmodified task-gradient component and its pairwise cosines.
+
+        The actor's ``parameter.grad`` remains the normal accumulated gradient.
+        This method derives the newly-added component by subtracting previously
+        captured snapshots, then retains it only until the optimizer step.
+        """
+        assert self._has_actor
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+
+        snapshots = getattr(self, "_multitask_gradient_snapshots", None)
+        if snapshots is None:
+            snapshots = []
+            self._multitask_gradient_snapshots = snapshots
+        if any(name == component for name, _, _ in snapshots):
+            raise RuntimeError(f"Multitask gradient component was captured twice: {component}")
+
+        params = list(self.fsdp_module.parameters())
+        component_gradients = []
+        for parameter_index, parameter in enumerate(params):
+            gradient = parameter.grad
+            if gradient is None:
+                component_gradients.append(None)
+                continue
+            component_gradient = gradient.detach().clone()
+            for _, prior_gradients, _ in snapshots:
+                prior_gradient = prior_gradients[parameter_index]
+                if prior_gradient is not None:
+                    component_gradient.sub_(prior_gradient.to(dtype=component_gradient.dtype))
+            component_gradients.append(component_gradient)
+
+        stats = torch.zeros(1 + len(snapshots), device=torch.cuda.current_device(), dtype=torch.float32)
+        for parameter_index, component_gradient in enumerate(component_gradients):
+            if component_gradient is not None:
+                stats[0].add_(component_gradient.float().square().sum())
+                for snapshot_index, (_, prior_gradients, _) in enumerate(snapshots, start=1):
+                    prior_gradient = prior_gradients[parameter_index]
+                    if prior_gradient is not None:
+                        stats[snapshot_index].add_(
+                            (prior_gradient.float() * component_gradient.float()).sum()
+                        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        if not torch.isfinite(stats).all():
+            self._multitask_gradient_snapshots = None
+            raise FloatingPointError("Non-finite multitask gradient diagnostics.")
+
+        component_norm_sq = stats[0].detach()
+        metrics = {
+            f"supervised_anchors/multitask_gradient/{component}_grad_norm": np.array(
+                [component_norm_sq.sqrt().item()]
+            )
+        }
+        for snapshot_index, (prior_name, _, prior_norm_sq) in enumerate(snapshots, start=1):
+            dot_product = stats[snapshot_index]
+            denominator = torch.sqrt(prior_norm_sq * component_norm_sq).clamp_min(1e-12)
+            cosine = dot_product / denominator
+            conflict = bool(
+                (dot_product < 0).item()
+                and (prior_norm_sq > 0).item()
+                and (component_norm_sq > 0).item()
+            )
+            pair_name = f"{prior_name}_vs_{component}"
+            metrics[f"supervised_anchors/multitask_gradient/{pair_name}_cosine"] = np.array(
+                [cosine.item()]
+            )
+            metrics[f"supervised_anchors/multitask_gradient/{pair_name}_conflict"] = np.array(
+                [float(conflict)]
+            )
+
+        snapshots.append((component, component_gradients, component_norm_sq))
+        return DataProto(non_tensor_batch=metrics).to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_multitask_gradient_diagnostics(self):
+        """Release observation-only gradient snapshots without changing ``.grad``."""
+        self._multitask_gradient_snapshots = None
+        return DataProto(non_tensor_batch={}).to("cpu")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def merge_asymmetric_actor_gradients(self):
         """Project only caption gradient components that oppose the segmentation gradient."""
         assert self._has_actor

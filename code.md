@@ -389,6 +389,17 @@ optimizer 更新；它与 `worker.opsd.asymmetric_gradient_projection` 互斥，
 默认均为 `0`，保持历史固定 CE 权重行为。实际每 step 权重记录为
 `supervised_anchors/direct_mask_ce_weight_effective`，用于和梯度余弦、范数共同分析。
 
+如需识别三流中的具体冲突，可启用
+`worker.supervised_anchors.gradient_diagnostics.enabled=true`。在一个 optimizer step 内，trainer 按实际
+反向累计中快照 `cycle_caption`、`cycle_segmentation`、`direct_grpo`、`direct_mask_ce`、`dlc_qa`，以及启用时的
+`regenerate_ce`、`privileged_jsd` 加权梯度分量，并记录每个
+`supervised_anchors/multitask_gradient/<component>_grad_norm`，以及任意已存在分量对的
+`<left>_vs_<right>_cosine` 与二元 `..._conflict`（负内积为 1）。Cycle caption/segmentation 的 PPO 与其
+同次 forward 中的 KL 属于同一分量。诊断只从已累积的 `.grad` 中扣除此前快照来观察新分量，不清零、投影、
+重标定或改变 optimizer 输入；快照在该 step 的 optimizer 前释放。由于每个 FSDP rank 会暂存最多七份 gradient
+shard，该开关仅用于 30--50 step 诊断，不应用于完整训练；它与
+非对称梯度投影和旧的 direct-CE-vs-base 诊断互斥。
+
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
 ### 3.5 奖励
@@ -437,7 +448,11 @@ depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并
 为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）时该正确性项为 `1.0`，否则为
 `0.0`。此模式不检查 `No target.` 文本，因而与 GRES `N_acc` 的 `not pred_mask.any()` 语义一致。
 它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，
-不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。
+不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。该 metadata 只在
+no-target reward 阶段有效；当 no-target caption batch 与正例 cycle caption batch 合并为主 PPO
+batch 前，trainer 必须从 `non_cycle_batch`（并对称地从 cycle 侧）移除
+`no_target_pixel_empty` 和 `no_target_reward_mode`，否则 `DataProto.concat` 会把仅存在于 no-target
+子 batch 的短数组保留为全 batch 字段而触发 batch-size 一致性断言。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -1409,3 +1424,30 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 验证：新增 mock OpenAI client 单测，检查停止 token 且确认 `A` 可解析；执行
   `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile projects/rl/reward_function/llm_judge_reward.py tests/test_supervised_anchors.py`、
   `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。
+
+### 2026-08-25 - 增加三流 pairwise 梯度冲突诊断
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/workers/config.py`、`verl/workers/fsdp_workers.py`、
+  `verl/trainer/ray_trainer.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和
+  `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4 节的 direct/CE 梯度诊断契约；未新增、移动或删除模块。
+- 行为：新增 opt-in `gradient_diagnostics.enabled`。开启后记录 Cycle caption、Cycle segmentation、direct GRPO、
+  DLC-QA GRPO、direct mask CE，以及实际启用的 regenerate CE/JSD 的加权梯度范数、所有可用两两余弦和负内积
+  冲突标志，不修改反向累计或 optimizer step。该模式与 caption-to-segmentation 投影、旧 direct CE/base 聚合
+  诊断互斥，并在单步完成后释放 FSDP gradient snapshot；仅适合短期诊断运行。
+- 验证：待执行受影响 Python compile、`python3 -m unittest tests.test_supervised_anchors`、入口 `bash -n`、
+  `git diff --check`；服务器需以完整五流配置运行 30--50 step，确认日志包含 pairwise metrics 且没有 OOM。
+
+### 2026-08-25 - 修复 pixel-empty no-target 与 cycle caption 合并失败
+
+- 代码：修改 `verl/trainer/ray_trainer.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.5 节 no-target reward 的 metadata 生命周期，并追加本日志；未新增、移动或删除模块。
+- 行为：`pixel_empty` no-target 解码产生的 `no_target_pixel_empty`、`no_target_reward_mode` 在其 reward/advantage
+  已计算后、与正例 cycle caption batch 合并为 PPO actor batch 前从 `non_cycle_batch` 移除，并对 cycle 侧执行同一
+  清理。此前字段只存在于 non-cycle 子 batch；`DataProto.concat` 未补齐 cycle 一侧字段，导致长度为 no-target
+  rollout 数的数组被带入总 batch，并在 `check_consistency` 抛出断言。该修复不改变 decoded-union no-target 奖励、
+  优势、PPO loss 或正例训练。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（20 tests）与
+  `git diff --check` 通过；本机无 PyTorch/CUDA/Ray/FSDP，服务器仍需以
+  `NO_TARGET_REWARD_MODE=pixel_empty` 运行 `MAX_STEPS=1`，确认可越过 caption batch concat 并记录 no-target reward。

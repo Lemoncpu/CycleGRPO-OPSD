@@ -88,3 +88,16 @@ class WorkerConfig:
                 "direct_mask_ce.record_base_gradient_cosine is incompatible with "
                 "opsd.asymmetric_gradient_projection; disable the projection for an unambiguous base gradient."
             )
+        if self.supervised_anchors.gradient_diagnostics.enabled and self.opsd.asymmetric_gradient_projection:
+            raise ValueError(
+                "supervised_anchors.gradient_diagnostics.enabled is incompatible with "
+                "opsd.asymmetric_gradient_projection; diagnostics require unprojected task gradients."
+            )
+        if (
+            self.supervised_anchors.gradient_diagnostics.enabled
+            and self.supervised_anchors.direct_mask_ce.record_base_gradient_cosine
+        ):
+            raise ValueError(
+                "supervised_anchors.gradient_diagnostics.enabled is incompatible with "
+                "direct_mask_ce.record_base_gradient_cosine; use the pairwise diagnostics instead."
+            )

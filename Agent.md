@@ -26,6 +26,8 @@ ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo
 MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok
 
 TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet
+OFFICIAL_HTG_TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_official_htg_seed20260825/cyclegrpo_20k_official_htg_15k_single_4k_multi_1k_gres_seed20260825.parquet
+OFFICIAL_HTG_TRAIN_MANIFEST=/volume/ybo/xyc/datasets/cyclegrpo_20k_official_htg_seed20260825/cyclegrpo_20k_official_htg_15k_single_4k_multi_1k_gres_seed20260825.manifest.json
 DIRECT_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet
 NO_TARGET_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet
 DLC_DATA=/volume/ybo/xyc/datasets/dlc_qa/dlc_qa_10000.parquet
@@ -39,3 +41,10 @@ RUN_ROOT=/volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo20k_direct30k_notarget10k_
 正例，`NO_TARGET_DATA` 是 disjoint gRefCOCO no-target，`DLC_DATA` 是 DLC-QA parquet，
 `DLC_QA` 是对应的 QA JSONL。启用 no-target direct GRPO/SFT 前仍需在服务器执行
 `test -f "$NO_TARGET_DATA"`，确认该实际文件存在。
+
+`OFFICIAL_HTG_TRAIN_DATA` 是由 `TRAIN_DATA` 导出的官方 CycleGRPO 兼容副本，仅把
+`source` 映射为官方代码已有标签：RefCOCO/COCO-Stuff/PACO 的 15k 行为
+`denseworld_single`，gRefCOCO positive 的 4k 行为 `denseworld_multiple`，1k
+`gres_no_target` 保持不变；所有其他 parquet 列保持原样。它只能配合
+`/volume/ybo/xyc/CycleGRPO` 的未修改官方训练代码做 HTG 对照，不应用于 OPSD 主训练，
+也不能表述为使用论文原始 DenseWorld 数据的复现。

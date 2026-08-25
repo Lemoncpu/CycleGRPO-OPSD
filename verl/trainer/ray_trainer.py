@@ -2138,6 +2138,9 @@ class RayPPOTrainer:
                     direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
                     direct_grounding_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
+                    multitask_gradient_diagnostics_enabled = bool(
+                        self.config.worker.supervised_anchors.gradient_diagnostics.enabled
+                    )
                     allowed_direct_sources = set()
                     if (
                         (
@@ -2557,8 +2560,11 @@ class RayPPOTrainer:
                         non_cycle_batch.batch["caption_anchor_kl_mask"] = torch.zeros(
                             len(non_cycle_batch), dtype=non_cycle_batch.batch["response_mask"].dtype
                         )
-                    # Remove iou_scores and correct_mask from batch before concat
-                    for key in (
+                    # Remove cycle-only and reward-stage-only metadata before concat.
+                    # The pixel-empty fields are produced on non_cycle_batch by
+                    # the no-target decoder; cycle-side fields are removed as well
+                    # so neither side can leak task-specific arrays into actor PPO.
+                    concat_only_metadata = (
                         "iou_scores",
                         "correct_mask",
                         "caption_uid",
@@ -2578,7 +2584,13 @@ class RayPPOTrainer:
                         "iou_std",
                         "iou_min",
                         "iou_max",
-                    ):
+                        # These decoded no-target values are consumed before
+                        # the actor update and exist only on the non-cycle side.
+                        "no_target_pixel_empty",
+                        "no_target_reward_mode",
+                    )
+                    for key in concat_only_metadata:
+                        non_cycle_batch.non_tensor_batch.pop(key, None)
                         cycle_cap_batch.non_tensor_batch.pop(key, None)
                     cap_batch = DataProto.concat([non_cycle_batch, cycle_cap_batch])
                 elif non_cycle_batch is not None:
@@ -2649,6 +2661,17 @@ class RayPPOTrainer:
                         
                         with timer("update_actor", timing_raw):
                             actor_metrics = {}
+
+                            def capture_multitask_gradient_component(component: str) -> None:
+                                if not multitask_gradient_diagnostics_enabled:
+                                    return
+                                diagnostic_output = (
+                                    self.actor_rollout_ref_wg.capture_multitask_gradient_component(component)
+                                )
+                                if diagnostic_output and hasattr(diagnostic_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(
+                                        reduce_metrics(diagnostic_output[0].non_tensor_batch)
+                                    )
                             
                             # Step 1: Accumulate gradients from cap_batch (combined non_single + single)
                             if cap_batch is not None and cap_batch_size > 0:
@@ -2656,6 +2679,7 @@ class RayPPOTrainer:
                                 cap_batch.meta_info['global_batch_size_per_device'] = len(cap_batch) // self.actor_rollout_ref_wg.world_size
                                 cap_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(cap_batch)
                                 actor_metrics.update({f"cap_{k}": v for k, v in reduce_metrics(cap_output.non_tensor_batch).items()})
+                                capture_multitask_gradient_component("cycle_caption")
                             
                             def accumulate_caption_auxiliary_gradients() -> None:
                                 if caption_qa_batch is not None and caption_qa_size > 0:
@@ -2676,6 +2700,7 @@ class RayPPOTrainer:
                                             ).items()
                                         }
                                     )
+                                    capture_multitask_gradient_component("dlc_qa")
 
                                 if regenerate_batch is not None and len(regenerate_batch) > 0:
                                     regen_count = len(regenerate_batch)
@@ -2706,6 +2731,7 @@ class RayPPOTrainer:
                                             ).items()
                                         }
                                     )
+                                    capture_multitask_gradient_component("regenerate_ce")
 
                                 if distillation_batch is not None and len(distillation_batch) > 0:
                                     distill_count = len(distillation_batch)
@@ -2738,6 +2764,7 @@ class RayPPOTrainer:
                                             ).items()
                                         }
                                     )
+                                    capture_multitask_gradient_component("privileged_jsd")
 
                             projection_enabled = bool(
                                 self.config.worker.opsd.asymmetric_gradient_projection
@@ -2764,6 +2791,7 @@ class RayPPOTrainer:
                                 seg_batch.meta_info['global_batch_size_per_device'] = len(seg_batch) // self.actor_rollout_ref_wg.world_size
                                 seg_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(seg_batch)
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
+                                capture_multitask_gradient_component("cycle_segmentation")
 
                             if direct_grounding_batch is not None and direct_grounding_size > 0:
                                 direct_grounding_batch.meta_info["grad_weight"] = direct_grad_weight
@@ -2779,6 +2807,7 @@ class RayPPOTrainer:
                                         for key, value in reduce_metrics(direct_output.non_tensor_batch).items()
                                     }
                                 )
+                                capture_multitask_gradient_component("direct_grpo")
 
                             if direct_ce_cosine_enabled:
                                 # Include DLC-QA and other caption auxiliaries in the measured non-CE base.
@@ -2812,6 +2841,7 @@ class RayPPOTrainer:
                                     ce_batch
                                 )
                                 actor_metrics.update(reduce_metrics(ce_output.non_tensor_batch))
+                                capture_multitask_gradient_component("direct_mask_ce")
 
                             if direct_ce_cosine_enabled:
                                 merge_output = self.actor_rollout_ref_wg.merge_direct_ce_base_gradients()
@@ -2825,6 +2855,11 @@ class RayPPOTrainer:
                             elif not caption_auxiliary_accumulated:
                                 # Preserve the historical accumulation order when projection is disabled.
                                 accumulate_caption_auxiliary_gradients()
+
+                            if multitask_gradient_diagnostics_enabled:
+                                clear_output = self.actor_rollout_ref_wg.clear_multitask_gradient_diagnostics()
+                                if clear_output and hasattr(clear_output[0], "non_tensor_batch"):
+                                    actor_metrics.update(reduce_metrics(clear_output[0].non_tensor_batch))
                             
                             # Step 3: Perform optimizer step with accumulated gradients
                             opt_output = self.actor_rollout_ref_wg.step_actor_optimizer()

@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import importlib.util
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ _CONFIG_SPEC.loader.exec_module(_CONFIG_MODULE)
 CaptionQAConfig = _CONFIG_MODULE.CaptionQAConfig
 DirectGroundingConfig = _CONFIG_MODULE.DirectGroundingConfig
 DirectMaskCEConfig = _CONFIG_MODULE.DirectMaskCEConfig
+GradientDiagnosticsConfig = _CONFIG_MODULE.GradientDiagnosticsConfig
 aligned_direct_prompt_count = _CONFIG_MODULE.aligned_direct_prompt_count
 alternating_localization_prompt_variants = _CONFIG_MODULE.alternating_localization_prompt_variants
 direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
@@ -103,6 +105,10 @@ class SupervisedAnchorsTest(unittest.TestCase):
         config = DirectGroundingConfig()
         self.assertEqual(config.rollouts, 6)
         self.assertFalse(config.consume_no_target_caption)
+
+    def test_pairwise_multitask_gradient_diagnostics_is_opt_in(self):
+        self.assertFalse(GradientDiagnosticsConfig().enabled)
+        self.assertTrue(GradientDiagnosticsConfig(enabled=True).enabled)
 
     def test_auxiliary_streams_have_independent_batch_sizes(self):
         direct = DirectGroundingConfig(
@@ -223,6 +229,31 @@ class SupervisedAnchorsTest(unittest.TestCase):
                     {"type": "positive", "question": "two", "choices": [["a", 1], ["b", 0], ["c", 0], ["d", 0]]},
                 ]
             )
+
+    def test_pixel_empty_metadata_is_dropped_before_caption_batch_concat(self):
+        trainer_path = Path(__file__).parents[1] / "verl/trainer/ray_trainer.py"
+        source = trainer_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        cleanup_tuples = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Tuple):
+                continue
+            cleanup_tuples.append(
+                {
+                    item.value
+                    for item in node.value.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                }
+            )
+        self.assertTrue(
+            any(
+                {"no_target_pixel_empty", "no_target_reward_mode"}.issubset(cleanup)
+                for cleanup in cleanup_tuples
+            ),
+            "caption batch concat must remove no-target-only decoded metadata",
+        )
+        self.assertIn("non_cycle_batch.non_tensor_batch.pop(key, None)", source)
+        self.assertIn("cycle_cap_batch.non_tensor_batch.pop(key, None)", source)
 
 
 if __name__ == "__main__":
