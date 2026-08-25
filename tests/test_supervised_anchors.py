@@ -255,6 +255,18 @@ class SupervisedAnchorsTest(unittest.TestCase):
         self.assertIn("non_cycle_batch.non_tensor_batch.pop(key, None)", source)
         self.assertIn("cycle_cap_batch.non_tensor_batch.pop(key, None)", source)
 
+    def test_gradient_diagnostics_flag_is_available_without_direct_loader(self):
+        trainer_path = Path(__file__).parents[1] / "verl/trainer/ray_trainer.py"
+        source = trainer_path.read_text(encoding="utf-8")
+        flag_assignment = "multitask_gradient_diagnostics_enabled = bool("
+        direct_branch = "if direct_parent_batch is not None:"
+        self.assertEqual(source.count(flag_assignment), 1)
+        self.assertLess(
+            source.index(flag_assignment),
+            source.index(direct_branch),
+            "pure CycleGRPO diagnostics must not depend on a direct auxiliary loader",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

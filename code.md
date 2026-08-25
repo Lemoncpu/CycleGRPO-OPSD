@@ -399,6 +399,8 @@ optimizer 更新；它与 `worker.opsd.asymmetric_gradient_projection` 互斥，
 重标定或改变 optimizer 输入；快照在该 step 的 optimizer 前释放。由于每个 FSDP rank 会暂存最多七份 gradient
 shard，该开关仅用于 30--50 step 诊断，不应用于完整训练；它与
 非对称梯度投影和旧的 direct-CE-vs-base 诊断互斥。
+诊断开关在每个 trainer step 的公共路径读取，因而纯 CycleGRPO（没有 direct 或 DLC-QA 辅助 loader）也可安全
+记录其实际存在的 cycle 分量；缺失的辅助分量不会被伪造，也不会改变正常的梯度累计顺序。
 
 代码中存在 `generate_sequences_with_ref`，可临时把 vLLM 换成 reference policy 权重，但当前调用已注释，实际调用 `generate_sequences`。因此当前有效实现确实是“actor 作为自己的 critic”，而不是冻结的外部 critic。
 
@@ -1451,3 +1453,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`（20 tests）与
   `git diff --check` 通过；本机无 PyTorch/CUDA/Ray/FSDP，服务器仍需以
   `NO_TARGET_REWARD_MODE=pixel_empty` 运行 `MAX_STEPS=1`，确认可越过 caption batch concat 并记录 no-target reward。
+
+### 2026-08-25 - 修复纯 CycleGRPO 梯度诊断的开关作用域
+
+- 代码：修改 `verl/trainer/ray_trainer.py` 和 `tests/test_supervised_anchors.py`。
+- 文档：更新第 3.4 节梯度诊断的无辅助 loader 契约；未新增、移动或删除模块。
+- 行为：`multitask_gradient_diagnostics_enabled` 改为在每个训练 step 的公共路径初始化，而非仅在
+  `direct_parent_batch` 存在时初始化。启用诊断但只训练 CycleGRPO 时，cycle caption/segmentation 分量可以正常
+  捕获；禁用诊断或不存在对应 batch 时保持无操作。direct GRPO、DLC-QA、CE、OPSD 及既有梯度累计顺序不变。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。

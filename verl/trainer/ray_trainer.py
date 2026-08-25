@@ -2134,13 +2134,14 @@ class RayPPOTrainer:
                 caption_qa_batch = None
                 direct_parent_batch = self._next_auxiliary_parent_batch("direct")
                 caption_qa_parent_batch = self._next_auxiliary_parent_batch("caption_qa")
+                # This also gates diagnostics for pure CycleGRPO runs without auxiliary loaders.
+                multitask_gradient_diagnostics_enabled = bool(
+                    self.config.worker.supervised_anchors.gradient_diagnostics.enabled
+                )
                 if direct_parent_batch is not None:
                     direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
                     direct_grounding_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
-                    multitask_gradient_diagnostics_enabled = bool(
-                        self.config.worker.supervised_anchors.gradient_diagnostics.enabled
-                    )
                     allowed_direct_sources = set()
                     if (
                         (
