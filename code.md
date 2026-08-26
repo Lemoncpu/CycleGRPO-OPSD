@@ -62,6 +62,8 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
 | rollout/global batch | `128` | 与论文一致 |
+| 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
+| 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
 | GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
 | vision tower | frozen | shell 覆盖为 `true` |
@@ -106,7 +108,7 @@ anchor KL 设为 `0`、关闭 caption safety，以免保留 C/C2 的额外策略
 启动行为均不变。入口会拒绝没有 pixel IoU 或 EMA teacher 的三路由配置。
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
-离线评测入口执行 RefCOCO val。设置入口的可选 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
+离线评测入口执行 RefCOCO val。入口默认 `MAX_STEPS=156`，用于使 20k/40k/10k 三条流在同一轮内对齐；设置 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
 再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
@@ -115,11 +117,11 @@ Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
 符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
-前扫描 parquet 的 `images` 列，验证所有图像路径均存在。它不修改论文算法或训练超参数，
-只固定当前服务器的数据与运行环境。
+前扫描 parquet 的 `images` 列，验证所有图像路径均存在。除本节记录的 70k 三流 batch/step
+对齐默认值外，它不修改论文算法；其他训练超参数和数据路径仍可由环境变量覆盖。
 
-入口以 `set -u` 运行时，未设置或显式清空 `MAX_STEPS` 不会向 Hydra 传入空位置参数；仅在该变量为正整数时
-才附加 `trainer.max_steps=<value>`。因此完整 epoch 与分段运行共用同一入口，不需要为完整 epoch 人为设置步数。
+入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用默认值 `156`；显式设置为空字符串时不会向 Hydra
+传入空位置参数并恢复完整 epoch，设置正整数时附加 `trainer.max_steps=<value>`。
 
 火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。当前服务器默认将
 `BASE_DIR` 固定为 `/volume/ybo/xyc`，使用 `/volume/ybo/xyc/envs/cyclegrpo`、
@@ -283,6 +285,12 @@ direct GRPO/SFT，
 `worker.supervised_anchors.caption_qa.train_files` 专供 DLC-QA caption GRPO。两者各有独立
 `batch_size`，每个主 step 只各读取一批，并循环遍历自身数据；它们绝不消费、重排或缩短主
 CycleGRPO iterator。resume 时三个 loader 的 state 都保存到 checkpoint。
+
+火山引擎 70k 三流入口默认使用 `ROLLOUT_BATCH_SIZE=128`、`DIRECT_BATCH_SIZE=256` 和
+`CAPTION_QA_BATCH_SIZE=64`，并设置 `MAX_STEPS=156`。这使 20k 主 CycleGRPO、40k
+direct supervision 和 10k DLC-QA 分别在约 156 个 optimizer step 内各消费一遍（parent-prompt
+配额比例 `2:4:1`）。这些 batch 只决定各 loader 每步读取的 parent prompt 数，不改变 rollout 数、
+loss weight 或三流在同一 optimizer step 中的梯度累积顺序；同名环境变量仍可覆盖默认值。
 
 服务器入口的 `THREE_STREAM_2_4_1_ENABLED=true` 是固定配额模式：要求 `NUM_GPUS=7`，并要求
 main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
@@ -1506,3 +1514,13 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   optimizer 或显式正频率 validation；未知版本不会强行改写。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/patch_official_final_validation.py` 和
   `git diff --check`；本机未修改官方仓库，未执行服务器训练。
+
+### 2026-08-26 - 对齐 70k 三流训练的默认 batch 与 step
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、3.2 节及本变更日志。
+- 行为：火山引擎入口默认主 CycleGRPO、direct supervision、DLC-QA parent batch 分别为
+  `128`、`256`、`64`，并默认 `MAX_STEPS=156`，使 20k/40k/10k 三条独立 loader 在约
+  156 个 optimizer step 内各消费一遍；显式环境变量仍可覆盖，`MAX_STEPS=""` 可恢复完整 epoch。
+- 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`git diff --check`，并用 Bash
+  空/未设置变量检查确认默认 `156` 与显式空值的完整 epoch 分支；本机无 8 卡 Ray/FSDP 环境，未执行端到端训练。
