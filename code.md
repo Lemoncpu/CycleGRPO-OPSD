@@ -569,6 +569,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 保活工具；默认按 `CUDA_VISIBLE_DEVICES` 为每张可见卡预留约 40000 MiB 显存，收到 SIGTERM/SIGINT 后释放 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
+| `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
@@ -1494,3 +1495,14 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   训练成功后继续执行默认约 40000 MiB/卡的 CUDA 保活，未设置时保持完整 epoch 行为。
 - 验证：`bash -n tools/run_official_cyclegrpo_keepalive.sh` 和 `git diff --check`；本机无服务器 CUDA/官方依赖，
   未执行实际 one-step training 或显存保活。
+
+### 2026-08-26 - 修复官方训练结束验证阻断 CUDA 保活
+
+- 代码：新增 `tools/patch_official_final_validation.py`。
+- 文档：更新第 5.1 节模块清单和本变更日志；说明该补丁作用于独立的官方仓库，不改变 CycleGRPO 更新逻辑。
+- 行为：幂等补丁将官方 trainer 的训练后 validation 改为仅在 `trainer.val_freq>0` 时执行。此前即使
+  `val_freq=-1`，训练结束仍会调用 `_validate()`，当前官方 loader 的字段不兼容时会在 vLLM 预处理阶段
+  触发 `AttributeError`，阻止最终 checkpoint 保存及后续 CUDA 保活。补丁不改变 step 内训练、reward、loss、
+  optimizer 或显式正频率 validation；未知版本不会强行改写。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/patch_official_final_validation.py` 和
+  `git diff --check`；本机未修改官方仓库，未执行服务器训练。
