@@ -567,6 +567,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
+| `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 保活工具；默认按 `CUDA_VISIBLE_DEVICES` 为每张可见卡预留约 40000 MiB 显存，收到 SIGTERM/SIGINT 后释放 |
+| `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
@@ -1463,3 +1465,32 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   捕获；禁用诊断或不存在对应 batch 时保持无操作。direct GRPO、DLC-QA、CE、OPSD 及既有梯度累计顺序不变。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py tests/test_supervised_anchors.py`、
   `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors` 和 `git diff --check`。
+
+### 2026-08-26 - 增加训练完成后的 CUDA 保活工具
+
+- 代码：新增 `tools/cuda_keepalive.py`、`tools/run_official_cyclegrpo_keepalive.sh`。
+- 文档：更新第 5.1 节模块清单；未修改官方 CycleGRPO 训练主循环或算法配置。
+- 行为：官方训练包装入口调用未修改的 `/volume/ybo/xyc/CycleGRPO` 主循环，只有训练成功退出后才启动保活工具。
+  保活工具按 `CUDA_VISIBLE_DEVICES` 遍历可见 GPU，逐卡预留可配置的小块显存并保持进程运行；训练失败时
+  不会启动保活进程，收到 SIGTERM/SIGINT 后释放预留并退出。入口支持可选的 `MAX_STEPS` 环境变量；设置
+  `MAX_STEPS=1` 时只运行一个官方训练 step，成功后立即进入保活，未设置时仍运行完整一轮 epoch。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/cuda_keepalive.py`、
+  `bash -n tools/run_official_cyclegrpo_keepalive.sh` 和 `git diff --check`；本机无 CUDA 运行时，未执行实际显存保活 smoke test。
+
+### 2026-08-26 - 将 CUDA 保活默认显存调整为约 40 GiB
+
+- 代码：修改 `tools/cuda_keepalive.py` 和 `tools/run_official_cyclegrpo_keepalive.sh`。
+- 文档：更新第 5.1 节模块说明和本变更日志。
+- 行为：保活工具和官方训练包装入口默认改为每张可见 GPU 预留 `40000 MiB`；仍可通过
+  `KEEPALIVE_MEMORY_MB` 或 `--memory-mb` 覆盖。训练算法、数据和 checkpoint 行为不变。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/cuda_keepalive.py`、
+  `bash -n tools/run_official_cyclegrpo_keepalive.sh` 和 `git diff --check`；本机无 CUDA，未执行真实显存分配。
+
+### 2026-08-26 - 支持官方训练一 step 后进入 CUDA 保活
+
+- 代码：修改 `tools/run_official_cyclegrpo_keepalive.sh`。
+- 文档：更新第 5.1 节包装入口说明和本变更日志。
+- 行为：包装入口通过可选 `MAX_STEPS` 注入官方 `trainer.max_steps`；`MAX_STEPS=1` 可用于短时验证，
+  训练成功后继续执行默认约 40000 MiB/卡的 CUDA 保活，未设置时保持完整 epoch 行为。
+- 验证：`bash -n tools/run_official_cyclegrpo_keepalive.sh` 和 `git diff --check`；本机无服务器 CUDA/官方依赖，
+  未执行实际 one-step training 或显存保活。
