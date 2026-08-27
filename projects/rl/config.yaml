@@ -93,7 +93,9 @@ worker:
       mask_threshold: 0.5
       prefer_raw_gt: true
       invalid_iou: 0.0
-      segmentation_max_response_tokens: 32
+      # Match the historical global rollout limit rather than truncating
+      # localization responses at the later 32-token stabilization setting.
+      segmentation_max_response_tokens: 256
       # ``pixel_empty`` decodes all legal groups and rewards an empty union,
       # matching offline gRefCOCO N_acc. ``text`` preserves historical training.
       no_target_reward_mode: text

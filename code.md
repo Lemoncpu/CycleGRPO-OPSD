@@ -49,6 +49,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 模型 | `<PATH_TO_COLD_START_CKPT>` | 必须替换为 co-SFT/SAMTok checkpoint |
 | 外层 rollout `G` | `worker.rollout.n=6` | 与论文及 OPSD 默认一致 |
 | caption response 上限 | `256` token | 火山引擎入口的稳定化消融值；同时是 caption 安全门控的超长阈值 |
+| segmentation response 上限 | `256` token | 与历史 20k OPSD 运行相同；localization rollout 默认继承等长上限，而非后加的 32-token 截断 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
 | caption 原始 GRPO | B 入口默认保留 | 所有安全 rollout 都计算原始 CycleGRPO policy loss；low/mid 的 teacher 更新改为附加梯度 |
@@ -1337,7 +1338,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 - 代码：修改 `verl/workers/opsd/mask_iou.py`、`verl/workers/opsd/config.py`、`verl/workers/fsdp_workers.py`、`verl/workers/reward/function.py`、`verl/trainer/ray_trainer.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_opsd_core.py`。
 - 文档：更新 `README.md`、第 3.4、3.5、5.2、关键注意事项 26 和本日志。
-- 行为：正例 localization 不再要求恰好一个 group，也不再把多 group IoU 置零或按额外 group 扣分。在线 decoder 从同一 image embedding 批量解码一条 response 的全部完整、codebook 合法 depth-2 group，并 union 为一个 prediction；raw GT 可用时仍优先作为 IoU target，结果同时作为 cycle `s_i,k`、`R_Ci` routing 和 direct `pixel_iou`。奖励恢复原 CycleGRPO 的格式与 non-repeat 语义：至少一个完整 group 得 format 一分，只有同一完整 group 超过三次时 non-repeat 一分为零，IoU 不受此正则置零。保留 `segmentation_max_response_tokens=32` 作为生成长度上限和 group-count telemetry；移除严格单 group 配置、环境变量、Hydra override 与遥测。
+- 行为：正例 localization 不再要求恰好一个 group，也不再把多 group IoU 置零或按额外 group 扣分。在线 decoder 从同一 image embedding 批量解码一条 response 的全部完整、codebook 合法 depth-2 group，并 union 为一个 prediction；raw GT 可用时仍优先作为 IoU target，结果同时作为 cycle `s_i,k`、`R_Ci` routing 和 direct `pixel_iou`。奖励恢复原 CycleGRPO 的格式与 non-repeat 语义：至少一个完整 group 得 format 一分，只有同一完整 group 超过三次时 non-repeat 一分为零，IoU 不受此正则置零。保留可配置的 `segmentation_max_response_tokens` 作为生成长度上限和 group-count telemetry；移除严格单 group 配置、环境变量、Hydra override 与遥测。
 - 论文边界：原始公开 CycleGRPO 以 HTG token matching 计算 `s_i,k`；当前实现唯一替换该测量为在线 decoded union 的像素 IoU，保留其在 `R_loc_i,k=10*s_i,k*mean_k(s_i,k)+format+non_repeat` 中的位置和其多 group 表达语义。此项取代本日志中 2026-08-12 的严格单 group 训练扩展；离线 `legacy_union|first_mask` 协议不变。
 - 验证：修改 Python 文件的 AST 语法检查、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `git diff --check` 通过。`python3 -m unittest tests.test_opsd_core` 在本机因缺少 `torch` 无法导入；测试已新增多 group 正奖励、四次相同 group 仅清零 non-repeat 项、以及 shared embedding 的 union decode 覆盖。服务器仍需以项目环境运行该单元测试和最小 batch smoke training。
 
@@ -1524,3 +1525,16 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   156 个 optimizer step 内各消费一遍；显式环境变量仍可覆盖，`MAX_STEPS=""` 可恢复完整 epoch。
 - 验证：`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`git diff --check`，并用 Bash
   空/未设置变量检查确认默认 `156` 与显式空值的完整 epoch 分支；本机无 8 卡 Ray/FSDP 环境，未执行端到端训练。
+
+### 2026-08-27 - 恢复历史 20k OPSD 的 localization 响应上限
+
+- 代码：修改 `verl/workers/opsd/config.py`、`projects/rl/config.yaml` 和
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2 节与本变更日志；未新增、移动或删除模块。
+- 行为：`pixel_iou.segmentation_max_response_tokens` 的 dataclass、YAML 与火山入口默认值统一从
+  `32` 恢复为 `256`。历史 RefCOCO 77 运行没有专用 segmentation cap，localization rollout 因而
+  继承全局 `data.max_response_length=256`；恢复后保持这一有效上限。该项只改变训练期
+  localization 生成的最大长度，不改变 caption 上限、G/K、union 解码、IoU/reward、routing、数据或 loss。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/opsd/config.py`、
+  `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机无
+  服务器 CUDA/Ray/FSDP 环境，未执行端到端训练。

@@ -10,7 +10,9 @@ class PixelIoUConfig:
     mask_threshold: float = 0.5
     prefer_raw_gt: bool = True
     invalid_iou: float = 0.0
-    segmentation_max_response_tokens: int = 32
+    # Historical CycleGRPO runs inherited the global 256-token rollout limit.
+    # Keep the dedicated localization cap aligned with that behavior by default.
+    segmentation_max_response_tokens: int = 256
     # ``text`` preserves the historical refusal proxy. ``pixel_empty`` uses
     # the decoded SAMTok union, matching offline GRES N_acc semantics.
     no_target_reward_mode: str = "text"
