@@ -1,0 +1,7 @@
+# trial_id	head_ssh	head_ip	worker_ssh	worker_ip	ray_port	dashboard_port	nccl_socket_ifname	experiment_env
+# Replace all hosts, IPs, ports, and the interface name before launch. The two
+# hosts in every row are exclusive to that row; the file must contain four rows.
+trial_01	root@h20-node-01	10.0.0.11	root@h20-node-02	10.0.0.12	6379	8265	ib0	projects/rl/experiments/multinode/trial_01.env
+trial_02	root@h20-node-03	10.0.0.13	root@h20-node-04	10.0.0.14	6379	8265	ib0	projects/rl/experiments/multinode/trial_02.env
+trial_03	root@h20-node-05	10.0.0.15	root@h20-node-06	10.0.0.16	6379	8265	ib0	projects/rl/experiments/multinode/trial_03.env
+trial_04	root@h20-node-07	10.0.0.17	root@h20-node-08	10.0.0.18	6379	8265	ib0	projects/rl/experiments/multinode/trial_04.env

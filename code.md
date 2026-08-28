@@ -66,7 +66,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
 | 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
-| GPU | 1 node x 8 GPU | Ray + FSDP + vLLM SPMD |
+| GPU | 默认 1 node x 8 GPU；显式多机为 2 nodes x 8 GPU | 单机仍由 Ray + FSDP + vLLM SPMD 运行；多机时每个 trial 固定 16 张 H20 |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
@@ -112,14 +112,26 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 离线评测入口执行 RefCOCO val。入口默认 `MAX_STEPS=156`，用于使 20k/40k/10k 三条流在同一轮内对齐；设置 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
 再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
-2.56；该入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
-Ray。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+2.56；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
+Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2`、`NUM_GPUS=8` 和由项目
+`$ENV_DIR/bin/ray` 创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前要求恰有两个
+存活节点和至少 16 张 GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
 符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。除本节记录的 70k 三流 batch/step
 对齐默认值外，它不修改论文算法；其他训练超参数和数据路径仍可由环境变量覆盖。
+
+四组 16-H20 训练使用 `tools/multinode/launch_four_trials.sh` 管理，而不是在八台机器上手工执行
+trainer。先复制 `tools/multinode/clusters.tsv.example`，每个非注释 TSV 行依次填写
+`trial_id`、`head_ssh`、`head_ip`、`worker_ssh`、`worker_ip`、`ray_port`、`dashboard_port`、
+`nccl_socket_ifname`、`experiment_env`；控制器要求恰好四行且八个 host 不重复。`INVENTORY=<清单>
+tools/multinode/launch_four_trials.sh launch` 先检查共享代码/数据/权重、每节点 8 GPU、项目环境
+Python/Ray/Torch/vLLM 版本、NCCL 网卡和启用时的 judge endpoint，再后台启动每组 head、worker 和仅在
+head 上运行的 trainer。`status` 查询 PID 和 Ray 节点/GPU 数，`stop` 只关闭清单中该组的 trainer 和
+Ray 节点；先运行 `launch --dry-run` 检查将执行的 SSH 命令。默认禁止节点上已有 Ray，确认节点只属于该
+trial 后才可显式设 `CLEAN_RAY=true`。
 
 入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用默认值 `156`；显式设置为空字符串时不会向 Hydra
 传入空位置参数并恢复完整 epoch，设置正整数时附加 `trainer.max_steps=<value>`。
@@ -239,7 +251,7 @@ parquet。
 
 ### 3.1 启动与配置合并
 
-1. `projects/rl/qwen3vl_4b_mt.sh` 或服务器入口 `qwen3vl_4b_refcoco10k_volcengine.sh` 调用 `python3 -m verl.trainer.main`；服务器入口会先清除不兼容的外部 `RAY_ADDRESS`。
+1. `projects/rl/qwen3vl_4b_mt.sh` 或服务器入口 `qwen3vl_4b_refcoco10k_volcengine.sh` 调用 `python3 -m verl.trainer.main`；默认单机入口会清除不兼容的外部 `RAY_ADDRESS`。只有 `MULTINODE_ENABLED=true` 时，入口才保留由项目环境启动、并已验证为两节点 16-GPU 的私有 Ray 地址。
 2. `verl/trainer/main.py::main` 按“dataclass 默认值 -> YAML -> CLI 覆盖”合并配置，并初始化 Ray。
 3. `Runner.run` 加载 tokenizer/processor，创建共享 GPU resource pool、`FSDPWorker`、batch reward manager 和 dataloader。若 Qwen3-VL checkpoint 的 processor 元数据不完整，`get_processor` 会在 `AutoProcessor` 返回 tokenizer/image processor 等非复合对象时，根据 `config.json` 的 `model_type=qwen3_vl` 显式回退到 `Qwen3VLProcessor`；其他模型仍保持原有的可选 processor 行为。
 4. `RayPPOTrainer.init_workers` 建立 actor、reference policy、可选 critic、vLLM rollout engine、FSDP/vLLM 权重同步器。
@@ -576,7 +588,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
-| `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 保活工具；默认按 `CUDA_VISIBLE_DEVICES` 为每张可见卡预留约 40000 MiB 显存，收到 SIGTERM/SIGINT 后释放 |
+| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 TSV，预检、启动、查询或停止每个 16-H20 trial |
+| `tools/multinode/clusters.tsv.example` | 四组两节点清单模板；填写 SSH/IP、Ray/dashboard 端口、NCCL 网卡和试验 env 文件 |
+| `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
@@ -626,7 +640,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎单节点 8 卡 OPSD 入口；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式两节点 16 卡的 OPSD 入口；多机模式只连接项目环境创建的 Ray cluster，并验证 `2 nodes / >=16 GPUs`；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计两节点 H20 试验模板；各自固定 run、数据、主 batch 128、response 256 与辅助任务开关，不在训练卡上部署 DLC judge |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -729,7 +744,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 12. **privileged distillation 第一版要求 `actor.ulysses_size=1`。** response 会裁到当前 micro-batch 的最大有效长度；完整词表 JSD 以 response-token chunk 加 checkpoint 计算，`distillation.token_chunk_size` 只在 CUDA 峰值显存与 softmax 重算时间间取舍。其他 sequence-parallel 配置会在启动时显式报错。
 13. **EMA checkpoint 位于 `actor/ema_teacher/`。** resume 优先恢复完整 teacher shard；旧 checkpoint 缺失 teacher 时从已恢复 actor 初始化，frozen reference policy 始终保持 cold-start anchor。`decay=1.0` 时这个 shard 是启动时的 SAMTok teacher；不能用旧 EMA 实验的 checkpoint 启动新的固定-teacher 消融。
 14. **teacher diagnosis 文件含特权信息。** `teacher_diagnoses.jsonl` 仅用于受控训练调试；公开日志、共享实验产物或发布 checkpoint 前应删除该文件，或关闭 `teacher_analysis`。
-15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；服务器入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地单节点 Ray。不要仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。入口固定使用短的真实本地 `/tmp/cgrpo-ray-<uid>` 目录，并在启动时检查临时盘利用率。
+15. **火山引擎注入的 Ray 集群与项目环境不兼容。** 当前平台集群使用 Python 3.12 / Ray 2.53，而项目 Conda 环境使用 Python 3.10 / Ray 2.56；默认单机入口必须清除继承的 `RAY_ADDRESS`，由当前解释器启动本地 Ray。两节点模式只能连接用同一 `$ENV_DIR/bin/ray` 创建的私有集群，八台训练节点的 Python/Ray/Torch/vLLM 版本必须一致，不能仅降级 Ray 而保留不同 Python 版本。Ray 的 `RAY_TMPDIR` 不能直接使用仓库长路径，否则 `session_*/sockets/plasma_store` 会超过 Linux `AF_UNIX` 的 107 字节限制；它也不能链接到使用率不低于 95% 的 workspace。多机控制器为每个节点使用独立短路径 `/dev/shm/cgrpo-<trial>-{h,w}`，入口仍检查临时盘利用率。
 16. **RefCOCO parquet 的图像路径必须与当前服务器一致。** `images` 保存的是绝对路径；跨服务器复制 parquet 后必须重新导出或修复该列。火山引擎入口在初始化 Ray/FSDP/vLLM 前逐条验证 `images`，避免模型全部加载后才由 DataLoader 抛出 `FileNotFoundError`。
 17. **Qwen3-VL checkpoint 必须使用复合 processor。** 自定义导出的 checkpoint 可能缺少让 `AutoProcessor` 识别 `Qwen3VLProcessor` 的元数据；loader 会根据 `config.json` 的 `model_type=qwen3_vl` 显式回退。若 `config.json` 也缺失或模型类型错误，必须先修正 checkpoint 元数据，不能用 tokenizer 或 image processor 代替，否则多模态 prompt 无法展开。
 18. **FSDP checkpoint 不是可直接评测的 HF 模型。** `actor/huggingface/` 仅保存 config/generation config/processor；必须使用与保存 world size 相同的 export-only FSDP worker 恢复 shard 后导出。不要把原 cold-start `MODEL_PATH` 当作训练后模型传给评测脚本。
@@ -744,6 +759,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
 28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL、caption safety 与 groundedness，防止 20k 主流混入任一辅助描述或分割监督。
 29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
+30. **四组两节点训练必须资源隔离。** `tools/multinode/launch_four_trials.sh` 要求 TSV 恰有四行且八个 SSH host 全部不同；每行单独启动一个 `2 x 8` 的 Ray 集群、Ray namespace、`/dev/shm` 临时目录、`RUN_ROOT`、PID/state 与日志。默认发现目标节点已有 Ray 进程即拒绝启动，只有显式 `CLEAN_RAY=true` 才会对清单中的节点执行 `ray stop --force`。64 张训练卡不得与 vLLM Llama judge 共置；启用 DLC-QA 的 env 必须把 judge 指向独立第 65 张 GPU 的 OpenAI 兼容 HTTP 服务。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填好 host/IP/NCCL 网卡后使用 `launch`，用 `status` 查询，用 `stop` 只停止清单中对应的 trainer 和 Ray 节点；`--dry-run` 仅打印 SSH 操作。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1538,3 +1554,38 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/opsd/config.py`、
   `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机无
   服务器 CUDA/Ray/FSDP 环境，未执行端到端训练。
+
+### 2026-08-28 - 增加四组两节点 16-H20 多机训练编排
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`；新增
+  `tools/multinode/launch_four_trials.sh`、`tools/multinode/clusters.tsv.example` 和
+  `projects/rl/experiments/multinode/trial_01.env` 至 `trial_04.env`。
+- 文档：更新第 2.2、3.1、5.1、5.3、6 节及本变更日志；模块清单已记录新增控制器、清单模板与 env
+  模板。
+- 行为：默认单机仍清除平台注入的 `RAY_ADDRESS`，并固定 `trainer.nnodes=1`。显式
+  `MULTINODE_ENABLED=true` 仅允许 `NNODES=2`、每节点 `NUM_GPUS=8`，保留由项目
+  `$ENV_DIR/bin/ray` 创建的私有地址，启动 trainer 前验证恰有两个存活节点和至少 16 张 GPU；启用
+  DLC-QA 时还验证外部 judge 的 `/models` HTTP endpoint。多机控制器读取四行 TSV，对每组独占的
+  head/worker 启动独立 Ray head/worker、namespace、短 `/dev/shm` 目录、训练 launcher、PID/state
+  和控制日志；默认拒绝已有 Ray，仅 `CLEAN_RAY=true` 允许清理清单中的目标节点。四个模板各自固定
+  20k 数据、batch 128、response 256 和 156 step，并显式列出可选 direct/DLC-QA 路径；judge 必须在
+  独立第 65 张 GPU 上运行，不能与 64 张训练卡共置。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `bash -n tools/multinode/launch_four_trials.sh`、`launch/status/stop --dry-run` 与
+  `git diff --check`。本机没有八台 H20、共享 `/volume`、Ray/vLLM 或 SSH 目标，未执行两节点
+  preflight、`MAX_STEPS=1` smoke test、16-world-size checkpoint 或四 trial 并发实机验证。
+
+### 2026-08-28 - 将 CUDA 保活改为按卡空闲监测
+
+- 代码：修改 `tools/cuda_keepalive.py`。
+- 文档：更新第 5.1 节工具说明及本变更日志；未新增、移动或删除模块。
+- 行为：工具不再启动即为全部可见卡分配显存。它每 15 秒通过 `nvidia-smi --query-gpu=index,memory.used`
+  检查整卡使用量，仅在使用量严格低于默认阈值 `1 MiB` 时，为该卡预留默认 `40000 MiB`；已有训练、vLLM
+  或其他 CUDA 进程占用的卡保持未分配，待其释放后才补位。已由本工具预留的卡保持占用直到收到
+  `SIGTERM`/`SIGINT`。工具要求使用数值形式且与 `nvidia-smi` 报告的物理卡一致的 `CUDA_VISIBLE_DEVICES`，例如
+  `0,1,2,3`，以将 nvidia-smi 的物理卡统计正确映射到 PyTorch device。首次检查只调用
+  `nvidia-smi`，不调用 `torch.cuda`；因此监测进程自身不会先创建 CUDA context 并将空卡误判为超过
+  1 MiB，只有确认该卡空闲后才初始化 PyTorch/CUDA 并预留显存。
+- 验证：执行 Python AST 语法解析、`python3 -B tools/cuda_keepalive.py --help`、
+  `bash -n tools/run_official_cyclegrpo_keepalive.sh` 与 `git diff --check`；本机没有 CUDA/nvidia-smi，
+  未执行真实显存监测或分配 smoke test。

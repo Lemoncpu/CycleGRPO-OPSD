@@ -11,6 +11,11 @@ TRAIN_DATA="${TRAIN_DATA:-${BASE_DIR}/refcoco-train2014-assets/refcoco_train_10k
 VAL_DATA="${VAL_DATA:-${TRAIN_DATA}}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
+MULTINODE_ENABLED="${MULTINODE_ENABLED:-false}"
+NNODES="${NNODES:-1}"
+RAY_CLUSTER_EXPECTED_NODES="${RAY_CLUSTER_EXPECTED_NODES:-${NNODES}}"
+RAY_CLUSTER_EXPECTED_GPUS="${RAY_CLUSTER_EXPECTED_GPUS:-$((NUM_GPUS * NNODES))}"
+RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS="${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS:-90}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-128}"
 ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-128}"
 CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
@@ -127,6 +132,41 @@ fi
 
 if [[ "${RESUME}" != "true" && "${RESUME}" != "false" ]]; then
     echo "RESUME must be true or false: ${RESUME}" >&2
+    exit 1
+fi
+
+if [[ "${MULTINODE_ENABLED}" != "true" && "${MULTINODE_ENABLED}" != "false" ]]; then
+    echo "MULTINODE_ENABLED must be true or false: ${MULTINODE_ENABLED}" >&2
+    exit 1
+fi
+
+if [[ ! "${NNODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NNODES must be a positive integer: ${NNODES}" >&2
+    exit 1
+fi
+
+if [[ ! "${RAY_CLUSTER_EXPECTED_NODES}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${RAY_CLUSTER_EXPECTED_GPUS}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Ray cluster expected nodes/GPUs and connect timeout must be positive integers." >&2
+    exit 1
+fi
+
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    if [[ "${NNODES}" != "2" || "${NUM_GPUS}" != "8" ]]; then
+        echo "MULTINODE_ENABLED=true currently requires NNODES=2 and NUM_GPUS=8 (16 H20 GPUs per trial)." >&2
+        exit 1
+    fi
+    if [[ -z "${RAY_ADDRESS:-}" ]]; then
+        echo "MULTINODE_ENABLED=true requires RAY_ADDRESS for a Ray cluster started with this project environment." >&2
+        exit 1
+    fi
+    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "2" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "16" ]]; then
+        echo "MULTINODE_ENABLED=true requires a two-node Ray cluster with at least 16 GPUs." >&2
+        exit 1
+    fi
+elif [[ "${NNODES}" != "1" ]]; then
+    echo "NNODES must remain 1 unless MULTINODE_ENABLED=true." >&2
     exit 1
 fi
 
@@ -433,6 +473,11 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "Python executable not found: ${PYTHON_BIN}" >&2
     exit 1
 fi
+RAY_BIN="${RAY_BIN:-${ENV_DIR}/bin/ray}"
+if [[ "${MULTINODE_ENABLED}" == "true" && ! -x "${RAY_BIN}" ]]; then
+    echo "Ray executable not found for multi-node mode: ${RAY_BIN}" >&2
+    exit 1
+fi
 
 required_paths=(
     "${TRAIN_DATA}"
@@ -531,10 +576,17 @@ echo "CycleGRPO training output: ${RUN_LOG}"
 exec >>"${RUN_LOG}" 2>&1
 
 INHERITED_RAY_ADDRESS="${RAY_ADDRESS:-}"
-# Volcengine injects a Python 3.12 / Ray 2.53 cluster address. This job uses the
-# repository Python 3.10 environment, so let ray.init() create a matching local cluster.
-unset RAY_ADDRESS
-unset RAY_NAMESPACE
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    # The orchestration tool starts this cluster with ENV_DIR's Ray. Preserve its
+    # address so verl.trainer.main attaches instead of creating a local cluster.
+    export RAY_ADDRESS
+    export RAY_NAMESPACE="${RAY_NAMESPACE:-cyclegrpo-${RUN_NAME}}"
+else
+    # Volcengine injects a Python 3.12 / Ray 2.53 cluster address. This job uses
+    # the repository Python 3.10 environment, so create a matching local cluster.
+    unset RAY_ADDRESS
+    unset RAY_NAMESPACE
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PYTHONUNBUFFERED=1
@@ -588,9 +640,62 @@ echo "Checkpoint retention limit: ${SAVE_LIMIT}"
 echo "Trainer loggers: ${TRAINER_LOGGERS}"
 echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
 echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
-echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
+echo "Multi-node Ray mode: ${MULTINODE_ENABLED} (nnodes=${NNODES})"
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    echo "Ray address: ${RAY_ADDRESS}; expected nodes/GPUs: ${RAY_CLUSTER_EXPECTED_NODES}/${RAY_CLUSTER_EXPECTED_GPUS}"
+else
+    echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
+fi
 "${PYTHON_BIN}" --version
 "${PYTHON_BIN}" -c 'import ray, torch, vllm; print(f"Ray: {ray.__version__}"); print(f"PyTorch: {torch.__version__}"); print(f"vLLM: {vllm.__version__}"); print(f"CUDA devices: {torch.cuda.device_count()}")'
+
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    "${PYTHON_BIN}" - "${RAY_ADDRESS}" "${RAY_CLUSTER_EXPECTED_NODES}" "${RAY_CLUSTER_EXPECTED_GPUS}" "${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS}" <<'PY'
+import sys
+import time
+
+import ray
+
+address, expected_nodes, expected_gpus, timeout = sys.argv[1:]
+expected_nodes = int(expected_nodes)
+expected_gpus = float(expected_gpus)
+deadline = time.monotonic() + int(timeout)
+last_state = "not connected"
+
+while time.monotonic() < deadline:
+    try:
+        ray.init(address=address, ignore_reinit_error=True, logging_level="ERROR")
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
+        last_state = f"alive_nodes={len(alive_nodes)}, gpus={gpu_count:g}"
+        if len(alive_nodes) == expected_nodes and gpu_count >= expected_gpus:
+            print(f"Verified multi-node Ray cluster: {last_state}")
+            ray.shutdown()
+            break
+        ray.shutdown()
+    except Exception as exc:
+        last_state = f"{type(exc).__name__}: {exc}"
+    time.sleep(2)
+else:
+    raise RuntimeError(
+        f"Ray cluster {address} did not reach {expected_nodes} alive nodes and "
+        f"{expected_gpus:g} GPUs within {timeout}s; last state: {last_state}"
+    )
+PY
+fi
+
+if [[ "${MULTINODE_ENABLED}" == "true" && "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "curl is required to verify CAPTION_QA_JUDGE_BASE_URL in multi-node mode." >&2
+        exit 1
+    fi
+    JUDGE_MODELS_URL="${CAPTION_QA_JUDGE_BASE_URL%/}/models"
+    if ! curl --fail --silent --show-error --max-time 15 "${JUDGE_MODELS_URL}" >/dev/null; then
+        echo "DLC-QA judge health check failed: ${JUDGE_MODELS_URL}" >&2
+        exit 1
+    fi
+    echo "DLC-QA judge health check passed: ${JUDGE_MODELS_URL}"
+fi
 
 # Generic trainer validation does not run the RefCOCO mask/cIoU path. Evaluate
 # the checkpoints saved below with the offline RefCOCO evaluator instead.
@@ -686,7 +791,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     trainer.experiment_name="${RUN_NAME}" \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
     "${TRAINER_MAX_STEPS_ARG[@]+"${TRAINER_MAX_STEPS_ARG[@]}"}" \
-    trainer.nnodes=1 \
+    trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${NUM_GPUS}" \
     trainer.val_freq=-1 \
     trainer.val_before_train=false \
