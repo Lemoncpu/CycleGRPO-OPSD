@@ -145,7 +145,9 @@ trial 后才可显式设 `CLEAN_RAY=true`。
 processor；因此必须先执行 `export` action，并以与 shard 文件名相同的 `NUM_GPUS=N` 拓扑只加载 actor model shard 并导出
 标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite`、`gres` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
-及 `train2014`，输出 cIoU/mIoU；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 接收其
+及 `train2014`，输出 cIoU/mIoU；生成默认最多 256 个新 token，可通过
+`REFCOCO_MAX_NEW_TOKENS` 覆盖（例如设为 `128` 可复现旧评测上限）；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 与 GRES/gRefCOCO
+也默认生成最多 256 个新 token，分别可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 和 `GRES_MAX_NEW_TOKENS` 覆盖。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
 目录计算 mask GIoU。当前服务器的默认 GroundingSuite 根目录是
 `/volume/ybo/xyc/third_party/GroundingSuite`，其评测 JSONL 为
@@ -715,10 +717,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 目录 | 文件职责 |
 |---|---|
-| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
+| `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；分割生成默认最多 256 个新 token（可通过 `GRES_MAX_NEW_TOKENS` 覆盖）；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS |
 | `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；逐样本 JSON 保存 group 数和协议，协议不匹配时会重新生成 |
-| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成上限为 128，默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
+| `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成默认上限为 256（可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 覆盖），默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
 | `dlc_bench/` | 多后端 caption inference、裁剪/区域输入、judge server、GPT-with-image/Llama-without-image 评测和绘图；Qwen3-VL 推理使用训练同构的正向 caption prompt、192-token 上限和 caption-only special-token logits blocker，另写 `.stats.json` 记录 leak rate |
@@ -1589,3 +1591,30 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 验证：执行 Python AST 语法解析、`python3 -B tools/cuda_keepalive.py --help`、
   `bash -n tools/run_official_cyclegrpo_keepalive.sh` 与 `git diff --check`；本机没有 CUDA/nvidia-smi，
   未执行真实显存监测或分配 smoke test。
+
+### 2026-08-30 - 将 RefCOCO 评测响应上限对齐至 256
+
+- 代码：修改 `evaluation/refcoco/qwen3vl_refcoco_eval.py`、
+  `evaluation/refcoco/run_refcoco_multigpu.sh` 和 `projects/eval/qwen3vl_4b_volcengine.sh`；未新增、
+  移动或删除模块。
+- 文档：更新第 2.2、5.6 节及本变更日志。
+- 行为：RefCOCO 推理从原先硬编码的 `max_new_tokens=128` 改为默认 `256`，并通过
+  `REFCOCO_MAX_NEW_TOKENS`/`MAX_NEW_TOKENS` 逐层传递到多 GPU worker；评测默认与当前训练的
+  response 256 上限一致，显式设为 128 仍可进行旧上限对照。输出协议、mask 解码、指标计算和其他
+  benchmark 不变。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/refcoco/qwen3vl_refcoco_eval.py`、
+  `bash -n evaluation/refcoco/run_refcoco_multigpu.sh`、`bash -n projects/eval/qwen3vl_4b_volcengine.sh`
+  和 `git diff --check`；本机无 CUDA/模型数据，未执行服务器端到端评测。
+
+### 2026-08-30 - 将 GroundingSuite 与 GRES 分割评测响应上限对齐至 256
+
+- 代码：修改 `evaluation/groundingsuite/qwen3vl_groundingsuite_infer.py`、
+  `evaluation/groundingsuite/run_groundingsuite_multigpu.sh`、`evaluation/gres/qwen3vl_gres_eval.py`、
+  `evaluation/gres/run_gres_multigpu.sh` 和 `projects/eval/qwen3vl_4b_volcengine.sh`；未新增、移动或删除模块。
+- 文档：更新第 2.2、5.6 节及本变更日志。
+- 行为：GroundingSuite 和 GRES/gRefCOCO 的分割生成从硬编码 `128` 改为默认 `256`，并分别通过
+  `GROUNDINGSUITE_MAX_NEW_TOKENS`、`GRES_MAX_NEW_TOKENS` 及对应 wrapper 参数透传；统一评测入口的
+  RefCOCO、GroundingSuite、GRES 三类 mask 评测现在与训练期 localization 的 256 上限一致。DLC caption
+  的 192-token 协议及 mask 解码、指标计算保持不变。
+- 验证：执行受影响 Python 文件 compile、`bash -n` 检查两个多 GPU wrapper 和统一评测入口，以及
+  `git diff --check`；本机无 CUDA/模型数据，未执行服务器端到端评测。

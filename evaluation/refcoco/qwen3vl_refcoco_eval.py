@@ -46,6 +46,12 @@ def parse_args():
     parser.add_argument("--gpu_id", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--mask_protocol", choices=MASK_PROTOCOLS, default="legacy_union")
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=256,
+        help="Maximum generated RefCOCO response tokens (default: 256).",
+    )
     parser.add_argument("--metric_only", action="store_true")
     return parser.parse_args()
 
@@ -163,6 +169,8 @@ def main():
         raise ValueError("task_id must be in [0, num_tasks).")
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+    if args.max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive.")
 
     gpu_id = args.task_id if args.gpu_id < 0 else args.gpu_id
     torch.cuda.set_device(gpu_id)
@@ -222,7 +230,7 @@ def main():
         with torch.no_grad():
             generation_kwargs = dict(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=args.max_new_tokens,
                 do_sample=False,
             )
             if eos_token_id is not None:

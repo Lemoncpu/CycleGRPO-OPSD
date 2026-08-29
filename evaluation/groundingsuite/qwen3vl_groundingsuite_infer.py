@@ -88,7 +88,11 @@ def parse_args():
                         help='Disable the automatic merge-to-JSONL step.')
     parser.add_argument('--mask_protocol', choices=MASK_PROTOCOLS, default='legacy_union',
                         help='SAMTok decoding protocol. legacy_union matches historical SAMTok results.')
+    parser.add_argument('--max_new_tokens', type=int, default=256,
+                        help='Maximum generated segmentation response tokens (default: 256).')
     args = parser.parse_args()
+    if args.max_new_tokens <= 0:
+        parser.error('--max_new_tokens must be positive.')
     return args
 
 def resolve_image_path(image_file, data_root, coco_root=None):
@@ -393,7 +397,7 @@ def main():
         # Inference: Generation of the output
         generation_kwargs = dict(
             **inputs, 
-            max_new_tokens=128,
+            max_new_tokens=args.max_new_tokens,
             do_sample=False,  # 关闭采样，使用贪婪解码
             top_p=1.0,  # 配合do_sample=False使用
         )

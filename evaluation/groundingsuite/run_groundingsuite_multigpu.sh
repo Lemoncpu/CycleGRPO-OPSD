@@ -19,6 +19,7 @@ DATA_ROOT=${DATA_ROOT:-$(dirname "$DATASET")}
 COCO_ROOT=${COCO_ROOT:-}
 PYTHON_BIN=${PYTHON_BIN:-python}
 MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 COCO_ARGS=()
 if [[ -n "$COCO_ROOT" ]]; then
     COCO_ARGS=(--coco_root "$COCO_ROOT")
@@ -48,6 +49,7 @@ for ((t=0; t<NUM_GPUS; t++)); do
         --save_dir "$SAVE_DIR" \
         --task_id "$t" --num_tasks "$NUM_GPUS" --gpu_id 0 \
         --mask_protocol "$MASK_PROTOCOL" \
+        --max_new_tokens "$MAX_NEW_TOKENS" \
         > "logs/groundingsuite_shard${t}.log" 2>&1 &
     pids+=($!)
     echo "  shard $t -> GPU $t (pid ${pids[-1]}, log logs/groundingsuite_shard${t}.log)"
