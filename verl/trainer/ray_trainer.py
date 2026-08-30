@@ -938,8 +938,12 @@ class RayPPOTrainer:
         if rollout_overrides:
             gen_batch.meta_info.update(rollout_overrides)
         
+        gen_batch, gen_pad_size = pad_dataproto_to_divisor(
+            gen_batch, self.actor_rollout_ref_wg.world_size
+        )
         # gen_batch_output = self.actor_rollout_ref_wg.generate_sequences_with_ref(gen_batch)
         gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+        gen_batch_output = unpad_dataproto(gen_batch_output, gen_pad_size * self.config.worker.rollout.n)
         # gen_batch_output.batch.keys(): ['prompts', 'responses', 'input_ids', 'attention_mask', 'response_mask', 'position_ids']
         # gen_batch_output.non_tensor_batch.keys(): ['multi_modal_data', 'mask_token_accuracy', 'format_correct']
 

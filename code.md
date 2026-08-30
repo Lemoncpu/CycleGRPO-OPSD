@@ -392,7 +392,10 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 empty/non-repeat reward 单独进行 GRPO advantage、log-prob 和可选 reference-KL 计算，再在同一个 optimizer
 step 与 cycle segmentation 独立累积。两类 segmentation response 可具有不同 padding 宽度，因此不拼接；
 `localization_loss_weight` 按两个 rollout batch 的样本数分配，保持它们合计仍为原配置的 segmentation
-权重，而非将 5% no-target batch 意外提升为并列 0.5 loss。
+权重，而非将 5% no-target batch 意外提升为并列 0.5 loss。由于 20k 数据中的 1,000 条 no-target
+按主 batch 随机抽样后每 step 通常只有约 6 条，不能直接均分到 8 个 rollout rank；通用 segmentation
+rollout dispatcher 会临时补齐 parent prompt 到 world-size 的整倍数，再在生成后删除补齐 response，
+不会把重复样本计入 reward、优势或 loss 权重。
 
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
@@ -1894,3 +1897,14 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   70k 任务保持单节点 7 卡训练并在 GPU 7 启动 Llama，因此每个任务物理最多使用 8 张卡。
 - 验证：执行四个 env 与 controller 的 `bash -n`、混合清单 `launch --dry-run`、确认 4 个 Ray 检查和仅 1 个
   judge 启动命令，并通过 `git diff --check`；未连接真实 Ray/H20 集群。
+
+### 2026-08-31 - 修复小批量 pixel-empty segmentation 的多卡 dispatch
+
+- 代码：修改 `verl/trainer/ray_trainer.py`；未新增、移动或删除模块。
+- 行为：`_make_seg_batch_data_for_caption` 在 rollout dispatch 前将 parent prompt 临时补齐到
+  `world_size` 的整倍数，并在生成后移除对应的 `n` 条合成 response。主 20k 的 5% no-target 子批次
+  即使只有 1--7 条也不会再触发 `DataProto.chunk` 的 equal-chunk assertion；补齐样本不进入后续 reward、
+  advantage、指标或 loss 权重。
+- 文档：更新第 3.4 节，说明总数据量与每 step 子批量的区别及 padding 生命周期。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 和
+  `git diff --check`；未执行 GPU/Ray rollout smoke test。
