@@ -131,8 +131,9 @@ Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2` �
 trainer。平台负责创建 Ray head/worker 和节点间通信；先复制 `tools/multinode/clusters.tsv.example`，每个
 非注释 TSV 行依次填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`，不再填写 SSH 主机
 或 NCCL 网卡。控制器要求恰好四行且 Ray 地址不重复；`INVENTORY=<清单>
-tools/multinode/launch_four_trials.sh launch` 只验证每个地址有两个存活节点和 16 张 GPU，然后在提交机后台
-启动 trainer。当前纯自监督 trial 将 GPU 0--7 全部交给 Ray，不启动 Llama；已跑过的历史 batch/response 对照
+tools/multinode/launch_four_trials.sh launch` 会在可配置的就绪超时内验证每个地址有两个存活节点和 16 张 GPU，然后在提交机后台
+启动 trainer。控制器以 `set -a` source env，确保每个 trial 的数据、运行名和全部实验开关都传给 `nohup` 的
+训练子进程；PID 文件记录实际 training launcher，`stop` 可可靠发送 SIGTERM。当前纯自监督 trial 将 GPU 0--7 全部交给 Ray，不启动 Llama；已跑过的历史 batch/response 对照
 不影响当前配置；当前四个 trial
 当前四组纯 20k 自监督 prompt/decode 消融统一为 `128/156/256`，依次为：
 `official_source_aware+first_mask`、`refcoco+first_mask`、
@@ -599,7 +600,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
-| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 Ray 地址/namespace/试验 env，预检 16-GPU 集群并启动、查询或停止本地 trainer，不创建 SSH head/worker |
+| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 Ray 地址/namespace/试验 env，在就绪超时内预检 16-GPU 集群，以导出 env 启动并记录实际 trainer launcher PID，支持查询/停止本地 trainer，不创建 SSH head/worker |
 | `tools/multinode/clusters.tsv.example` | 四组两节点 Ray 清单模板；填写平台 Ray 地址、namespace 和试验 env 文件 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
@@ -769,7 +770,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
 28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL 与 caption safety，防止 20k 主流混入任一辅助描述或分割监督。
 29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
-30. **四组两节点训练必须资源隔离。** 平台需预先创建四个独立的两节点 Ray 集群，每个提供 16 张 GPU；`tools/multinode/launch_four_trials.sh` 的 TSV 恰有四行且只填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`。当前纯自监督 env 设置 `NUM_GPUS=8`，每个节点 GPU 0--7 全部训练，单 trial 为 `2 x 8=16` 张卡，四组共 64 张训练卡且不启动 judge。控制器不执行 SSH、`ray start` 或 `ray stop`，也不设置 `NCCL_SOCKET_IFNAME`；它仅通过 Ray API 验证集群、在提交机启动 trainer，并由 `status`/`stop` 管理本地 trainer PID。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填入平台提供的四个 Ray 地址和 namespace 后使用 `launch`；`--dry-run` 只打印 Ray 检查和训练命令。
+30. **四组两节点训练必须资源隔离。** 平台需预先创建四个独立的两节点 Ray 集群，每个提供 16 张 GPU；`tools/multinode/launch_four_trials.sh` 的 TSV 恰有四行且只填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`。当前纯自监督 env 设置 `NUM_GPUS=8`，每个节点 GPU 0--7 全部训练，单 trial 为 `2 x 8=16` 张卡，四组共 64 张训练卡且不启动 judge。控制器不执行 SSH、`ray start` 或 `ray stop`，也不设置 `NCCL_SOCKET_IFNAME`；它在 `RAY_READY_TIMEOUT_SECONDS` 内通过 Ray API 验证集群、以 `set -a` 导出每个 env 文件中的变量后启动 trainer，并由记录实际 launcher PID 的 `status`/`stop` 管理本地进程。`RAY_NAMESPACE` 会传给 `ray.init`，隔离每个 cluster 上的 driver/actor 命名空间。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填入平台提供的四个 Ray 地址和 namespace 后使用 `launch`；`--dry-run` 只打印 Ray 检查和训练命令。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1748,3 +1749,16 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/refcoco/qwen3vl_refcoco_eval.py`、
   `bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 和 `git diff --check`；服务器端已完成 8 卡
   batch 4 left-padding RefCOCO 全量评测，得到 `cIoU=79.1668`、`mIoU=78.8606`。
+
+### 2026-08-30 - 修正四组多机控制器的环境、namespace 与 PID 传递
+
+- 代码：修改 `tools/multinode/launch_four_trials.sh` 与 `verl/trainer/main.py`；未新增、移动或删除模块。
+- 文档：更新第 2.2、5.1、6 节及本变更日志；模块清单无变化。
+- 行为：控制器以 `set -a` source trial env，使 `RUN_NAME`、`TRAIN_DATA`、prompt/decode 配置和所有训练
+  参数都导出到 `nohup` 训练子进程；此前未导出的 shell 变量可能使子进程回退到 launcher 默认值。后台启动
+  现在直接记录 `nohup bash`（最终 `exec` 到 trainer）的 PID，`stop` 的 SIGTERM 能作用于实际训练链路。
+  Ray 预检改为在 `RAY_READY_TIMEOUT_SECONDS`（默认 120 秒）内轮询两节点/16-GPU 就绪状态。`main.py` 的
+  `ray.init` 读取 `RAY_NAMESPACE`，使 TSV 中每个 trial 的 namespace 真正作用于 Ray driver 与其 actor。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/main.py`、
+  `bash -n tools/multinode/launch_four_trials.sh`、四个 env 的 `bash -n`、`launch/status/stop --dry-run`
+  及 `git diff --check`；本机未连接真实两节点 Ray 集群，尚未执行 16-GPU smoke training。

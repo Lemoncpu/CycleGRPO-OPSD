@@ -89,18 +89,35 @@ verify_ray_cluster() {
         return 0
     fi
     [[ -x "${python_bin}" ]] || fail "Python executable not found: ${python_bin}"
-    "${python_bin}" - "${ray_address}" "${expected_gpus}" <<'PY'
+    "${python_bin}" - "${ray_address}" "${expected_gpus}" "${RAY_READY_TIMEOUT_SECONDS}" <<'PY'
 import sys
+import time
+
 import ray
 
-address, expected_gpus = sys.argv[1], float(sys.argv[2])
-ray.init(address=address, logging_level="ERROR")
-alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
-gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
-print(f"ray_address={address} alive_nodes={len(alive_nodes)} gpus={gpu_count:g}")
-ray.shutdown()
-if len(alive_nodes) != 2 or gpu_count < expected_gpus:
-    raise SystemExit(1)
+address, expected_gpus, timeout_seconds = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+deadline = time.monotonic() + timeout_seconds
+last_state = "not connected"
+
+while time.monotonic() < deadline:
+    try:
+        ray.init(address=address, logging_level="ERROR")
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
+        last_state = f"alive_nodes={len(alive_nodes)} gpus={gpu_count:g}"
+        if len(alive_nodes) == 2 and gpu_count >= expected_gpus:
+            print(f"ray_address={address} {last_state}")
+            ray.shutdown()
+            break
+        ray.shutdown()
+    except Exception as exc:
+        last_state = f"{type(exc).__name__}: {exc}"
+    time.sleep(2)
+else:
+    raise SystemExit(
+        f"Ray cluster {address} did not reach 2 nodes / {expected_gpus:g} GPUs "
+        f"within {timeout_seconds}s; last state: {last_state}"
+    )
 PY
 }
 
@@ -109,14 +126,30 @@ launch_training() {
     local log_dir="${run_root}/multinode"
     local pid_file="${log_dir}/trainer_launcher.pid"
     local log_file="${log_dir}/trainer_launcher.log"
-    local remote_command
-    printf -v remote_command 'source %q && export RAY_ADDRESS=%q RAY_NAMESPACE=%q MULTINODE_ENABLED=true NNODES=2 NUM_GPUS=8 RAY_CLUSTER_EXPECTED_NODES=2 RAY_CLUSTER_EXPECTED_GPUS=16 && nohup bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh" > %q 2>&1 < /dev/null & echo $! > %q' \
-        "${env_file}" "${ray_address}" "${ray_namespace}" "${log_file}" "${pid_file}"
     if [[ "${DRY_RUN}" == "true" ]]; then
-        printf '%s\n' "${remote_command}"
+        printf 'set -a; source %q; set +a\n' "${env_file}"
+        printf 'export RAY_ADDRESS=%q RAY_NAMESPACE=%q MULTINODE_ENABLED=true NNODES=2 NUM_GPUS=8 RAY_CLUSTER_EXPECTED_NODES=2 RAY_CLUSTER_EXPECTED_GPUS=16\n' \
+            "${ray_address}" "${ray_namespace}"
+        printf 'nohup bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh" > %q 2>&1 < /dev/null &\n' "${log_file}"
+        printf 'echo $! > %q\n' "${pid_file}"
     else
         mkdir -p "${log_dir}"
-        bash -lc "${remote_command}"
+        (
+            # shellcheck disable=SC1090
+            set -a
+            source "${env_file}"
+            set +a
+            export RAY_ADDRESS="${ray_address}"
+            export RAY_NAMESPACE="${ray_namespace}"
+            export MULTINODE_ENABLED=true
+            export NNODES=2
+            export NUM_GPUS=8
+            export RAY_CLUSTER_EXPECTED_NODES=2
+            export RAY_CLUSTER_EXPECTED_GPUS=16
+            nohup bash "${REPO_DIR}/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh" \
+                > "${log_file}" 2>&1 < /dev/null &
+            printf '%s\n' "$!" > "${pid_file}"
+        )
         echo "Started ${trial_id}; pid=$(cat "${pid_file}"); log=${log_file}"
     fi
 }
