@@ -380,7 +380,7 @@ MODEL_PATH="$MODEL_PATH" RUN_NAME="$RUN_NAME" RUN_ROOT="$RUN_ROOT" \
 TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$TRAIN_DATA" \
 TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
 OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
-GROUNDEDNESS_ENABLED=false TRAINER_LOGGERS='["file"]' \
+TRAINER_LOGGERS='["file"]' \
 bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
 ```
 
@@ -467,7 +467,7 @@ MODEL_PATH="$MODEL_PATH" RUN_NAME="$RUN_NAME" RUN_ROOT="$RUN_ROOT" \
 TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$TRAIN_DATA" \
 TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
 OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
-GROUNDEDNESS_ENABLED=false TRAINER_LOGGERS='["file"]' \
+TRAINER_LOGGERS='["file"]' \
 DIRECT_GROUNDING_ENABLED=true \
 DIRECT_TRAIN_DATA="$REF_DIRECT_PA" \
 DIRECT_NO_TARGET_TRAIN_DATA="$GREF_NO_TARGET_PA" \
@@ -510,7 +510,7 @@ global-step state.
 DLC-QA is a third independent training stream. Its 10k Parquet is used only to
 form caption prompts, and every row must expose a `dam_source_id` with a
 matching accepted entry in the QA JSONL. The reward is only the Llama judge's
-mean QA score: it has no cycle IoU, mask format, caption-safety, groundedness,
+mean QA score: it has no cycle IoU, mask format, or caption-safety,
 teacher regenerate, or JSD term. `CAPTION_QA_LOSS_WEIGHT` controls the actual
 actor-gradient contribution after GRPO normalization.
 

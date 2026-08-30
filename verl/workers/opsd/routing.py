@@ -301,21 +301,6 @@ def build_privileged_context(
 def format_privileged_prompt(context: dict[str, object], *, mode: str) -> str:
     caption = context.get("student_caption", "")
     base = "You are improving an object caption with privileged visual evidence.\n"
-    if mode == "groundedness":
-        return base + (
-            "Image 1 is the full scene. Image 2 isolates the intended object.\n"
-            f"Student caption: {caption}\n"
-            "Extract at most 8 literal substrings from the student caption that make visual claims. "
-            "For each claim, classify it as supported, contradicted, unsupported, or uncertain. "
-            "Use supported only when Image 2 or directly visible scene evidence proves it. "
-            "Use unsupported when the caption adds an unverified detail. Use uncertain for ambiguity. "
-            "A relation such as right, behind, background, or nearby is supported only when both the "
-            "target and a named reference are visibly verifiable. Do not require background details.\n"
-            "Output only JSON: {\"claims\":[{\"text\":\"literal caption substring\",\"type\":"
-            "appearance|part|count|relation|context|other\",\"verdict\":"
-            "supported|contradicted|unsupported|uncertain\"}],\"overall\":"
-            "supported|partially_supported|unsupported\"}."
-        )
     base += (
         "Image 1 is the full scene. Image 2 isolates the intended object. "
         "Image 3 isolates the object or area recovered from the student caption.\n"

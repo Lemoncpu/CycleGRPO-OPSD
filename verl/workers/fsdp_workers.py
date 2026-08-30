@@ -830,7 +830,7 @@ class FSDPWorker(Worker):
 
     def _caption_generation_blocked_token_ids(self, task: Optional[str]) -> list[int]:
         """Return caption-only forbidden ids without changing localization sampling."""
-        if task not in {"caption", "opsd_regenerate", "opsd_groundedness", "opsd_teacher_analysis"}:
+        if task not in {"caption", "opsd_regenerate", "opsd_teacher_analysis"}:
             return []
         if not self.config.opsd.caption_safety.block_special_token_vocab:
             return []
@@ -1673,6 +1673,7 @@ class FSDPWorker(Worker):
                 codebook_depth=self.config.reward.codebook_depth,
                 threshold=pixel_config.mask_threshold,
                 decode_batch_size=pixel_config.decode_batch_size,
+                decode_mode=pixel_config.mask_decode_mode,
             )
             target_mask = decoded[0]
             if raw_gt_masks is not None and raw_gt_masks[first] is not None and pixel_config.prefer_raw_gt:
@@ -1788,6 +1789,7 @@ class FSDPWorker(Worker):
                 codebook_depth=self.config.reward.codebook_depth,
                 threshold=pixel_config.mask_threshold,
                 decode_batch_size=pixel_config.decode_batch_size,
+                decode_mode=pixel_config.mask_decode_mode,
             )
             for data_index, prediction in zip(indices, decoded):
                 rewards[data_index] = pixel_empty_reward(prediction)
@@ -2173,11 +2175,7 @@ class FSDPWorker(Worker):
                 entropy_weight_beta=config.entropy_weight_beta,
                 token_chunk_size=config.token_chunk_size,
                 blocked_token_ids=blocked_token_ids,
-                extra_token_weight=(
-                    micro_batch.batch["groundedness_token_weight"][:, :response_length]
-                    if "groundedness_token_weight" in micro_batch.batch
-                    else None
-                ),
+                extra_token_weight=None,
             )
             scaled_loss = (
                 loss_numerator

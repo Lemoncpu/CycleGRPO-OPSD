@@ -34,6 +34,9 @@ from . import torch_functional as VF
 
 
 NO_THINK_PREFIX = "<think>\n\n</think>\n\n"
+MASK_TOKEN_PATTERN = re.compile(
+    r"<\|mt_start\|><\|mt_\d{4}\|><\|mt_\d{4}\|><\|mt_end\|>"
+)
 
 
 def add_no_think_prefix(prompt: str, enabled: bool) -> str:
@@ -333,6 +336,7 @@ class RLHFDataset(Dataset):
         filter_overlong_prompts_workers: int = 16,
         region_format: str = "mask_token",  # "mask_token" or "bbox"
         enable_no_think_prefix: bool = False,
+        cycle_prompt_mode: str = "current",
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -350,6 +354,11 @@ class RLHFDataset(Dataset):
         self.max_pixels = max_pixels
         self.region_format = region_format
         self.enable_no_think_prefix = enable_no_think_prefix
+        if cycle_prompt_mode not in {"current", "official_source_aware"}:
+            raise ValueError(
+                "cycle_prompt_mode must be 'current' or 'official_source_aware'."
+            )
+        self.cycle_prompt_mode = cycle_prompt_mode
 
         # 支持多路径加载
         datasets_list = []
@@ -417,6 +426,8 @@ class RLHFDataset(Dataset):
         is_video_sample = self.video_key in example
         media_token = "<video>" if is_video_sample else "<image>"
         prompt_variant = example.get("localization_prompt_variant", "legacy")
+        if self.cycle_prompt_mode == "official_source_aware" and not is_video_sample:
+            prompt_variant = "legacy"
         # 视频样本使用时间戳定位模板；图像样本沿用 bbox/mask 模板
         if is_video_sample:
             PROMPT_TEMPLATE = """{media_token}\nBased on the description below, locate the timestamp interval in the video where the event occurs:
@@ -674,8 +685,43 @@ class RLHFDataset(Dataset):
             "prompt_text": prompt_text,
         }
 
+    def _build_source_aware_caption_prompt(self, example: dict[str, Any], prompt: str) -> str:
+        if self.cycle_prompt_mode != "official_source_aware":
+            return prompt
+        source_family = {
+            "refcoco_cycle": "refcoco",
+            "denseworld_single": "refcoco",
+            "grefcoco_cycle": "grefcoco",
+            "denseworld_multiple": "grefcoco",
+            "paco_part_cycle": "paco",
+            "cocostuff_cycle": "stuff",
+        }.get(str(example.get("source") or ""))
+        if source_family is None:
+            return prompt
+
+        answer = str(example.get(self.seg_answer_key) or "")
+        mask_tokens = MASK_TOKEN_PATTERN.findall(answer)
+        if not mask_tokens:
+            mask_tokens = MASK_TOKEN_PATTERN.findall(prompt)
+        if not mask_tokens:
+            return prompt
+
+        token_text = ", ".join(mask_tokens)
+        if source_family == "grefcoco":
+            return (
+                "<image>\nCould you please give me a detailed description of the "
+                f"following regions? {token_text}. Please respond with interleaved "
+                "segmentation masks for the corresponding parts of the answer."
+            )
+        if source_family == "paco":
+            return f"<image>\nProvide a detailed description of the visible parts of this region {token_text}."
+        if source_family == "stuff":
+            return f"<image>\nProvide a detailed description of this semantic region {token_text}."
+        return f"<image>\nProvide a detailed description of this region {token_text}."
+
     def _build_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         cap_prompt_str: str = example.get(self.cap_prompt_key) or ""
+        cap_prompt_str = self._build_source_aware_caption_prompt(example, cap_prompt_str)
         seg_prompt_str: str = example.get(self.seg_prompt_key) or ""
         if self.format_prompt:
             format_prompt = Template(self.format_prompt.strip())

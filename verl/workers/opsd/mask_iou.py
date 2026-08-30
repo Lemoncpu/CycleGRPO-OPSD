@@ -143,15 +143,18 @@ def decode_mask_tokens(
     codebook_depth: int = 2,
     threshold: float = 0.5,
     decode_batch_size: int = 32,
+    decode_mode: str = "union",
 ) -> tuple[list[Optional[torch.Tensor]], tuple[int, int]]:
-    """Decode every legal group in each response and return their pixel union.
+    """Decode legal groups and return either the first mask or their pixel union.
 
     The VQ-SAM2 image embedding is shared across all groups for one image.  This
-    preserves CycleGRPO's original multi-group semantics while replacing its
-    token-domain grading with online pixel IoU.
+    preserves CycleGRPO's original multi-group semantics in ``union`` mode while
+    ``first_mask`` restores the historical single-group training decoder.
     """
     if decode_batch_size <= 0:
         raise ValueError("decode_batch_size must be positive.")
+    if decode_mode not in {"union", "first_mask"}:
+        raise ValueError("decode_mode must be 'union' or 'first_mask'.")
     pil_image = _load_rgb_image(image)
     width, height = pil_image.size
     resized = pil_image.resize((1024, 1024))
@@ -165,6 +168,8 @@ def decode_mask_tokens(
             codes = parse_mask_codes(group, codebook_size, codebook_depth)
             if codes is not None:
                 groups.append(codes)
+        if decode_mode == "first_mask":
+            groups = groups[:1]
         parsed_groups.append(groups)
 
     decode_items = [

@@ -15,7 +15,7 @@ from pycocotools import mask as mask_utils
 from pycocoevalcap.cider.cider import Cider
 from torchvision.transforms.functional import to_pil_image
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2Config, VQ_SAM2
-from verl.workers.opsd import caption_safety_reason, groundedness_penalty, mask_group_metadata
+from verl.workers.opsd import caption_safety_reason, mask_group_metadata
 
 _MODEL_CACHE = {'vq_sam2': None, 'sam2_image_processor': None}
 
@@ -1335,8 +1335,6 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 # Both validity gates are multiplicative: a malformed caption
                 # cannot collect pixel-IoU reward through the cycle objective.
                 cap_validity_score = cap_no_bbox_no_chinese_score * cap_no_special_token_or_json_score
-                groundedness = reward_input.get("groundedness") or {}
-                groundedness_penalty_value = groundedness_penalty(groundedness)
                 qa_result = qa_reward_map.get(i, {"reward": 0.0, "question_count": 0.0, "failure_count": 0.0})
                 qa_settings = reward_input.get("caption_qa_settings")
                 qa_weight = qa_settings.reward_weight if qa_settings is not None else 0.0
@@ -1344,7 +1342,6 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 cap_overall = (
                     (answer_content_no_repeat_score + 10 * iou_scores) * cap_validity_score
                     + cap_validity_score
-                    - groundedness_penalty_value
                     + qa_reward
                 )
                 scores.append(
@@ -1354,10 +1351,6 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                         "cap_answer_content_no_repeat_score": answer_content_no_repeat_score,
                         "cap_no_bbox_no_chinese_score": cap_no_bbox_no_chinese_score,
                         "cap_no_special_token_or_json_score": cap_no_special_token_or_json_score,
-                        "cap_groundedness_penalty": groundedness_penalty_value,
-                        "cap_groundedness_score": float(groundedness.get("groundedness_score", 0.0)),
-                        "cap_unsupported_claim_count": int(groundedness.get("unsupported_count", 0)),
-                        "cap_contradicted_claim_count": int(groundedness.get("contradicted_count", 0)),
                         "cap_dlc_qa_reward": qa_reward,
                         "cap_dlc_qa_raw_reward": qa_result["reward"],
                         "cap_dlc_qa_question_count": qa_result["question_count"],

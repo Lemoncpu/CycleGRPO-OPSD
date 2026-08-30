@@ -50,6 +50,9 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 外层 rollout `G` | `worker.rollout.n=6` | 与论文及 OPSD 默认一致 |
 | caption response 上限 | `256` token | 火山引擎入口的稳定化消融值；同时是 caption 安全门控的超长阈值 |
 | segmentation response 上限 | `256` token | 与历史 20k OPSD 运行相同；localization rollout 默认继承等长上限，而非后加的 32-token 截断 |
+| mask 解码模式 | `union` | 默认解码每个 response 的全部合法 group 并取像素 union；设 `MASK_DECODE_MODE=first_mask` 可复现原始单 group 训练解码 |
+| localization prompt 模式 | `mixed` | 默认 1:1 交替 RefCOCO/GroundingSuite 模板；设 `LOCALIZATION_PROMPT_MODE=refcoco` 可让所有图像 localization 使用 RefCOCO prompt |
+| 两阶段 prompt 模式 | `current` | 设 `CYCLE_PROMPT_MODE=official_source_aware` 可按 RefCOCO/gRefCOCO/PACO/Stuff source 重建官方 caption prompt，并让图像 localization 使用官方长模板；默认不改变当前行为 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
 | 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
 | caption 原始 GRPO | B 入口默认保留 | 所有安全 rollout 都计算原始 CycleGRPO policy loss；low/mid 的 teacher 更新改为附加梯度 |
@@ -58,7 +61,6 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | C2: 非对称梯度投影 | 关闭 | 仍可显式启用；实测 caption/seg cosine 接近 0，投影对更新方向影响很小 |
 | 高置信 teacher gate | 开启 | regenerate 要求 `teacher R_Ci>=0.65` 且归一化改善 `>=0.30`；JSD 仅接收 `R_Ci>=0.65` 的 mid route |
 | C: JSD 特殊词表屏蔽 | 开启 | teacher/student JSD 同时禁止 `mt_*` 和 `object_ref_*` token |
-| groundedness verifier | 入口默认开启 | frozen teacher 以全图和 GT target crop 核验所有有目标 cycle caption；no-target 不参与 |
 | teacher 消融入口 | 默认 `decay=1.0`、CPU offload | `qwen3vl_4b_refcoco10k_volcengine.sh` 默认冻结启动时复制的 SAMTok teacher；主 YAML 仍为 EMA `0.999`，与 frozen reference policy 独立 |
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
@@ -66,7 +68,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
 | 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
-| GPU | 默认 1 node x 8 GPU；显式多机为 2 nodes x 8 GPU | 单机仍由 Ray + FSDP + vLLM SPMD 运行；多机时每个 trial 固定 16 张 H20 |
+| GPU | 默认 1 node x 8 GPU；当前显式多机为 2 nodes x 8 GPU | 单机仍由 Ray + FSDP + vLLM SPMD 运行；当前四组纯自监督多机 trial 每节点 GPU 0--7 全部加入 Ray，单 trial 使用 16 张训练 H20；需要本机 Llama judge 的辅助 trial 才改用 2 nodes x 7 GPU |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
@@ -113,9 +115,11 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
-Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2`、`NUM_GPUS=8` 和由项目
-`$ENV_DIR/bin/ray` 创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前要求恰有两个
-存活节点和至少 16 张 GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2` 和由项目 `$ENV_DIR/bin/ray`
+创建的私有 `RAY_ADDRESS`；无本机 judge 时设置 `NUM_GPUS=8`，入口会保留该地址，并在 trainer
+启动前要求恰有两个存活节点和至少 16 张 Ray 训练 GPU。只有启用本机 Llama judge 的辅助 trial 才设置
+`NUM_GPUS=8`、使用 GPU 0--7，并要求至少 16 张 Ray GPU；仅启用本机 judge 的辅助 trial 才使用
+`NUM_GPUS=7`、预留物理 GPU 7，并要求至少 14 张 Ray GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
@@ -123,15 +127,19 @@ Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2`、
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。除本节记录的 70k 三流 batch/step
 对齐默认值外，它不修改论文算法；其他训练超参数和数据路径仍可由环境变量覆盖。
 
-四组 16-H20 训练使用 `tools/multinode/launch_four_trials.sh` 管理，而不是在八台机器上手工执行
-trainer。先复制 `tools/multinode/clusters.tsv.example`，每个非注释 TSV 行依次填写
-`trial_id`、`head_ssh`、`head_ip`、`worker_ssh`、`worker_ip`、`ray_port`、`dashboard_port`、
-`nccl_socket_ifname`、`experiment_env`；控制器要求恰好四行且八个 host 不重复。`INVENTORY=<清单>
-tools/multinode/launch_four_trials.sh launch` 先检查共享代码/数据/权重、每节点 8 GPU、项目环境
-Python/Ray/Torch/vLLM 版本、NCCL 网卡和启用时的 judge endpoint，再后台启动每组 head、worker 和仅在
-head 上运行的 trainer。`status` 查询 PID 和 Ray 节点/GPU 数，`stop` 只关闭清单中该组的 trainer 和
-Ray 节点；先运行 `launch --dry-run` 检查将执行的 SSH 命令。默认禁止节点上已有 Ray，确认节点只属于该
-trial 后才可显式设 `CLEAN_RAY=true`。
+四组两节点 H20 训练使用 `tools/multinode/launch_four_trials.sh` 管理，而不是在八台机器上手工执行
+trainer。平台负责创建 Ray head/worker 和节点间通信；先复制 `tools/multinode/clusters.tsv.example`，每个
+非注释 TSV 行依次填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`，不再填写 SSH 主机
+或 NCCL 网卡。控制器要求恰好四行且 Ray 地址不重复；`INVENTORY=<清单>
+tools/multinode/launch_four_trials.sh launch` 只验证每个地址有两个存活节点和 16 张 GPU，然后在提交机后台
+启动 trainer。当前纯自监督 trial 将 GPU 0--7 全部交给 Ray，不启动 Llama；已跑过的历史 batch/response 对照
+不影响当前配置；当前四个 trial
+当前四组纯 20k 自监督 prompt/decode 消融统一为 `128/156/256`，依次为：
+`official_source_aware+first_mask`、`refcoco+first_mask`、
+`official_source_aware+union`、`refcoco+union`；四组均设置 `LOCAL_JUDGE_ENABLED=false`，不启动 Llama。
+启用 caption-QA 时 controller 才会启动并配置本机 judge；`status` 查询 PID 和 Ray 节点/GPU 数，
+`stop` 只关闭清单中该组的 trainer、Ray 节点和已启用的 judge；先运行 `launch --dry-run` 检查将执行的 SSH 命令。
+默认禁止节点上已有 Ray 或已监听的 judge 端口，确认节点只属于该 trial 后才可显式设 `CLEAN_RAY=true`。
 
 入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用默认值 `156`；显式设置为空字符串时不会向 Hydra
 传入空位置参数并恢复完整 epoch，设置正整数时附加 `trainer.max_steps=<value>`。
@@ -145,7 +153,8 @@ trial 后才可显式设 `CLEAN_RAY=true`。
 processor；因此必须先执行 `export` action，并以与 shard 文件名相同的 `NUM_GPUS=N` 拓扑只加载 actor model shard 并导出
 标准 safetensors HF 目录。之后 `refcoco`、`groundingsuite`、`gres` 和 `dlc` action 使用独立 CUDA
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
-及 `train2014`，输出 cIoU/mIoU；生成默认最多 256 个新 token，可通过
+及 `train2014`，输出 cIoU/mIoU；批量生成固定使用 decoder-only 模型要求的 tokenizer left padding，避免
+right-padding 导致不同长度多模态 prompt 的生成位置错位；生成默认最多 256 个新 token，可通过
 `REFCOCO_MAX_NEW_TOKENS` 覆盖（例如设为 `128` 可复现旧评测上限）；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 与 GRES/gRefCOCO
 也默认生成最多 256 个新 token，分别可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 和 `GRES_MAX_NEW_TOKENS` 覆盖。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
@@ -253,7 +262,7 @@ parquet。
 
 ### 3.1 启动与配置合并
 
-1. `projects/rl/qwen3vl_4b_mt.sh` 或服务器入口 `qwen3vl_4b_refcoco10k_volcengine.sh` 调用 `python3 -m verl.trainer.main`；默认单机入口会清除不兼容的外部 `RAY_ADDRESS`。只有 `MULTINODE_ENABLED=true` 时，入口才保留由项目环境启动、并已验证为两节点 16-GPU 的私有 Ray 地址。
+1. `projects/rl/qwen3vl_4b_mt.sh` 或服务器入口 `qwen3vl_4b_refcoco10k_volcengine.sh` 调用 `python3 -m verl.trainer.main`；默认单机入口会清除不兼容的外部 `RAY_ADDRESS`。只有 `MULTINODE_ENABLED=true` 时，入口才保留由项目环境启动、并已验证为两节点 14-training-GPU 的私有 Ray 地址。
 2. `verl/trainer/main.py::main` 按“dataclass 默认值 -> YAML -> CLI 覆盖”合并配置，并初始化 Ray。
 3. `Runner.run` 加载 tokenizer/processor，创建共享 GPU resource pool、`FSDPWorker`、batch reward manager 和 dataloader。若 Qwen3-VL checkpoint 的 processor 元数据不完整，`get_processor` 会在 `AutoProcessor` 返回 tokenizer/image processor 等非复合对象时，根据 `config.json` 的 `model_type=qwen3_vl` 显式回退到 `Qwen3VLProcessor`；其他模型仍保持原有的可选 processor 行为。
 4. `RayPPOTrainer.init_workers` 建立 actor、reference policy、可选 critic、vLLM rollout engine、FSDP/vLLM 权重同步器。
@@ -315,7 +324,7 @@ main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
 只运行独立 Llama DLC judge service。`ACTOR_GLOBAL_BATCH_SIZE` 仍必须整除主
 `ROLLOUT_BATCH_SIZE`，推荐保持 `28`，不能设为三流 parent batch 总和 `98`。
 该模式还强制 20k 主流为纯 CycleGRPO + online pixel-IoU OPSD：`OPSD_ENABLED=true`、
-`PIXEL_IOU_ENABLED=true`，但 routing、EMA teacher、teacher analysis、caption safety、groundedness、
+`PIXEL_IOU_ENABLED=true`，但 routing、EMA teacher、teacher analysis 和 caption safety、
 caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、privileged JSD、KL anchor
 或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
 人工 referring/GT-mask 或 no-target refusal 监督来自独立 direct 流。
@@ -324,7 +333,7 @@ caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、
 
 `RayPPOTrainer._make_batch_data`：
 
-1. 从 dataloader 取 batch，为原始 prompt 分配 `uid`，用 `cap_*` 字段构造 `task=caption` 的 `DataProto`。
+1. 从 dataloader 取 batch，为原始 prompt 分配 `uid`，用 `cap_*` 字段构造 `task=caption` 的 `DataProto`。`data.cycle_prompt_mode=current` 保留 parquet 内 prompt；设置为 `official_source_aware` 时，`denseworld_single/refcoco_cycle` 使用单区域 `Provide a detailed description of this region {mask}`，`denseworld_multiple/grefcoco_cycle` 使用官方多区域 interleaved-mask 模板，`paco_part_cycle` 和 `cocostuff_cycle` 分别使用 visible-parts/semantic-region 模板；no-target 或未知 source 保留原 prompt。
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
@@ -351,11 +360,12 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 
 1. 解码每个 caption response，删除空 thinking tag 和误回显的视觉标记。
 2. 对视频描述去掉显式时间先验，避免模型直接复述时间戳。
-3. 调用 dataset 的 `_gen_seg_preprocess`，把 caption 注入 localization prompt。图像 caption index 按偶/奇在 RefCOCO/GRES 与 GroundingSuite 两个 benchmark 同构模板之间交替；`caption_text` 仍保存裸 student caption，供 CycleGRPO reward、OPSD 路由和 teacher 使用。
+3. 调用 dataset 的 `_gen_seg_preprocess`，把 caption 注入 localization prompt。默认图像 caption index 按偶/奇在 RefCOCO/GRES 与 GroundingSuite 两个 benchmark 同构模板之间交替；通过 `worker.opsd.pixel_iou.localization_prompt_mode` 可统一切换为 `refcoco`、`groundingsuite` 或旧的 `legacy` 模板。若 `data.cycle_prompt_mode=official_source_aware`，图像 mask localization 忽略该交替设置并统一采用官方长模板（包含 mask 格式和 `null` 说明）；视频/bbox 分支保持各自模板。`caption_text` 仍保存裸 student caption，供 CycleGRPO reward、OPSD 路由和 teacher 使用。
 4. 从 `worker.opsd.localization_rollouts` 读取 `K`，用当前 actor 为每条 caption 采样定位结果。
-   每条正例 localization rollout 的生成上限独立限制为 `32` token，防止尚未收敛的策略在首个
-   mask 后无界延续；合法的多个 mask group 仍可共同表示一个区域。这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
-5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的全部合法 group，再在每条 response 内取像素 union。
+   每条 localization rollout 的生成上限由 `pixel_iou.segmentation_max_response_tokens` 控制（当前默认
+   `256`，可显式设置为历史 `32`）；合法的多个 mask group 是否共同表示一个区域由
+   `pixel_iou.mask_decode_mode` 控制。这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
+5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
 6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
@@ -370,7 +380,8 @@ parent expression 建立一个独立 `K=6`
 text-to-mask rollout group，先裁到 world size 的整倍数；不足一个 rank-shard 时跳过并记录原因。
 这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。query 按偶/奇
 index 在 RefCOCO/GRES `Please segment {query} in this image.` 与 GroundingSuite `Please carefully check ...`
-模板之间 1:1 交替。direct batch 的 UID、优势和日志独立，正例用原始 RLE pixel IoU，不调用 cycle
+模板之间 1:1 交替，也可由 `worker.opsd.pixel_iou.localization_prompt_mode` 统一设为
+`refcoco`、`groundingsuite` 或 `legacy`。direct batch 的 UID、优势和日志独立，正例用原始 RLE pixel IoU，不调用 cycle
 的 `R_Ci` 合并、OPSD routing、teacher regenerate 或 JSD。no-target direct GRPO 复用选定的
 `text|pixel_empty` no-target reward；后者与离线 `N_acc` 一致。火山引擎入口默认关闭 direct anchor；
 开启正例时必须传 `DIRECT_TRAIN_DATA` 与 `DIRECT_BATCH_SIZE`，开启 no-target GRPO 或 SFT 时还必须传
@@ -387,8 +398,8 @@ caption 或 localization reward 拼接后共同 whiten。
 anchor。正例从 standalone RefCOCO parent batch 的每个原始 UID 建立
 `grounding_query -> seg_answer`，target 是完整 GT SAMTok group；当
 `direct_mask_ce.include_no_target=true` 时，gRefCOCO no-target row 同样建立一条
-`grounding_query -> <answer>No target.</answer>` SFT 目标。二者都使用同样的两种 localization prompt
-交替，不接收 rollout response、IoU 或 advantage，也不会从 20k 主混合数据派生。CE loss mask 覆盖正例
+`grounding_query -> <answer>No target.</answer>` SFT 目标。二者服从同一个
+`localization_prompt_mode` 配置（默认两种 localization prompt 交替），不接收 rollout response、IoU 或 advantage，也不会从 20k 主混合数据派生。CE loss mask 覆盖正例
 的完整 mask token 或 no-target 的完整拒识文本 token，EOS/padding 只作为前向上下文。构造该 batch 时必须从
 保留 batch 维度的 non-tensor object array 取每个 parent 的图像 metadata、GT 和 mask。主 cycle rollout
 的 caption media 字段名是 `multi_modal_data`，独立 direct loader 则保留
@@ -484,7 +495,7 @@ batch 前，trainer 必须从 `non_cycle_batch`（并对称地从 cycle 侧）�
 `supervised_caption_qa`。reward actor 在初始化时读取已验证的 QA JSONL，并严格按 `dam_source_id`
 join 每一条 rollout；任何缺失 join 都会报错而不是静默给零分。独立 Llama judge 只看到学生 caption、题目和
 选项；每条 rollout 对全部题目作答，`1/0/-1` 的均值乘 `reward_weight` 就是**全部** caption reward。
-该流不计算或混入 cycle IoU、format/non-repeat、caption safety、groundedness、`R_Ci`、OPSD routing、
+该流不计算或混入 cycle IoU、format/non-repeat、caption safety、`R_Ci`、OPSD routing、
 teacher regenerate 或 JSD。服务超时、请求失败或无唯一选项时该题贡献 `0`；`caption_qa.loss_weight`
 在 actor 累积时控制此独立 GRPO 梯度的实际比例，因为组内 GRPO 标准化不保留 reward 的常数缩放。
 训练期每个 QA judge 请求还显式传递 Llama-3.1 的 `<|eot_id|>` `stop_token_ids=[128009]`。
@@ -514,8 +525,6 @@ low route 用 EMA teacher 在 privileged prompt 下采样 6 条自然 caption，
 mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：原图全景、由 GT mask 隔离出的目标 crop、以及由代表性 localization reconstruction 隔离出的 crop；并根据 student caption 进行同轨迹 teacher forcing。两个 crop 使用同一 GT/reconstruction union box、外扩 15%、mask 外中性灰填充，并在送入 processor 前各自限制为最多 `512x512` 等效像素，避免三图使 teacher FSDP 的视觉 token 峰值失控。GT/reconstruction mask 仍是 privileged evidence，但 teacher prompt 不再写 raw mask token、IoU 向量、面积/中心、相对位置或差异摘要，避免这些几何文本诱导全图定位语言。启用 `teacher_confidence` 时，仅 `R_Ci>=0.65` 的 mid route 进入 JSD；低于该值表示 student caption 尚缺少稳定的 cycle grounding，teacher 的 GT-conditioned token distribution 不作为共享 actor 的直接锚点。其余 JSD 细节保持不变：`beta=0.5` generalized JSD、归一化的 `exp(-H_teacher)` teacher 置信度和 `clamp((0.85-R_Ci)/0.35,0.1,1)` 样本权重。C 的第一部分在每个 JSD chunk 的 teacher/student softmax 前将 tokenizer 词表中所有 `<|mt_start|>`、`<|mt_####|>`、`<|mt_end|>` 和 `<|object_ref_*|>` logit 置为不可选，因此这些分割结构没有概率质量、JSD 梯度也不会把它们泄漏到 caption。student 原始 GRPO target 与 localization rollout 不变。为控制 Qwen3-VL 大词表的峰值显存，`workers/opsd/distillation.py` 继续按 response token 块计算 teacher 熵、token score 和 JSD；每块的 student JSD softmax/probability 中间量使用 activation checkpoint 在反向时重算。
 
 C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。非对称梯度投影仍保留为可选诊断：`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。当前服务器日志的 cosine 仅约 `-0.004` 到 `-0.018`，故入口默认关闭它。高置信 gate 新增 `opsd/regenerate_validated_candidate_count`、`opsd/regenerate_confident_candidate_{count,rate}`、`opsd/regenerate_confident_target_acceptance_rate`、`opsd/distillation_route_count`、`opsd/distillation_confident_{count,rate}` 与 `opsd/distillation_confident_R_Ci_mean`，必须同时检查这些项，避免阈值过严而使辅助 loss 静默为空。原有 anchor、projection、JSD finite 检查行为不变。
-
-当前 groundedness 受控消融在 pixel-IoU 路由之后增加一次 frozen initial teacher verifier。对所有有目标 cycle caption，teacher 只看全图和 GT target crop，输出最多 8 个必须是原 caption 字面子串的 claim，并标记 `supported`、`contradicted`、`unsupported` 或 `uncertain`。解析失败、没有有效 claim 和 `uncertain` 不产生惩罚；caption reward 仅减去 `0.25*unsupported_rate + 0.75*contradicted_rate`，不改变 pixel-IoU 或 segmentation reward。`R_Ci` low route 的 regenerate CE 要求 verifier score 至少 `0.85`；mid route 的 privileged JSD 同时要求 `R_Ci>=0.65`（`groundedness.min_distill_caption_score`）和 verifier score 至少 `0.85`，即使历史 `teacher_confidence` gate 被关闭也不会放宽该 groundedness 边界。原始 caption GRPO 保持不变。verifier 记录到 checkpoint 根目录的 `caption_groundedness.jsonl`，并输出 coverage、parse failure、claim rate 和 penalty 指标。除成功 verdict 外，该文件每个 global step 还保留至多 8 条失败记录，包括 `no_json_object`、`invalid_overall`、`claims_not_list`、`no_valid_claims` 或 `insufficient_checked_claims`，各 claim 丢弃原因以及截断到 2048 字符的原始 verifier 输出；这些字段仅用于诊断，不会进入 reward、CE 或 JSD。no-target 样本继续由原 GRES 拒识 reward 处理。当前首版只建立 `groundedness_token_mask` 和可选 extra JSD weight 接口，`token_jsd_enabled=false`，不直接产生 token-level groundedness 梯度；这是当前论文循环目标之外的 caption factuality 辅助消融。为兼容 GRES no-target 与 cycle caption 共同组成的 actor batch、避免将特权 verdict 传给主 PPO worker，verifier 记录和 token mask 会在 reward/JSD 均消费完成后、任一 actor batch 更新前从 cycle caption batch 移除。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -590,8 +599,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
-| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 TSV，预检、启动、查询或停止每个 16-H20 trial |
-| `tools/multinode/clusters.tsv.example` | 四组两节点清单模板；填写 SSH/IP、Ray/dashboard 端口、NCCL 网卡和试验 env 文件 |
+| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 Ray 地址/namespace/试验 env，预检 16-GPU 集群并启动、查询或停止本地 trainer，不创建 SSH head/worker |
+| `tools/multinode/clusters.tsv.example` | 四组两节点 Ray 清单模板；填写平台 Ray 地址、namespace 和试验 env 文件 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
@@ -619,15 +628,14 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/sharding_manager/fsdp_vllm.py` | FSDP 参数与 vLLM engine 同步/offload |
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
-| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 与 groundedness 配置及边界校验 |
+| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 配置及边界校验 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
-| `workers/opsd/groundedness.py` | teacher verifier JSON 的保守解析、claim/penalty 汇总，以及 optional token-span 对齐；解析不确定时 fail closed 为零辅助梯度 |
-| `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、共享 image embedding 的批量全 group 解码/response union、尺寸恢复和像素 IoU |
+| `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、共享 image embedding 的批量 `union`/`first_mask` 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
 | `single_controller/` | Ray worker、worker group、注册装饰器、资源/dispatch 管理 |
-| `utils/dataset.py` | 本项目数据 schema、图像/视频处理、双 prompt 构建和过滤 |
+| `utils/dataset.py` | 本项目数据 schema、图像/视频处理、可配置 current/source-aware caption 与 official/RefCOCO/GroundingSuite localization prompt 构建和过滤 |
 | `utils/dataset_old.py` | 上游/旧 dataset，仅供回溯 |
 | `utils/tokenizer.py` | 加载 tokenizer 与复合多模态 processor；Qwen3-VL 自动加载退化时按模型配置显式回退到 `Qwen3VLProcessor` |
 | `utils/checkpoint/` | FSDP 模型、优化器、scheduler、processor 的保存/恢复 |
@@ -642,8 +650,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式两节点 16 卡的 OPSD 入口；多机模式只连接项目环境创建的 Ray cluster，并验证 `2 nodes / >=16 GPUs`；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
-| `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计两节点 H20 试验模板；各自固定 run、数据、主 batch 128、response 256 与辅助任务开关，不在训练卡上部署 DLC judge |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式连接平台两节点 16 训练卡 Ray cluster 的 OPSD 入口；多机模式验证 `2 nodes / >=16 training GPUs`，并保留 judge-enabled 辅助实验的 7-GPU 兼容分支；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计两节点 H20 试验模板；当前 GPU 0--7 全部训练、统一为 `128/156/256`，分别测试 official/refcoco prompt 与 first/union decode |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -719,7 +727,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；分割生成默认最多 256 个新 token（可通过 `GRES_MAX_NEW_TOKENS` 覆盖）；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16；逐样本 JSON 保存 group 数和协议，协议不匹配时会重新生成 |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数和协议，协议不匹配时会重新生成 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成默认上限为 256（可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 覆盖），默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
@@ -753,15 +761,15 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 19. **caption safety 是当前 OPSD 的稳定化消融。** 它在 IoU 路由之后排除特殊 token、`mask_2d` JSON 和超长 caption 对原始 GRPO/mid JSD 的影响，并把它们导向 regenerate；这不改变论文的单 actor 双任务设计、privileged prompt 或 JSD 公式。比较该消融与历史实验时，必须同时报告 `CAPTION_MAX_RESPONSE_LENGTH` 和安全指标，不能仅比较最终 benchmark 分数。
 20. **B 保留原始 GRPO 是另一项受控消融。** `PRESERVE_ORIGINAL_GRPO=true` 使低/中路由的 teacher CE/JSD 成为额外梯度，而非替代原 CycleGRPO caption 梯度；这会改变 caption 梯度总量和与 teacher 的相对权重，不能与 route-replacement 结果直接混合。必须检查 `caption_original_grpo_active_rate` 是否接近 `caption_safe_rate`，否则说明安全门控或 batch 组合没有按预期生效。
 21. **C 当前同时处理 special-token 支持集、reference anchor、teacher 特权信息形态和共享梯度冲突。** JSD 屏蔽和 caption anchor KL 能阻止特权 token 分布写入 caption、并将安全 caption 拉回 frozen SAMTok。C2 保留 GT/reconstruction 的诊断信息，但仅以全图、GT crop 和 reconstruction crop 传给 teacher，不把 IoU、几何或 raw mask 文本写进 teacher prompt；student 不会看到这些图。为控制已观察到的纯 CycleGRPO text-to-mask 遗忘，C2 以 segmentation anchor KL 约束全部 cycle localization response，并可用非对称梯度投影移除 caption-side gradient 中与 localization gradient 冲突的分量；两者都不把 `seg_answer` 作为 student CE target，保持单 actor 的 cycle-only 训练信号。投影会额外保留一份本 rank 的 caption gradient，因此增加约一个 FSDP gradient shard 的显存；系数和冲突率必须通过 10-step RefCOCO/GroundingSuite 消融验证。屏蔽词表的实现不得把 logits 设为 `-inf` 后直接参与 entropy/JSD；必须保留有限 log-probability，且任何非有限 JSD 或 actor gradient 都必须 fail-fast，不能静默跳过 optimizer step。
-22. **groundedness 是对 caption factuality 的额外受控消融。** 它不提供人工 referring expression 或 caption CE，而是让冻结初始 teacher 用 GT target crop 核验 actor/teacher caption 的字面 claim。该校验会显著增加 teacher rollout 时间，且 teacher JSON 解析率不足时必须先检查 `opsd/groundedness_coverage`，不能把无效 verifier 当作零幻觉。`caption_groundedness.jsonl` 同样含 GT mask 派生的特权视觉判断，公开日志或发布产物前应删除。若 `groundedness_parse_failure_rate` 高，先读取同文件每 step 最多 8 条、原始输出限 2048 字符的失败记录，按 `parse_failure_reason` 和 `discarded_claim_reasons` 定位 prompt、长度或字面 span 问题；这些诊断记录不能被误作有效 verifier verdict。caption rollout 与 DLC inference 的 special-token blocker 仅禁止 response token；不能施加到 localization prompt 或 segmentation response，否则会破坏 text-to-mask 任务。
+22. **groundedness verifier 已从当前训练链路移除。** 当前 caption reward、regenerate、privileged JSD 与 DLC-QA 不再读取 groundedness 字段，也不会启动 groundedness verifier rollout、claim penalty、candidate/JSD gate 或 groundedness token mask/weight。保留的 teacher analysis、caption safety 和 teacher confidence 仍按各自配置运行；历史变更日志中的 groundedness 记录仅用于保留实验历史，不能视为当前可用配置。
 23. **GRES/gRefCOCO 评测需要独立标注根目录。** `projects/eval/qwen3vl_4b_volcengine.sh gres` 不使用训练 parquet 作为评测集，而是由 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 生成固定的 `gres_<split>_samples.json`。推理逐样本写入 `EVAL_ROOT/gres/case_*.json`，确认所有 case 完成后才计算 `gres_metrics.json`；因此不能用部分 shard 或只存在旧 prediction 的目录计算 GRES 指标。离线子集报告同样拒绝不完整 case，并使用该固定样本 JSON 的逐项 phrase 对齐来确认官方 refs 的重建顺序；不能把不同 split、不同标注版本或不同评测清单的 case 混用。
-24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；二者的差别只能是查询内容和奖励，不能是外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
+24. **正、负样本必须共享完整的 localization prompt 分布。** 若 `Please segment {expression} in this image.` 只用于 no-target caption PPO，会使模型把 RefCOCO/GRES 的评测指令条件化为固定拒识。当前默认正 cycle caption 与 no-target direct segmentation query 都以 1:1 覆盖 RefCOCO/GRES 和 GroundingSuite 模板；也可用 `LOCALIZATION_PROMPT_MODE=refcoco` 让所有训练 localization 使用 RefCOCO 指令，或用 `legacy` 复现旧模板。二者的差别只能是查询内容和奖励，不能是未记录的外层 instruction。该措施只对齐外层 instruction，不能替代带关系表达的正 referring supervision；若开启 `include_positive_sources=true`，必须将其作为使用人工 expression 的外部 anchoring 消融报告。
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
-26. **正例 segmentation 使用 union 语义。** 在线 CycleGRPO 与 direct reward 都记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。该训练语义与 RefCOCO/GRES/GroundingSuite 默认 `legacy_union` 一致；`first_mask` 仍是仅用于离线诊断的显式协议，两种评测协议不能混合比较。
+26. **正例 segmentation 的 mask 解码可配置。** 在线 CycleGRPO 与 direct reward 默认记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。通过 `MASK_DECODE_MODE=first_mask` 可以恢复原始训练时只解码第一个合法 group 的语义；`union` 是当前默认值。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。训练解码模式必须与离线评测协议单独记录，不能混合比较。
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
-28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL、caption safety 与 groundedness，防止 20k 主流混入任一辅助描述或分割监督。
+28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL 与 caption safety，防止 20k 主流混入任一辅助描述或分割监督。
 29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
-30. **四组两节点训练必须资源隔离。** `tools/multinode/launch_four_trials.sh` 要求 TSV 恰有四行且八个 SSH host 全部不同；每行单独启动一个 `2 x 8` 的 Ray 集群、Ray namespace、`/dev/shm` 临时目录、`RUN_ROOT`、PID/state 与日志。默认发现目标节点已有 Ray 进程即拒绝启动，只有显式 `CLEAN_RAY=true` 才会对清单中的节点执行 `ray stop --force`。64 张训练卡不得与 vLLM Llama judge 共置；启用 DLC-QA 的 env 必须把 judge 指向独立第 65 张 GPU 的 OpenAI 兼容 HTTP 服务。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填好 host/IP/NCCL 网卡后使用 `launch`，用 `status` 查询，用 `stop` 只停止清单中对应的 trainer 和 Ray 节点；`--dry-run` 仅打印 SSH 操作。
+30. **四组两节点训练必须资源隔离。** 平台需预先创建四个独立的两节点 Ray 集群，每个提供 16 张 GPU；`tools/multinode/launch_four_trials.sh` 的 TSV 恰有四行且只填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`。当前纯自监督 env 设置 `NUM_GPUS=8`，每个节点 GPU 0--7 全部训练，单 trial 为 `2 x 8=16` 张卡，四组共 64 张训练卡且不启动 judge。控制器不执行 SSH、`ray start` 或 `ray stop`，也不设置 `NCCL_SOCKET_IFNAME`；它仅通过 Ray API 验证集群、在提交机启动 trainer，并由 `status`/`stop` 管理本地 trainer PID。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填入平台提供的四个 Ray 地址和 namespace 后使用 `launch`；`--dry-run` 只打印 Ray 检查和训练命令。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1557,25 +1565,21 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机无
   服务器 CUDA/Ray/FSDP 环境，未执行端到端训练。
 
-### 2026-08-28 - 增加四组两节点 16-H20 多机训练编排
+### 2026-08-28 - 增加四组两节点多机训练编排
 
 - 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`；新增
   `tools/multinode/launch_four_trials.sh`、`tools/multinode/clusters.tsv.example` 和
   `projects/rl/experiments/multinode/trial_01.env` 至 `trial_04.env`。
 - 文档：更新第 2.2、3.1、5.1、5.3、6 节及本变更日志；模块清单已记录新增控制器、清单模板与 env
   模板。
-- 行为：默认单机仍清除平台注入的 `RAY_ADDRESS`，并固定 `trainer.nnodes=1`。显式
-  `MULTINODE_ENABLED=true` 仅允许 `NNODES=2`、每节点 `NUM_GPUS=8`，保留由项目
-  `$ENV_DIR/bin/ray` 创建的私有地址，启动 trainer 前验证恰有两个存活节点和至少 16 张 GPU；启用
-  DLC-QA 时还验证外部 judge 的 `/models` HTTP endpoint。多机控制器读取四行 TSV，对每组独占的
-  head/worker 启动独立 Ray head/worker、namespace、短 `/dev/shm` 目录、训练 launcher、PID/state
-  和控制日志；默认拒绝已有 Ray，仅 `CLEAN_RAY=true` 允许清理清单中的目标节点。四个模板各自固定
-  20k 数据、batch 128、response 256 和 156 step，并显式列出可选 direct/DLC-QA 路径；judge 必须在
-  独立第 65 张 GPU 上运行，不能与 64 张训练卡共置。
+- 行为：初始设计的 16-training-GPU/外部 judge 拓扑已被 2026-08-30 的每节点 `7+1` 拓扑替代；请以最新
+  记录为准。默认单机仍清除平台注入的 `RAY_ADDRESS`，并固定 `trainer.nnodes=1`。多机控制器读取四行
+  TSV，对每组独占的 head/worker 启动独立 Ray head/worker、namespace、短 `/dev/shm` 目录、训练
+  launcher、PID/state 和控制日志；默认拒绝已有 Ray，仅 `CLEAN_RAY=true` 允许清理清单中的目标节点。
 - 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
   `bash -n tools/multinode/launch_four_trials.sh`、`launch/status/stop --dry-run` 与
   `git diff --check`。本机没有八台 H20、共享 `/volume`、Ray/vLLM 或 SSH 目标，未执行两节点
-  preflight、`MAX_STEPS=1` smoke test、16-world-size checkpoint 或四 trial 并发实机验证。
+  preflight、`MAX_STEPS=1` smoke test 或四 trial 并发实机验证。
 
 ### 2026-08-28 - 将 CUDA 保活改为按卡空闲监测
 
@@ -1618,3 +1622,129 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
   的 192-token 协议及 mask 解码、指标计算保持不变。
 - 验证：执行受影响 Python 文件 compile、`bash -n` 检查两个多 GPU wrapper 和统一评测入口，以及
   `git diff --check`；本机无 CUDA/模型数据，未执行服务器端到端评测。
+
+### 2026-08-30 - 将四组多机训练改为每节点 7 训练卡加 1 本机 Llama
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `tools/multinode/launch_four_trials.sh` 和 `projects/rl/experiments/multinode/trial_01.env` 至
+  `trial_04.env`；未新增、移动或删除模块。
+- 文档：更新第 2.2、3.1、5.1、5.3、6 节及本变更日志。
+- 行为：显式两节点模式从每节点 8 Ray GPU 改为每节点 7 Ray 训练 GPU，要求 `NNODES=2`、
+  `NUM_GPUS=7`、`RAY_CLUSTER_EXPECTED_GPUS=14`。多机控制器以 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`
+  启动 Ray head/worker 和 trainer，并在每台机器用物理 GPU 7 后台启动本机 Llama-3.1 vLLM、检查
+  tokenizer chat template、端口空闲与 `/v1/models` 健康状态；`status`/`stop` 同时管理两个 judge PID。
+  四个模板改为 batch/step/segmentation-response 的 `28/714/32`、`28/714/256`、`112/178/32`、
+  `112/178/256` 受控对照。DLC-QA 启用时当前单 URL reward 配置使用 trial head 的 Llama；worker
+  Llama 不参与自动负载均衡。默认单机 `NUM_GPUS=8` 行为不变。
+- 验证：执行训练入口和多机控制器 `bash -n`、四个 trial env 的 `bash -n`、四组 `launch/status/stop`
+  dry-run，以及 `git diff --check`；本机无八台 H20、共享 `/volume`、Ray/vLLM 或 SSH 目标，未执行
+  真正的 14-world-size smoke training、GPU 7 vLLM 启动或四 trial 并发验证。
+
+### 2026-08-30 - 替换已运行的多机 response 条件为 128-token 对照
+
+- 代码：修改 `projects/rl/experiments/multinode/trial_01.env` 与 `trial_04.env`；未新增、移动或删除模块。
+- 文档：更新第 2.2 节的多机试验矩阵与模块清单，并追加本日志。
+- 行为：已完成的 `28/714/32` 改为 `28/714/128`，已完成的 `112/178/256` 改为
+  `112/178/128`；因此当前四个两节点 `7+1` trial 为 `28/714/128`、`28/714/256`、
+  `112/178/32`、`112/178/128`。其他训练开关、batch、step、Ray/Llama GPU 拓扑均不变。
+- 验证：执行四个 trial env 的 `bash -n`、多机控制器 `launch --dry-run` 与 `git diff --check`；
+  未在真实集群启动。
+
+### 2026-08-30 - 删除训练链路中的 groundedness verifier
+
+- 代码：删除 `verl/workers/opsd/groundedness.py`；修改 `verl/workers/opsd/{__init__,config}.py`、
+  `verl/workers/opsd/routing.py`、`verl/trainer/ray_trainer.py`、`verl/workers/fsdp_workers.py`、
+  `verl/workers/reward/function.py`、`projects/rl/reward_function/text2mask.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`tests/test_opsd_core.py`、
+  `README.md`。
+- 行为：移除 groundedness verifier rollout、claim penalty、candidate/JSD gate、token mask/weight 和
+  相关配置；caption reward、regenerate、privileged JSD 与 DLC-QA 不再读取 groundedness 字段。
+  现有 teacher analysis、caption safety 和 teacher confidence 保持不变。
+- 模块清单：移除 `workers/opsd/groundedness.py` 条目。
+- 验证：执行受影响 Python 文件 `py_compile`、训练入口 `bash -n`、`git diff --check`，并确认运行代码中无 groundedness 引用；未执行 Ray/FSDP/CUDA 训练。
+
+### 2026-08-30 - 增加训练 mask 解码与 RefCOCO prompt 配置
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/workers/opsd/mask_iou.py`、`verl/workers/fsdp_workers.py`、
+  `verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py`、
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `tests/test_opsd_core.py`。
+- 文档：更新第 2.2、3.4、5.1 节及关键注意事项 24、26；未新增、移动或删除模块。
+- 行为：新增 `MASK_DECODE_MODE=union|first_mask`，默认保持完整合法 group 的 union，设置为
+  `first_mask` 时只解码第一个合法 group，以复现原始单 group 训练语义；新增
+  `LOCALIZATION_PROMPT_MODE=mixed|refcoco|groundingsuite|legacy`，默认保留 RefCOCO/GroundingSuite
+  交替，设置为 `refcoco` 时 cycle、direct GRPO 和 direct CE 的图像 localization prompt 全部使用
+  `Please segment ... in this image.`。两个开关均透传至 no-target pixel-empty 解码或 direct prompt 构造。
+- 验证：执行受影响 Python 文件 `py_compile`、新增配置/解码/prompt 单元测试、训练入口 `bash -n` 和
+  `git diff --check`；本机无 CUDA/Ray/FSDP，未执行端到端训练。
+
+### 2026-08-30 - 增加 source-aware 官方两阶段 prompt 开关
+
+- 代码：修改 `verl/utils/dataset.py`、`verl/trainer/config.py`、`verl/trainer/data_loader.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和
+  `tests/test_opsd_core.py`。
+- 行为：新增 `data.cycle_prompt_mode` 与环境变量 `CYCLE_PROMPT_MODE`。默认 `current` 完全保留现有
+  parquet caption prompt 及 `LOCALIZATION_PROMPT_MODE` 行为；`official_source_aware` 按
+  `refcoco_cycle/denseworld_single`、`grefcoco_cycle/denseworld_multiple`、`paco_part_cycle`、
+  `cocostuff_cycle` 分别重建单区域、官方多区域 interleaved、visible-parts 和 semantic-region
+  caption 模板，并将图像 localization 统一切换到官方长 segmentation 模板。no-target、未知 source、视频和 bbox
+  分支不被错误套用图像 source 模板；开关同时作用于 train/val dataloader。
+- 论文边界：这是可选的 prompt 分布对照，不改变 CycleGRPO reward、mask 解码、G/K、OPSD 路由或优化公式；
+  source-aware PACO/Stuff 文案是当前数据类别语义模板，不宣称为官方论文新增 prompt。
+- 验证：执行 `python3 -m py_compile verl/utils/dataset.py verl/trainer/config.py verl/trainer/data_loader.py tests/test_opsd_core.py`、
+  `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、source-template 单测检查和
+  `git diff --check`；本机缺少完整 PyTorch/Ray/vLLM/CUDA，未执行多卡训练。
+
+### 2026-08-30 - 固定四组纯 20k 自监督 prompt/decode 消融
+
+- 代码：修改 `projects/rl/experiments/multinode/trial_01.env` 至 `trial_04.env`、
+  `tools/multinode/launch_four_trials.sh` 的模板注释和 `tools/multinode/clusters.tsv.example`；未新增、
+  移动或删除模块。
+- 行为：四个两节点 trial 统一只读取 20k `TRAIN_DATA`，关闭 `DIRECT_GROUNDING_ENABLED`、
+  `DIRECT_MASK_CE_ENABLED`、`SUPERVISED_CAPTION_QA_ENABLED`，并设置 `LOCAL_JUDGE_ENABLED=false`，
+  因而不启动 Llama、也不消费 40k/10k/DLC-QA 数据。四组均为 `ROLLOUT_BATCH_SIZE=128`、
+  `ACTOR_GLOBAL_BATCH_SIZE=128`、`MAX_STEPS=156`、`CAPTION/SEGMENTATION response=256`、`G=K=6`，
+  仅比较官方 source-aware 两阶段 prompt 或当前 RefCOCO prompt，以及 `first_mask` 或 `union` 解码：
+  `official+first`、`refcoco+first`、`official+union`、`refcoco+union`。
+- 资源：每个 Ray 集群为两节点、每节点 GPU 0--7 共 16 张训练卡；不启动 judge，四组共 64 张训练卡。
+  OPSD、pixel-IoU、routing/regenerate 和 teacher 诊断仍保持各 env 原值，未关闭自监督
+  CycleGRPO 主链路。
+- 验证：四个 env 和 `tools/multinode/launch_four_trials.sh` 通过 `bash -n`；使用
+  `INVENTORY=tools/multinode/clusters.tsv.example tools/multinode/launch_four_trials.sh launch --dry-run`
+  验证四行 TSV、Ray 检查命令和 judge 条件分支；`git diff --check` 通过。未连接真实 H20 节点，未启动
+  多机训练或 Llama 服务。
+
+### 2026-08-30 - 四组纯自监督切换为 8 卡节点与 batch 128
+
+- 代码：修改 `projects/rl/experiments/multinode/trial_01.env` 至 `trial_04.env`、
+  `tools/multinode/launch_four_trials.sh`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `tools/multinode/clusters.tsv.example`；未新增、移动或删除模块。
+- 行为：当前四组纯 20k 实验统一使用每节点 8 张 Ray GPU（两节点共 16 张/实验），`ROLLOUT_BATCH_SIZE`
+  和 `ACTOR_GLOBAL_BATCH_SIZE` 从 112 改为 128，完整一轮对应 `MAX_STEPS=156`；四组仍关闭 Llama、
+  direct GRPO、direct CE 和 DLC-QA。控制器按 `LOCAL_JUDGE_ENABLED` 动态选择 8 卡纯训练拓扑，只有
+  judge-enabled 辅助实验才回退到每节点 7 卡训练加 GPU 7 judge。
+- 验证：四个 env、训练入口和控制器通过 `bash -n`；dry-run 验证 16-GPU Ray 参数和四组 TSV 解析，
+  `git diff --check` 通过。未连接真实多机节点或执行训练。
+
+### 2026-08-30 - 改用平台 Ray/verl 多机框架
+
+- 代码：重写 `tools/multinode/launch_four_trials.sh` 和 `tools/multinode/clusters.tsv.example`；更新
+  `code.md` 的多机说明与模块清单，未新增、移动或删除训练模块。
+- 行为：控制器不再通过 SSH 启动 Ray head/worker，不再执行 `ray start`/`ray stop`，也不要求清单提供
+  NCCL 网卡。平台需预先提供四个独立的两节点 Ray 集群；清单改为 `trial_id`、`ray_address`、
+  `ray_namespace`、`experiment_env` 四列。控制器通过 Ray API 验证每个集群为 2 节点、16 GPU，再在
+  提交机启动对应的 verl trainer；`status`/`stop` 只管理本地 trainer PID。四组仍为纯 20k、8 卡/节点、
+  batch 128、156 steps、无 Llama。
+- 验证：执行控制器和训练入口 `bash -n`、四个 env `bash -n`、平台 Ray 清单 `launch --dry-run` 解析及
+  `git diff --check`；未连接真实 Ray 集群或启动训练。
+
+### 2026-08-30 - 固定 RefCOCO 批量推理使用 left padding
+
+- 代码：修改 `evaluation/refcoco/qwen3vl_refcoco_eval.py`；未新增、移动或删除模块。
+- 文档：更新第 2.2、5.6 节及本变更日志；模块清单无变化。
+- 行为：加载 `AutoProcessor` 后固定设置 `processor.tokenizer.padding_side="left"`。RefCOCO 的
+  batch size 1 与 batch size 4 对照显示，right padding 的 cIoU 为 64.67，而 left padding 为
+  79.17，后者与无 padding 的 batch size 1（79.16）一致；该修复只改变评测批处理方式，不改变
+  EOS、mask protocol、模型权重或训练逻辑。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/refcoco/qwen3vl_refcoco_eval.py`、
+  `bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 和 `git diff --check`；服务器端已完成 8 卡
+  batch 4 left-padding RefCOCO 全量评测，得到 `cIoU=79.1668`、`mIoU=78.8606`。

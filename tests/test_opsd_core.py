@@ -8,12 +8,6 @@ from verl.workers.opsd.distillation import (
     chunked_weighted_jsd_loss,
 )
 from verl.workers.opsd.config import OPSDConfig, PixelIoUConfig, TeacherConfidenceConfig
-from verl.workers.opsd.groundedness import (
-    disabled_groundedness,
-    groundedness_penalty,
-    groundedness_token_mask,
-    parse_groundedness_verdict,
-)
 from verl.workers.opsd.mask_iou import (
     coerce_raw_mask,
     compute_binary_iou,
@@ -22,6 +16,8 @@ from verl.workers.opsd.mask_iou import (
     parse_mask_codes,
     pixel_empty_reward,
 )
+from verl.workers.supervised_anchors import localization_prompt_variants
+from verl.utils.dataset import RLHFDataset
 from projects.rl.reward_function.text2mask import compute_score
 from verl.workers.opsd.routing import (
     GRPO_ROUTE,
@@ -42,6 +38,21 @@ from verl.workers.config import WorkerConfig
 
 
 class OPSDCoreTest(unittest.TestCase):
+    def test_source_aware_official_caption_templates(self):
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.cycle_prompt_mode = "official_source_aware"
+        dataset.seg_answer_key = "seg_answer"
+        mask = "<|mt_start|><|mt_0001|><|mt_0002|><|mt_end|>"
+        ref_prompt = dataset._build_source_aware_caption_prompt(
+            {"source": "refcoco_cycle", "seg_answer": f"<answer>{mask}</answer>"}, "old"
+        )
+        gref_prompt = dataset._build_source_aware_caption_prompt(
+            {"source": "grefcoco_cycle", "seg_answer": f"<answer>{mask}</answer>"}, "old"
+        )
+        self.assertEqual(ref_prompt, f"<image>\nProvide a detailed description of this region {mask}.")
+        self.assertIn("following regions", gref_prompt)
+        self.assertIn("interleaved segmentation masks", gref_prompt)
+
     def test_multi_group_reward_keeps_original_cyclegrpo_semantics(self):
         first = "<|mt_start|><|mt_0007|><|mt_0268|><|mt_end|>"
         second = "<|mt_start|><|mt_0008|><|mt_0269|><|mt_end|>"
@@ -94,6 +105,13 @@ class OPSDCoreTest(unittest.TestCase):
 
     def test_no_target_reward_mode_validation(self):
         self.assertEqual(PixelIoUConfig().no_target_reward_mode, "text")
+        self.assertEqual(PixelIoUConfig().mask_decode_mode, "union")
+        self.assertEqual(PixelIoUConfig().localization_prompt_mode, "mixed")
+        PixelIoUConfig(mask_decode_mode="first_mask", localization_prompt_mode="refcoco").post_init()
+        with self.assertRaisesRegex(ValueError, "mask_decode_mode"):
+            PixelIoUConfig(mask_decode_mode="invalid").post_init()
+        with self.assertRaisesRegex(ValueError, "localization_prompt_mode"):
+            PixelIoUConfig(localization_prompt_mode="invalid").post_init()
         PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
         with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
             PixelIoUConfig(no_target_reward_mode="unknown").post_init()
@@ -142,88 +160,6 @@ class OPSDCoreTest(unittest.TestCase):
             OPSDConfig(
                 teacher_confidence=TeacherConfidenceConfig(distill_min_caption_score=1.01)
             ).post_init()
-
-    def test_groundedness_requires_frozen_teacher_and_rejects_invalid_claims(self):
-        config = OPSDConfig()
-        config.groundedness.enabled = True
-        config.ema_teacher.decay = 1.0
-        config.post_init()
-        config.groundedness.min_distill_caption_score = 1.01
-        with self.assertRaisesRegex(ValueError, "groundedness.min_distill_caption_score"):
-            config.post_init()
-        config.groundedness.min_distill_caption_score = 0.65
-        config.ema_teacher.decay = 0.999
-        with self.assertRaisesRegex(ValueError, "frozen initial teacher"):
-            config.post_init()
-
-        caption = "A red cup with a silver handle."
-        verdict = parse_groundedness_verdict(
-            '{"claims":[{"text":"red cup","type":"appearance","verdict":"supported"},'
-            '{"text":"silver handle","type":"part","verdict":"unsupported"},'
-            '{"text":"invented logo","type":"other","verdict":"contradicted"},'
-            '{"text":"cup","type":"part","verdict":"uncertain"}],'
-            '"overall":"partially_supported"}',
-            caption,
-            max_claims=8,
-        )
-        self.assertTrue(verdict["parse_ok"])
-        self.assertIsNone(verdict["parse_failure_reason"])
-        self.assertEqual(verdict["supported_count"], 1)
-        self.assertEqual(verdict["unsupported_count"], 1)
-        self.assertEqual(verdict["contradicted_count"], 0)
-        self.assertEqual(verdict["uncertain_count"], 1)
-        self.assertAlmostEqual(verdict["penalty"], 0.25 / 2)
-        self.assertAlmostEqual(groundedness_penalty(verdict), 0.25 / 2)
-        self.assertFalse(disabled_groundedness()["enabled"])
-        self.assertEqual(groundedness_penalty(disabled_groundedness()), 0.0)
-        self.assertEqual(
-            parse_groundedness_verdict("not json", caption, max_claims=8)["parse_failure_reason"],
-            "no_json_object",
-        )
-
-    def test_groundedness_parser_reports_rejection_reasons(self):
-        caption = "A red cup with a silver handle."
-        invalid_overall = parse_groundedness_verdict(
-            '{"claims": [], "overall": "maybe"}', caption, max_claims=8
-        )
-        self.assertEqual(invalid_overall["parse_failure_reason"], "invalid_overall")
-        claims_not_list = parse_groundedness_verdict(
-            '{"claims": {}, "overall": "supported"}', caption, max_claims=8
-        )
-        self.assertEqual(claims_not_list["parse_failure_reason"], "claims_not_list")
-        rejected_claim = parse_groundedness_verdict(
-            '{"claims":[{"text":"blue saucer","type":"appearance","verdict":"supported"}],'
-            '"overall":"unsupported"}',
-            caption,
-            max_claims=8,
-        )
-        self.assertEqual(rejected_claim["parse_failure_reason"], "no_valid_claims")
-        self.assertEqual(
-            rejected_claim["discarded_claim_reasons"]["claim_not_literal_substring"], 1
-        )
-        uncertain_only = parse_groundedness_verdict(
-            '{"claims":[{"text":"red cup","type":"appearance","verdict":"uncertain"}],'
-            '"overall":"partially_supported"}',
-            caption,
-            max_claims=8,
-        )
-        self.assertEqual(uncertain_only["parse_failure_reason"], "insufficient_checked_claims")
-
-    def test_groundedness_token_mask_fails_closed_when_claim_cannot_align(self):
-        class FakeTokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return {"red cup": [3, 4], "missing": [8]}.get(text, [])
-
-        mask = groundedness_token_mask(
-            [1, 3, 4, 5],
-            FakeTokenizer(),
-            [
-                {"text": "red cup", "verdict": "unsupported"},
-                {"text": "missing", "verdict": "contradicted"},
-                {"text": "ignored", "verdict": "supported"},
-            ],
-        )
-        self.assertEqual(mask, [False, True, True, False])
 
     def test_route_boundaries_are_strict(self):
         self.assertEqual(classify_route(0.4999), REGENERATE_ROUTE)
@@ -289,6 +225,25 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(int(masks[1].sum()), 2)
         self.assertIsNone(masks[2])
 
+        first_masks, _ = decode_mask_tokens(
+            vq_sam2=decoder,
+            image=image,
+            token_texts=[
+                "<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|><|mt_start|><|mt_0003|><|mt_0259|><|mt_end|>"
+            ],
+            decode_batch_size=2,
+            decode_mode="first_mask",
+        )
+        self.assertEqual(int(first_masks[0].sum()), 1)
+
+    def test_localization_prompt_modes(self):
+        self.assertEqual(
+            localization_prompt_variants(4, "mixed"),
+            ["refcoco", "groundingsuite", "refcoco", "groundingsuite"],
+        )
+        self.assertEqual(localization_prompt_variants(3, "refcoco"), ["refcoco"] * 3)
+        self.assertEqual(localization_prompt_variants(2, "legacy"), ["legacy"] * 2)
+
     def test_aggregate_and_privileged_context(self):
         ious = [0.1, 0.4, 0.7, 0.8, 0.9, 0.6]
         aggregate = aggregate_caption_rollouts(ious)
@@ -345,9 +300,6 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertIn("Image 2", prompt)
         self.assertNotIn("IoU", prompt)
         self.assertNotIn("<|mt_start|>", prompt)
-        groundedness_prompt = format_privileged_prompt(context, mode="groundedness")
-        self.assertIn("literal substrings", groundedness_prompt)
-        self.assertIn("unsupported", groundedness_prompt)
         target_only_evidence = build_privileged_teacher_images(
             image, context, padding_fraction=0.0, include_reconstruction=False
         )
@@ -554,26 +506,3 @@ class OPSDCoreTest(unittest.TestCase):
         )
         for key, value in dense_metrics.items():
             self.assertTrue(torch.allclose(chunked_metrics[key], value, atol=1e-6, rtol=1e-6))
-
-    def test_chunked_jsd_accepts_optional_groundedness_token_weights(self):
-        torch.manual_seed(5)
-        student = torch.randn(1, 3, 7, requires_grad=True)
-        teacher = torch.randn(1, 3, 7)
-        loss, metrics = chunked_weighted_jsd_loss(
-            student_logits=student,
-            teacher_logits=teacher,
-            target_ids=torch.tensor([[1, 2, 3]]),
-            response_mask=torch.ones(1, 3),
-            sample_weight=torch.ones(1),
-            beta=0.5,
-            temperature=1.0,
-            entropy_weight_beta=1.0,
-            token_chunk_size=2,
-            extra_token_weight=torch.tensor([[1.0, 2.0, 1.0]]),
-        )
-        self.assertTrue(torch.isfinite(loss))
-        self.assertEqual(metrics["extra_weighted_token_count"].item(), 1.0)
-
-
-if __name__ == "__main__":
-    unittest.main()

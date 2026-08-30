@@ -13,6 +13,7 @@ VAL_DATA="${VAL_DATA:-${TRAIN_DATA}}"
 NUM_GPUS="${NUM_GPUS:-8}"
 MULTINODE_ENABLED="${MULTINODE_ENABLED:-false}"
 NNODES="${NNODES:-1}"
+LOCAL_JUDGE_ENABLED="${LOCAL_JUDGE_ENABLED:-false}"
 RAY_CLUSTER_EXPECTED_NODES="${RAY_CLUSTER_EXPECTED_NODES:-${NNODES}}"
 RAY_CLUSTER_EXPECTED_GPUS="${RAY_CLUSTER_EXPECTED_GPUS:-$((NUM_GPUS * NNODES))}"
 RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS="${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS:-90}"
@@ -25,6 +26,9 @@ PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
 # Historical 20k OPSD training let localization inherit the 256-token global
 # rollout cap. Keep that behavior unless an experiment explicitly overrides it.
 SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-256}"
+MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
+LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
+CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
@@ -55,13 +59,6 @@ SEGMENTATION_ANCHOR_KL_COEF="${SEGMENTATION_ANCHOR_KL_COEF:-0.05}"
 # not materially alter updates and is disabled for the high-confidence teacher run.
 ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-false}"
 JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
-GROUNDEDNESS_ENABLED="${GROUNDEDNESS_ENABLED:-true}"
-GROUNDEDNESS_MAX_CLAIMS="${GROUNDEDNESS_MAX_CLAIMS:-8}"
-GROUNDEDNESS_MAX_NEW_TOKENS="${GROUNDEDNESS_MAX_NEW_TOKENS:-96}"
-GROUNDEDNESS_UNSUPPORTED_PENALTY="${GROUNDEDNESS_UNSUPPORTED_PENALTY:-0.25}"
-GROUNDEDNESS_CONTRADICTED_PENALTY="${GROUNDEDNESS_CONTRADICTED_PENALTY:-0.75}"
-GROUNDEDNESS_MIN_SCORE="${GROUNDEDNESS_MIN_SCORE:-0.85}"
-GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE="${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE:-0.65}"
 TEACHER_CONFIDENCE_ENABLED="${TEACHER_CONFIDENCE_ENABLED:-true}"
 REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
 REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
@@ -153,16 +150,25 @@ if [[ ! "${RAY_CLUSTER_EXPECTED_NODES}" =~ ^[1-9][0-9]*$ ]] \
 fi
 
 if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
-    if [[ "${NNODES}" != "2" || "${NUM_GPUS}" != "8" ]]; then
-        echo "MULTINODE_ENABLED=true currently requires NNODES=2 and NUM_GPUS=8 (16 H20 GPUs per trial)." >&2
+    if [[ "${NNODES}" != "2" ]]; then
+        echo "MULTINODE_ENABLED=true currently requires NNODES=2." >&2
+        exit 1
+    fi
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && "${NUM_GPUS}" != "7" ]]; then
+        echo "A local Llama judge requires NUM_GPUS=7 so GPU 7 remains reserved." >&2
+        exit 1
+    fi
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "false" && "${NUM_GPUS}" != "8" ]]; then
+        echo "Without a local Llama judge, MULTINODE_ENABLED=true requires NUM_GPUS=8." >&2
         exit 1
     fi
     if [[ -z "${RAY_ADDRESS:-}" ]]; then
         echo "MULTINODE_ENABLED=true requires RAY_ADDRESS for a Ray cluster started with this project environment." >&2
         exit 1
     fi
-    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "2" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "16" ]]; then
-        echo "MULTINODE_ENABLED=true requires a two-node Ray cluster with at least 16 GPUs." >&2
+    expected_multinode_gpus="$((NUM_GPUS * NNODES))"
+    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "2" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
+        echo "MULTINODE_ENABLED=true requires a two-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
         exit 1
     fi
 elif [[ "${NNODES}" != "1" ]]; then
@@ -185,6 +191,27 @@ if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "pix
     exit 1
 fi
 
+if [[ "${MASK_DECODE_MODE}" != "union" && "${MASK_DECODE_MODE}" != "first_mask" ]]; then
+    echo "MASK_DECODE_MODE must be union or first_mask: ${MASK_DECODE_MODE}" >&2
+    exit 1
+fi
+
+case "${LOCALIZATION_PROMPT_MODE}" in
+    mixed|refcoco|groundingsuite|legacy) ;;
+    *)
+        echo "LOCALIZATION_PROMPT_MODE must be mixed, refcoco, groundingsuite, or legacy: ${LOCALIZATION_PROMPT_MODE}" >&2
+        exit 1
+        ;;
+esac
+
+case "${CYCLE_PROMPT_MODE}" in
+    current|official_source_aware) ;;
+    *)
+        echo "CYCLE_PROMPT_MODE must be current or official_source_aware: ${CYCLE_PROMPT_MODE}" >&2
+        exit 1
+        ;;
+esac
+
 if [[ "${NO_TARGET_REWARD_MODE}" == "pixel_empty" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
     echo "NO_TARGET_REWARD_MODE=pixel_empty requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
     exit 1
@@ -198,7 +225,6 @@ for bool_name in \
     CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB \
     EMA_TEACHER_ENABLED \
     TEACHER_ANALYSIS_ENABLED \
-    GROUNDEDNESS_ENABLED \
     SUPERVISED_CAPTION_QA_ENABLED \
     DIRECT_GROUNDING_ENABLED \
     DIRECT_GROUNDING_INCLUDE_NO_TARGET \
@@ -264,8 +290,8 @@ if [[ "${THREE_STREAM_2_4_1_ENABLED}" == "true" ]]; then
         echo "THREE_STREAM_2_4_1_ENABLED requires direct GRPO, direct mask CE, and caption QA to all be enabled." >&2
         exit 1
     fi
-    if [[ "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" || "${ROUTING_ENABLED}" != "false" || "${EMA_TEACHER_ENABLED}" != "false" || "${TEACHER_ANALYSIS_ENABLED}" != "false" || "${GROUNDEDNESS_ENABLED}" != "false" || "${CAPTION_SAFETY_ENABLED}" != "false" ]]; then
-        echo "THREE_STREAM_2_4_1_ENABLED keeps the 20k stream pure CycleGRPO plus pixel-IoU OPSD: enable OPSD/pixel IoU and disable teacher routing, safety, and groundedness auxiliaries." >&2
+    if [[ "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" || "${ROUTING_ENABLED}" != "false" || "${EMA_TEACHER_ENABLED}" != "false" || "${TEACHER_ANALYSIS_ENABLED}" != "false" || "${CAPTION_SAFETY_ENABLED}" != "false" ]]; then
+        echo "THREE_STREAM_2_4_1_ENABLED keeps the 20k stream pure CycleGRPO plus pixel-IoU OPSD: enable OPSD/pixel IoU and disable teacher routing and safety auxiliaries." >&2
         exit 1
     fi
     if ! awk -v caption_kl="${CAPTION_ANCHOR_KL_COEF}" -v segmentation_kl="${SEGMENTATION_ANCHOR_KL_COEF}" 'BEGIN { exit !(caption_kl == 0 && segmentation_kl == 0) }'; then
@@ -273,7 +299,7 @@ if [[ "${THREE_STREAM_2_4_1_ENABLED}" == "true" ]]; then
         exit 1
     fi
     if (( ROLLOUT_BATCH_SIZE % NUM_GPUS != 0 || DIRECT_BATCH_SIZE % NUM_GPUS != 0 || CAPTION_QA_BATCH_SIZE % NUM_GPUS != 0 )); then
-        echo "All three parent-prompt batch sizes must be divisible by the 7 training GPUs." >&2
+        echo "All three parent-prompt batch sizes must be divisible by the ${NUM_GPUS} training GPUs." >&2
         exit 1
     fi
     if (( DIRECT_BATCH_SIZE != 2 * ROLLOUT_BATCH_SIZE || ROLLOUT_BATCH_SIZE != 2 * CAPTION_QA_BATCH_SIZE )); then
@@ -319,37 +345,6 @@ if [[ "${ROUTING_ENABLED}" == "true" && "${EMA_TEACHER_ENABLED}" != "true" ]]; t
     echo "ROUTING_ENABLED=true requires EMA_TEACHER_ENABLED=true." >&2
     exit 1
 fi
-
-if [[ "${GROUNDEDNESS_ENABLED}" == "true" && "${TEACHER_EMA_DECAY}" != "1.0" ]]; then
-    echo "GROUNDEDNESS_ENABLED=true requires TEACHER_EMA_DECAY=1.0." >&2
-    exit 1
-fi
-
-for groundedness_count_name in GROUNDEDNESS_MAX_CLAIMS GROUNDEDNESS_MAX_NEW_TOKENS; do
-    groundedness_count_value="${!groundedness_count_name}"
-    if [[ ! "${groundedness_count_value}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "${groundedness_count_name} must be a positive integer: ${groundedness_count_value}" >&2
-        exit 1
-    fi
-done
-
-for groundedness_penalty_name in GROUNDEDNESS_UNSUPPORTED_PENALTY GROUNDEDNESS_CONTRADICTED_PENALTY; do
-    groundedness_penalty_value="${!groundedness_penalty_name}"
-    if [[ ! "${groundedness_penalty_value}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
-        || ! awk -v value="${groundedness_penalty_value}" 'BEGIN { exit !(value >= 0) }'; then
-        echo "${groundedness_penalty_name} must be non-negative: ${groundedness_penalty_value}" >&2
-        exit 1
-    fi
-done
-
-for groundedness_score_name in GROUNDEDNESS_MIN_SCORE GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE; do
-    groundedness_score_value="${!groundedness_score_name}"
-    if [[ ! "${groundedness_score_value}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
-        || ! awk -v value="${groundedness_score_value}" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
-        echo "${groundedness_score_name} must be in [0, 1]: ${groundedness_score_value}" >&2
-        exit 1
-    fi
-done
 
 if [[ ! "${CAPTION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
     || ! awk -v value="${CAPTION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
@@ -611,8 +606,11 @@ echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
-echo "Positive segmentation mask protocol: union of all complete legal SAMTok groups"
+echo "Positive segmentation mask decode mode: ${MASK_DECODE_MODE} (union or first_mask)"
 echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
+echo "Training mask decode mode: ${MASK_DECODE_MODE}"
+echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
+echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
 echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
@@ -622,7 +620,6 @@ echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_A
 echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
 echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADIENT_PROJECTION}"
 echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
-echo "Caption groundedness: ${GROUNDEDNESS_ENABLED} (unsupported=${GROUNDEDNESS_UNSUPPORTED_PENALTY}, contradicted=${GROUNDEDNESS_CONTRADICTED_PENALTY}, min score=${GROUNDEDNESS_MIN_SCORE}, min distill R_Ci=${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE})"
 echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
 echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
 echo "DLC-QA train data: ${CAPTION_QA_TRAIN_DATA:-<disabled>} (batch=${CAPTION_QA_BATCH_SIZE}, loss weight=${CAPTION_QA_LOSS_WEIGHT})"
@@ -705,6 +702,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     "data.val_files=['${VAL_DATA}']" \
     data.format_prompt="${REPO_DIR}/projects/rl/format_prompt/non_thinking.jinja" \
     data.region_format=mask_token \
+    data.cycle_prompt_mode="${CYCLE_PROMPT_MODE}" \
     data.shuffle=true \
     data.seed=1 \
     data.rollout_batch_size="${ROLLOUT_BATCH_SIZE}" \
@@ -739,6 +737,8 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
     worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
     worker.opsd.pixel_iou.segmentation_max_response_tokens="${SEGMENTATION_MAX_RESPONSE_TOKENS}" \
+    worker.opsd.pixel_iou.mask_decode_mode="${MASK_DECODE_MODE}" \
+    worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
@@ -752,19 +752,6 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.ema_teacher.enabled="${EMA_TEACHER_ENABLED}" \
     worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
     worker.opsd.teacher_analysis.enabled="${TEACHER_ANALYSIS_ENABLED}" \
-    worker.opsd.groundedness.enabled="${GROUNDEDNESS_ENABLED}" \
-    worker.opsd.groundedness.teacher_must_be_frozen=true \
-    worker.opsd.groundedness.max_claims="${GROUNDEDNESS_MAX_CLAIMS}" \
-    worker.opsd.groundedness.max_new_tokens="${GROUNDEDNESS_MAX_NEW_TOKENS}" \
-    worker.opsd.groundedness.temperature=0.0 \
-    worker.opsd.groundedness.unsupported_penalty="${GROUNDEDNESS_UNSUPPORTED_PENALTY}" \
-    worker.opsd.groundedness.contradicted_penalty="${GROUNDEDNESS_CONTRADICTED_PENALTY}" \
-    worker.opsd.groundedness.min_checked_claims=1 \
-    worker.opsd.groundedness.min_groundedness_score="${GROUNDEDNESS_MIN_SCORE}" \
-    worker.opsd.groundedness.min_distill_caption_score="${GROUNDEDNESS_MIN_DISTILL_CAPTION_SCORE}" \
-    worker.opsd.groundedness.no_target_enabled=false \
-    worker.opsd.groundedness.token_jsd_enabled=false \
-    worker.opsd.groundedness.token_jsd_multiplier=1.0 \
     "${CAPTION_QA_OVERRIDES[@]}" \
     worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
     "${DIRECT_TRAIN_FILES_OVERRIDE}" \

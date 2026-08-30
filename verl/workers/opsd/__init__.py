@@ -1,11 +1,5 @@
-from .config import CaptionSafetyConfig, GroundednessConfig, OPSDConfig
+from .config import CaptionSafetyConfig, OPSDConfig
 from .distillation import caption_blocked_special_token_ids, chunked_weighted_jsd_loss
-from .groundedness import (
-    disabled_groundedness,
-    groundedness_penalty,
-    groundedness_token_mask,
-    parse_groundedness_verdict,
-)
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
     coerce_raw_mask,
@@ -40,17 +34,12 @@ __all__ = [
     "MASK_TOKEN_PATTERN",
     "ON_POLICY_DISTILL_ROUTE",
     "CaptionSafetyConfig",
-    "GroundednessConfig",
     "OPSDConfig",
     "REGENERATE_ROUTE",
     "aggregate_caption_rollouts",
     "build_privileged_teacher_images",
     "build_privileged_context",
     "caption_blocked_special_token_ids",
-    "disabled_groundedness",
-    "groundedness_penalty",
-    "groundedness_token_mask",
-    "parse_groundedness_verdict",
     "caption_safety_reason",
     "chunked_weighted_jsd_loss",
     "classify_route",

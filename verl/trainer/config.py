@@ -59,8 +59,13 @@ class DataConfig:
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
     region_format: str = "mask_token"
+    cycle_prompt_mode: str = "current"
 
     def post_init(self):
+        if self.cycle_prompt_mode not in {"current", "official_source_aware"}:
+            raise ValueError(
+                "cycle_prompt_mode must be 'current' or 'official_source_aware'."
+            )
         if self.image_dir is not None:
             if os.path.exists(self.image_dir):  # ray job uses absolute path
                 self.image_dir = os.path.abspath(self.image_dir)

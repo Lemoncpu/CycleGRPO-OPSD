@@ -24,6 +24,10 @@ data:
   max_pixels: 1605632
   filter_overlong_prompts: true
   region_format: mask_token
+  # ``current`` preserves OPSD prompt routing; ``official_source_aware``
+  # selects source-specific caption templates and the official localization
+  # template for the two-stage cycle rollout.
+  cycle_prompt_mode: current
 algorithm:
   adv_estimator: grpo
   disable_kl: false
@@ -96,6 +100,12 @@ worker:
       # Match the historical global rollout limit rather than truncating
       # localization responses at the later 32-token stabilization setting.
       segmentation_max_response_tokens: 256
+      # ``union`` is the current all-group decoder; use ``first_mask`` for
+      # the original single-group training ablation.
+      mask_decode_mode: union
+      # ``mixed`` alternates RefCOCO/GroundingSuite wording; ``refcoco`` makes
+      # every image localization prompt use the RefCOCO instruction.
+      localization_prompt_mode: mixed
       # ``pixel_empty`` decodes all legal groups and rewards an empty union,
       # matching offline gRefCOCO N_acc. ``text`` preserves historical training.
       no_target_reward_mode: text
@@ -140,21 +150,6 @@ worker:
       max_samples_per_step: 2
       max_new_tokens: 96
       temperature: 0.0
-    groundedness:
-      enabled: false
-      teacher_must_be_frozen: true
-      max_claims: 8
-      max_claim_chars: 160
-      max_new_tokens: 96
-      temperature: 0.0
-      unsupported_penalty: 0.25
-      contradicted_penalty: 0.75
-      min_checked_claims: 1
-      min_groundedness_score: 0.85
-      min_distill_caption_score: 0.65
-      no_target_enabled: false
-      token_jsd_enabled: false
-      token_jsd_multiplier: 1.0
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu

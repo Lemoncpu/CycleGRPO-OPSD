@@ -186,6 +186,7 @@ def main():
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(args.model_path, torch_dtype="auto").to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_path)
+    processor.tokenizer.padding_side = "left"
     config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../projects/transformers/vq_sam2/sam2/sam2_configs"))
     with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
         sam2_config = SAM2Config(cfg_path="sam2.1_hiera_l.yaml", ckpt_path=args.sam2_path)

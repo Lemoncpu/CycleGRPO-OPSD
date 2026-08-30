@@ -30,6 +30,20 @@ def alternating_localization_prompt_variants(size: int) -> list[str]:
     return ["refcoco" if index % 2 == 0 else "groundingsuite" for index in range(size)]
 
 
+def localization_prompt_variants(size: int, mode: str = "mixed") -> list[str]:
+    """Return localization prompt variants for a configured training mode."""
+    if size < 0:
+        raise ValueError("size must be non-negative.")
+    if mode == "mixed":
+        return alternating_localization_prompt_variants(size)
+    if mode in {"refcoco", "groundingsuite", "legacy"}:
+        return [mode] * size
+    raise ValueError(
+        "localization prompt mode must be one of "
+        "{'mixed', 'refcoco', 'groundingsuite', 'legacy'}."
+    )
+
+
 def aligned_direct_prompt_count(prompt_count: int, world_size: int) -> int:
     """Keep a prefix that can be dispatched evenly to every rollout rank."""
     if world_size <= 0:
