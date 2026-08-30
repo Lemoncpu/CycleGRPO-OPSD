@@ -150,8 +150,8 @@ if [[ ! "${RAY_CLUSTER_EXPECTED_NODES}" =~ ^[1-9][0-9]*$ ]] \
 fi
 
 if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
-    if [[ "${NNODES}" != "2" ]]; then
-        echo "MULTINODE_ENABLED=true currently requires NNODES=2." >&2
+    if [[ "${NNODES}" != "1" && "${NNODES}" != "2" ]]; then
+        echo "MULTINODE_ENABLED=true supports NNODES=1 or NNODES=2." >&2
         exit 1
     fi
     if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && "${NUM_GPUS}" != "7" ]]; then
@@ -167,8 +167,8 @@ if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
         exit 1
     fi
     expected_multinode_gpus="$((NUM_GPUS * NNODES))"
-    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "2" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
-        echo "MULTINODE_ENABLED=true requires a two-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
+    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "${NNODES}" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
+        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
         exit 1
     fi
 elif [[ "${NNODES}" != "1" ]]; then
@@ -186,8 +186,8 @@ if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
     exit 1
 fi
 
-if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
-    echo "NO_TARGET_REWARD_MODE must be text or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
+if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
+    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
     exit 1
 fi
 

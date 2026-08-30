@@ -107,7 +107,8 @@ worker:
       # every image localization prompt use the RefCOCO instruction.
       localization_prompt_mode: mixed
       # ``pixel_empty`` decodes all legal groups and rewards an empty union,
-      # matching offline gRefCOCO N_acc. ``text`` preserves historical training.
+      # matching offline gRefCOCO N_acc. ``text`` checks SAMTok fragments;
+      # ``official_bbox`` reproduces public CycleGRPO's bbox-format proxy.
       no_target_reward_mode: text
     routing:
       enabled: true

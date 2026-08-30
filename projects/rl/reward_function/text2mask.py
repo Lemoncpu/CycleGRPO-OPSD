@@ -206,10 +206,12 @@ def no_target_check(response: str, ground_truth: str) -> float:
 
 
 def no_target_reward_score(reward_input: dict) -> float:
-    """Select the historical textual proxy or decoded-union GRES semantics."""
+    """Select text, official bbox-proxy, or decoded-union no-target semantics."""
     mode = reward_input.get("no_target_reward_mode") or "text"
     if mode == "text":
         return no_target_check(reward_input["response"], "No target.")
+    if mode == "official_bbox":
+        return no_target_check_bbox(reward_input["response"], "No target.")
     if mode != "pixel_empty":
         raise ValueError(f"Unknown no-target reward mode: {mode!r}")
     pixel_empty = reward_input.get("no_target_pixel_empty")

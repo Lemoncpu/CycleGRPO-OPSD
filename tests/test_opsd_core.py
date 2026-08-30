@@ -113,6 +113,7 @@ class OPSDCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "localization_prompt_mode"):
             PixelIoUConfig(localization_prompt_mode="invalid").post_init()
         PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
+        PixelIoUConfig(no_target_reward_mode="official_bbox").post_init()
         with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
             PixelIoUConfig(no_target_reward_mode="unknown").post_init()
         with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):

@@ -68,7 +68,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
 | 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
-| GPU | 默认 1 node x 8 GPU；当前显式多机为 2 nodes x 8 GPU | 单机仍由 Ray + FSDP + vLLM SPMD 运行；当前四组纯自监督多机 trial 每节点 GPU 0--7 全部加入 Ray，单 trial 使用 16 张训练 H20；需要本机 Llama judge 的辅助 trial 才改用 2 nodes x 7 GPU |
+| GPU | 默认 1 node x 8 GPU；显式 Ray attach 按试验族区分 | 单机仍由 Ray + FSDP + vLLM SPMD 运行；纯 20k controller 使用两节点、每节点 GPU 0--7 全部加入 Ray（单 trial 16 张训练 H20）；70k 有监督 controller 每 trial 使用一台 32-GPU 节点，仅向 Ray 登记 GPU 0--6，物理 GPU 7 运行本机 Llama judge（单 trial 7 训练卡 + 1 judge 卡，GPU 8--31 不使用） |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
@@ -115,11 +115,11 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
-Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2` 和由项目 `$ENV_DIR/bin/ray`
-创建的私有 `RAY_ADDRESS`；无本机 judge 时设置 `NUM_GPUS=8`，入口会保留该地址，并在 trainer
-启动前要求恰有两个存活节点和至少 16 张 Ray 训练 GPU。只有启用本机 Llama judge 的辅助 trial 才设置
-`NUM_GPUS=8`、使用 GPU 0--7，并要求至少 16 张 Ray GPU；仅启用本机 judge 的辅助 trial 才使用
-`NUM_GPUS=7`、预留物理 GPU 7，并要求至少 14 张 Ray GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+Ray。显式连接平台 Ray 时设置 `MULTINODE_ENABLED=true`、`NNODES=1|2` 和由项目 `$ENV_DIR/bin/ray`
+创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前验证对应数量的节点和 Ray GPU。纯 20k
+controller 使用 `NNODES=2`、`NUM_GPUS=8`、GPU 0--7 全训练的拓扑（16 Ray GPU）；有监督 controller
+使用一台 32-GPU 节点、`NNODES=1`、`NUM_GPUS=7`，仅向 Ray 登记物理 GPU 0--6，预留物理 GPU 7
+运行本机 Llama，并要求恰有 1 个 Ray 节点和至少 7 张 Ray GPU。该实验不调度物理 GPU 8--31。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
@@ -127,20 +127,32 @@ Ray。显式两节点模式必须设置 `MULTINODE_ENABLED=true`、`NNODES=2` �
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。除本节记录的 70k 三流 batch/step
 对齐默认值外，它不修改论文算法；其他训练超参数和数据路径仍可由环境变量覆盖。
 
-四组两节点 H20 训练使用 `tools/multinode/launch_four_trials.sh` 管理，而不是在八台机器上手工执行
-trainer。平台负责创建 Ray head/worker 和节点间通信；先复制 `tools/multinode/clusters.tsv.example`，每个
-非注释 TSV 行依次填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`，不再填写 SSH 主机
-或 NCCL 网卡。控制器要求恰好四行且 Ray 地址不重复；`INVENTORY=<清单>
-tools/multinode/launch_four_trials.sh launch` 会在可配置的就绪超时内验证每个地址有两个存活节点和 16 张 GPU，然后在提交机后台
-启动 trainer。控制器以 `set -a` source env，确保每个 trial 的数据、运行名和全部实验开关都传给 `nohup` 的
-训练子进程；PID 文件记录实际 training launcher，`stop` 可可靠发送 SIGTERM。当前纯自监督 trial 将 GPU 0--7 全部交给 Ray，不启动 Llama；已跑过的历史 batch/response 对照
-不影响当前配置；当前四个 trial
-当前四组纯 20k 自监督 prompt/decode 消融统一为 `128/156/256`，依次为：
-`official_source_aware+first_mask`、`refcoco+first_mask`、
-`official_source_aware+union`、`refcoco+union`；四组均设置 `LOCAL_JUDGE_ENABLED=false`，不启动 Llama。
-启用 caption-QA 时 controller 才会启动并配置本机 judge；`status` 查询 PID 和 Ray 节点/GPU 数，
-`stop` 只关闭清单中该组的 trainer、Ray 节点和已启用的 judge；先运行 `launch --dry-run` 检查将执行的 SSH 命令。
-默认禁止节点上已有 Ray 或已监听的 judge 端口，确认节点只属于该 trial 后才可显式设 `CLEAN_RAY=true`。
+两套四组 H20 控制器都依赖平台预先创建 Ray cluster，不需要手工 SSH 启动 trainer 或配置 NCCL 网卡。纯自监督使用 `tools/multinode/launch_four_cycle_trials.sh`（其底层为
+`launch_four_trials.sh`）：复制 `clusters.tsv.example`，每个非注释 TSV 行填写 `trial_id`、`ray_address`、
+`ray_namespace`、`experiment_env`。它要求每个集群恰有两节点、16 张 Ray GPU；四个 20k trial 均为
+`128/156/256`，分别比较 `official_source_aware/refcoco` prompt 与 `first_mask/union` 解码，且
+`LOCAL_JUDGE_ENABLED=false`，GPU 0--7 全部用于训练。
+
+混合四组实验使用独立的 `tools/multinode/launch_four_supervised_trials.sh`：复制
+`supervised_clusters.tsv.example`，每行填写 `trial_id`、`ray_address`、`ray_namespace`、
+`head_judge_base_url`（无 DLC-QA 的行填 `-`）和 `experiment_env`。控制器按 env 动态预检 Ray
+拓扑：三个 20k 自监督 trial 使用单节点、8 张训练 GPU（8 GPU/trial），不启动 Llama；
+70k 三流 trial 使用一台节点、7 张 Ray 训练 GPU，物理 GPU 7 由 node-affine actor 启动本机 Llama，
+GPU 8--31 不使用。四个任务分别为 pixel-empty 20k、pixel-empty 70k（direct GRPO+CE+DLC-QA）、
+official-bbox no-target 20k 和 official source-aware prompt 的 pixel-empty 20k：
+
+| env | 主要目的 | main/direct/QA batch，step | direct CE | direct GRPO / DLC-QA |
+|---|---|---|---|---|
+| `supervised_trial_01` | pixel-empty 20k 自监督 | `128/128`，156 | — | 无 direct/CE/DLC-QA |
+| `supervised_trial_02` | pixel-empty 70k 有监督 | `112/224/56`，178 | `0.005`，warmup `10--30`，含 no-target | `0.15 / 1.0` |
+| `supervised_trial_03` | official-bbox no-target 20k | `128/128`，156 | — | 无 direct/CE/DLC-QA |
+| `supervised_trial_04` | official source-aware prompt 20k | `128/128`，156 | — | 无 direct/CE/DLC-QA |
+
+7 个 rank 上，70k batch `112/224/56` 对应 `16/32/8` 个 main/direct/QA parent prompt；20k 任务没有辅助流。
+虽然环境中 `THREE_STREAM_2_4_1_ENABLED=false`，这是为了绕过该旧严格模式对 routing/EMA/teacher diagnosis 的互斥检查；
+70k parent batch 仍保持 `2:4:1`，并由 mixed controller 显式校验，不代表关闭 v1/v2 诊断监督。两个控制器都以 `set -a` source env，使 trial 数据、运行名和开关传给
+`nohup` 的训练子进程；PID 记录实际 training launcher。两者均有 `launch`、`status`、`stop` 和
+`--dry-run`；stop 仅停止控制器所启动的 trainer，supervised stop 还关闭其管理的 detached judge actor。
 
 入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用默认值 `156`；显式设置为空字符串时不会向 Hydra
 传入空位置参数并恢复完整 epoch，设置正整数时附加 `trainer.max_steps=<value>`。
@@ -329,6 +341,9 @@ main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
 caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、privileged JSD、KL anchor
 或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
 人工 referring/GT-mask 或 no-target refusal 监督来自独立 direct 流。
+单节点 `7+1` 有监督 controller 的 world size 为 7：`112:224:56` 对应每 rank `16:32:8` 个
+main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。入口保留 `NUM_GPUS=7` 的
+兼容性检查，controller 会在提交前额外检查三个 batch 都能被 7 整除。
 
 ### 3.3 Phase 1：caption rollout
 
@@ -338,7 +353,7 @@ caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`，默认以原始 CycleGRPO 的外层 caption GRPO 更新，且不进入内层 localization rollout。只有显式开启 direct grounding 后才会额外构造独立 batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。`text` 或 `official_bbox` 模式仍走历史外层 caption GRPO；`pixel_empty` 模式则从 caption batch 移除 no-target 行，按每个原始 UID 保留一条 `grounding_query`，再生成标准 segmentation rollout 并加入主 segmentation GRPO。只有显式开启 direct grounding 后才会额外构造独立 batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -372,6 +387,13 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
+主 20k 的 `pixel_empty` no-target 行不依赖 actor caption 作为 query：每个原始 UID 直接使用 parquet
+的 `grounding_query` 建立 `supervised_grounding_no_target` 的 K 次 segmentation rollout。它的 decoded-union
+empty/non-repeat reward 单独进行 GRPO advantage、log-prob 和可选 reference-KL 计算，再在同一个 optimizer
+step 与 cycle segmentation 独立累积。两类 segmentation response 可具有不同 padding 宽度，因此不拼接；
+`localization_loss_weight` 按两个 rollout batch 的样本数分配，保持它们合计仍为原配置的 segmentation
+权重，而非将 5% no-target batch 意外提升为并列 0.5 loss。
+
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
 这些文件可以是 `DIRECT_TRAIN_DATA` 的 RefCOCO 正例和可选
@@ -384,7 +406,7 @@ index 在 RefCOCO/GRES `Please segment {query} in this image.` 与 GroundingSuit
 模板之间 1:1 交替，也可由 `worker.opsd.pixel_iou.localization_prompt_mode` 统一设为
 `refcoco`、`groundingsuite` 或 `legacy`。direct batch 的 UID、优势和日志独立，正例用原始 RLE pixel IoU，不调用 cycle
 的 `R_Ci` 合并、OPSD routing、teacher regenerate 或 JSD。no-target direct GRPO 复用选定的
-`text|pixel_empty` no-target reward；后者与离线 `N_acc` 一致。火山引擎入口默认关闭 direct anchor；
+`text|official_bbox|pixel_empty` no-target reward；后者与离线 `N_acc` 一致。火山引擎入口默认关闭 direct anchor；
 开启正例时必须传 `DIRECT_TRAIN_DATA` 与 `DIRECT_BATCH_SIZE`，开启 no-target GRPO 或 SFT 时还必须传
 `DIRECT_NO_TARGET_TRAIN_DATA`。`consume_no_target_caption` 始终为 `false`，保证 direct 是对主 no-target
 caption GRPO 的附加训练。
@@ -480,16 +502,15 @@ localization positive:
 `supervised_grounding_no_target` 的正确性项。默认 `text` 保持原来的 `1.0 / 0.2 / 0.0`
 取值：响应必须含 `No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或
 `<|mt_end|>` 片段；任一完整或残缺 mask-token 都会使该项为 `0.0`。选择 opt-in
-`pixel_empty` 时，FSDP worker 对同图的每条 response 解析全部完整、codebook 合法的
+`pixel_empty` 时，主 20k no-target 行不再计算 caption reward；FSDP worker 对 segmentation rollout 的同图每条 response 解析全部完整、codebook 合法的
 depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；union
 为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）时该正确性项为 `1.0`，否则为
 `0.0`。此模式不检查 `No target.` 文本，因而与 GRES `N_acc` 的 `not pred_mask.any()` 语义一致。
 它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，
-不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。该 metadata 只在
-no-target reward 阶段有效；当 no-target caption batch 与正例 cycle caption batch 合并为主 PPO
-batch 前，trainer 必须从 `non_cycle_batch`（并对称地从 cycle 侧）移除
-`no_target_pixel_empty` 和 `no_target_reward_mode`，否则 `DataProto.concat` 会把仅存在于 no-target
-子 batch 的短数组保留为全 batch 字段而触发 batch-size 一致性断言。
+不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。该 metadata 在 segmentation
+reward/advantage 阶段消费；no-target segmentation 与正例 cycle segmentation 合并时会补齐
+cycle-only metadata，避免 `DataProto.concat` 的字段长度断言，因此该模式的梯度更新作用于
+segmenter，不作用于 captioner。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -546,7 +567,8 @@ optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` �
 
 direct-grounding 显式启用时，其 GRPO loss 在 cycle localization 后、同一次 optimizer step 前累积，权重为
 `worker.supervised_anchors.direct_grounding.loss_weight`（generic YAML 默认 `0.25`）。火山引擎入口默认关闭该外部
-supervised anchor，保证 no-target 保留原始 CycleGRPO 外层 GRPO 和两项拒识 reward。若实验显式启用 no-target direct
+supervised anchor；在默认 text/official_bbox no-target 模式下，主数据仍保留原始 CycleGRPO 外层 GRPO 和两项拒识 reward，
+而 pixel-empty 模式改为上述主 segmentation rollout。若实验显式启用 no-target direct
 group，它会额外使用独立 `K=6` group；`consume_no_target_caption=true` 已由配置校验拒绝，避免 no-target 仅依赖
 direct rollout 而在同组正确拒识相同的情况下产生零 GRPO advantage。direct query 使用人工 expression 或类别模板，属于受控外部监督，不是 image-mask-only
 CycleGRPO 的核心奖励或纯 on-policy self-distillation。
@@ -600,8 +622,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
-| `tools/multinode/launch_four_trials.sh` | 四组隔离的两节点 Ray 集群控制器；读取 Ray 地址/namespace/试验 env，在就绪超时内预检 16-GPU 集群，以导出 env 启动并记录实际 trainer launcher PID，支持查询/停止本地 trainer，不创建 SSH head/worker |
-| `tools/multinode/clusters.tsv.example` | 四组两节点 Ray 清单模板；填写平台 Ray 地址、namespace 和试验 env 文件 |
+| `tools/multinode/launch_four_trials.sh` / `tools/multinode/launch_four_cycle_trials.sh` | 四组纯 20k 两节点 Ray controller；读取 Ray 地址/namespace/试验 env，在就绪超时内预检每组 16 Ray GPU，以导出 env 启动并记录实际 trainer launcher PID；后者是面向用户的明确 pure-cycle 入口，不创建 SSH head/worker |
+| `tools/multinode/clusters.tsv.example` | 纯自监督四组两节点 Ray 清单模板；填写平台 Ray 地址、namespace 和试验 env 文件 |
+| `tools/multinode/launch_four_supervised_trials.sh` | 四组混合任务 controller；按 env 预检 2x8 或 1x7 Ray GPU 拓扑，仅 judge-enabled trial 在物理 GPU 7 启动本机 Llama，并支持 launch/status/stop 与 dry-run |
+| `tools/multinode/supervised_clusters.tsv.example` | 混合四组清单模板；无 judge 行使用 `-`，其余填写本机 Llama URL、Ray 地址/namespace 和 env 文件 |
+| `tools/multinode/local_llama_judge.py` / `tools/multinode/llama3_chat_template.jinja` | 在预期数量的 Ray 节点上用 CPU-only node-affine detached actor 管理 GPU 7 的本机 Llama vLLM；当前有监督 controller 要求单节点，健康检查要求 `/v1/models` 包含指定 served model，模板固定 Llama-3.1 对话格式 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
@@ -651,8 +676,9 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式连接平台两节点 16 训练卡 Ray cluster 的 OPSD 入口；多机模式验证 `2 nodes / >=16 training GPUs`，并保留 judge-enabled 辅助实验的 7-GPU 兼容分支；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 和 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
-| `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计两节点 H20 试验模板；当前 GPU 0--7 全部训练、统一为 `128/156/256`，分别测试 official/refcoco prompt 与 first/union decode |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式连接平台 1 或 2 节点 Ray cluster 的 OPSD 入口；pure controller 使用 `2 nodes / >=16 training GPUs`，有监督 controller 使用 `1 node / >=7 training GPUs`、`NUM_GPUS=7` 和本机 GPU 7 judge；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 与 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计纯 20k 两节点 H20 模板；GPU 0--7 全部训练、统一 `128/156/256`，分别测试 official/refcoco prompt 与 first/union decode |
+| `experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env` | 四个混合任务 env：pixel-empty 20k、pixel-empty 70k（bs112/direct+CE+DLC-QA/7+1）、official-bbox 20k 和 official source-aware prompt 20k；20k 使用单节点 8 GPU、batch 128/156 step，70k 使用 1x7+GPU7 Llama、batch 112/178 step，均保持 G=K=6 与 response 256 |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -768,9 +794,18 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 25. **类别模板不是人工 referring expression。** `include_label_sources=true` 只允许 COCO-Stuff 的完整 semantic category mask 使用 `the {label}`，以及 PACO v1 的同图 parent-category part union 使用 `the visible parts of the {parent}`。它不得使用 COCO 五条全图 caption 直接配对 region mask，也不得把 PACO 的 parent object category 伪装成未提供的细粒度 part label。该开关是额外的 label-template direct grounding 消融，实验报告必须与 RefCOCO/gRefCOCO 人工 expression anchor 分开说明。
 26. **正例 segmentation 的 mask 解码可配置。** 在线 CycleGRPO 与 direct reward 默认记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。通过 `MASK_DECODE_MODE=first_mask` 可以恢复原始训练时只解码第一个合法 group 的语义；`union` 是当前默认值。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。训练解码模式必须与离线评测协议单独记录，不能混合比较。
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
-28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。该模式强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL 与 caption safety，防止 20k 主流混入任一辅助描述或分割监督。
+28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。`THREE_STREAM_2_4_1_ENABLED=true` 是旧的严格纯三流模式，会强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL 与 caption safety；当前有监督多机 sweep 不开启该 flag，而是让 controller 校验相同的 2:4:1 配额，以保留 v1/v2 routing、EMA teacher 和 teacher diagnosis。
 29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
-30. **四组两节点训练必须资源隔离。** 平台需预先创建四个独立的两节点 Ray 集群，每个提供 16 张 GPU；`tools/multinode/launch_four_trials.sh` 的 TSV 恰有四行且只填写 `trial_id`、`ray_address`、`ray_namespace`、`experiment_env`。当前纯自监督 env 设置 `NUM_GPUS=8`，每个节点 GPU 0--7 全部训练，单 trial 为 `2 x 8=16` 张卡，四组共 64 张训练卡且不启动 judge。控制器不执行 SSH、`ray start` 或 `ray stop`，也不设置 `NCCL_SOCKET_IFNAME`；它在 `RAY_READY_TIMEOUT_SECONDS` 内通过 Ray API 验证集群、以 `set -a` 导出每个 env 文件中的变量后启动 trainer，并由记录实际 launcher PID 的 `status`/`stop` 管理本地进程。`RAY_NAMESPACE` 会传给 `ray.init`，隔离每个 cluster 上的 driver/actor 命名空间。复制 `tools/multinode/clusters.tsv.example` 为实际清单，填入平台提供的四个 Ray 地址和 namespace 后使用 `launch`；`--dry-run` 只打印 Ray 检查和训练命令。
+30. **混合四组多机试验必须使用五列清单与动态资源契约。** `launch_four_supervised_trials.sh` 的每行是
+`trial_id`、`ray_address`、`ray_namespace`、`head_judge_base_url`、`experiment_env`；无 DLC-QA 的 20k 行将
+judge URL 填为 `-`。pixel-empty 20k、official-bbox 20k 和 official source-aware prompt 20k 均要求单节点、
+8 Ray GPU（GPU 0--7 全训练），不启动 Llama；70k 混合任务要求一台节点、7 Ray GPU（GPU 0--6），
+并由 node-affine actor 在 GPU 7 启动 Llama，GPU 8--31 不使用。controller 从 env 读取 `NNODES`、`NUM_GPUS`、
+`LOCAL_JUDGE_ENABLED`，按实际拓扑预检 Ray、只对 judge-enabled 行执行 judge start/status/stop，并将 env
+完整导出给 trainer。20k 任务保持 batch 128、156 step、G=K=6、response 256；70k 任务消费 20k cycle、
+30k direct RefCOCO、10k no-target 和 10k DLC-QA，使用 batch `112/224/56`、178 step、pixel-empty、
+direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller 不执行 SSH、`ray start`、`ray stop`
+或 NCCL 网卡配置。真实启动前应执行 `launch --dry-run`，确认每个 trial 的节点/GPU/judge 分支。
 
 ## 7. 修改代码时的文档维护规则
 
@@ -1762,3 +1797,100 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 - 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/main.py`、
   `bash -n tools/multinode/launch_four_trials.sh`、四个 env 的 `bash -n`、`launch/status/stop --dry-run`
   及 `git diff --check`；本机未连接真实两节点 Ray 集群，尚未执行 16-GPU smoke training。
+
+### 2026-08-30 - 拆分纯自监督与 70k 有监督四组多机控制器
+
+- 代码：新增 `tools/multinode/launch_four_cycle_trials.sh`、
+  `tools/multinode/launch_four_supervised_trials.sh`、`tools/multinode/supervised_clusters.tsv.example`、
+  `tools/multinode/local_llama_judge.py`、`tools/multinode/llama3_chat_template.jinja` 和
+  `projects/rl/experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env`。
+- 文档：更新第 2.2、5.1、5.3、6 节与本变更日志，区分两套 controller、清单格式、数据/超参数与 `8` 对 `7+1`
+  的 GPU 拓扑。
+- 行为：纯 20k 的 `launch_four_cycle_trials.sh` 是现有 16-training-GPU controller 的明确入口，继续使用
+  四列清单和 `128/156/256` 的 prompt/decode 矩阵。新增的 supervised controller 使用独立五列清单和四个
+  70k 三流 env：每 trial 两节点、每节点 7 张 Ray 训练 GPU，batch 为 `112/224/56`、178 step、response 256；
+  每节点物理 GPU 7 由 CPU-only node-affine detached Ray actor 启动的 Llama vLLM 独占。DLC-QA 指向清单指定的
+  head judge URL；所有本机及由提交端访问的 head judge `/v1/models` 健康检查还必须匹配
+  `LOCAL_JUDGE_SERVED_MODEL_NAME`，避免错误复用已有服务。该 node-local judge 方案不改变 CycleGRPO、direct GRPO、direct CE、DLC-QA reward 或优化公式。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/multinode/local_llama_judge.py`，对两个
+  controller 与全部八个 env 执行 `bash -n`，执行两类 controller 的 `launch/status/stop --dry-run` 和
+  `git diff --check`；本机未连接实际 Ray/H20/vLLM，未运行 14-world-size 或四 trial 并发 smoke test。
+
+### 2026-08-30 - 重设四个有监督多机 trial 为 CE、batch 与累计剂量消融
+
+- 代码：修改 `projects/rl/experiments/multinode/supervised_trial_01.env` 至
+  `supervised_trial_04.env`；未修改训练实现、数据加载、reward 或 controller。
+- 文档：更新第 2.2、5.3、6 节及本变更日志，记录固定配置和四个受控变量。
+- 行为：四个 trial 固定 70k 数据、`current + mixed localization prompt + union`、`G=K=6` 和
+  response 256。trial 01 为 `bs112/178-step, CE=0.005`；trial 02 为 `bs28/714-step, CE=0.02`；trial 03
+  为 `bs28/714-step, CE=0.005` 且只对正例 direct mask CE，no-target 继续仅接受 direct GRPO；trial 04 为
+  `bs28/714-step, CE=0.005`，direct GRPO/DLC-QA loss 从 `0.15/1.0` 缩至 `0.0375/0.25`，近似匹配
+  bs112/178 baseline 的累计辅助剂量。28-batch 的 warmup 设为 `40--120`，对应 112-batch 的 `10--30`
+  训练进度比例。
+- 验证：对四个 supervised env 执行 `bash -n`，运行 supervised controller 的
+  `launch/status/stop --dry-run`，并执行 `git diff --check`；未连接真实 Ray/H20/vLLM，未进行训练。
+
+### 2026-08-30 - 有监督多机 sweep 恢复 v1/v2 routing 与诊断监督
+
+- 代码：修改 `tools/multinode/launch_four_supervised_trials.sh` 和
+  `projects/rl/experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env`。
+- 文档：更新第 2.2、5.3、6 节及本变更日志，修正此前错误的“关闭 routing”表述。
+- 行为：四个 70k trial 均固定 `ROUTING_ENABLED=true`、`EMA_TEACHER_ENABLED=true`、
+  `TEACHER_ANALYSIS_ENABLED=true` 与 `PRESERVE_ORIGINAL_GRPO=true`，保持历史 v1/v2 的 teacher-routing
+  和诊断监督路径。controller 在 launch/status/stop 解析 env 时强制检查前三个开关；任一开关退化为 false
+  会在启动前失败。`THREE_STREAM_2_4_1_ENABLED=false` 仅用于避开该旧严格模式对 routing 的互斥要求，
+  controller 仍强制 main/direct/DLC-QA parent batch 的实际比例为 `2:4:1`。
+- 验证：执行 supervised controller 与四个 env 的 `bash -n`、`launch/status/stop --dry-run` 及
+  `git diff --check`；未连接真实 Ray/H20/vLLM，未启动训练。
+
+### 2026-08-30 - 将有监督 sweep 改为单 32-GPU 节点的 7+1 拓扑
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `tools/multinode/launch_four_supervised_trials.sh`、`tools/multinode/local_llama_judge.py` 和
+  `tools/multinode/supervised_clusters.tsv.example`。
+- 文档：更新第 2.2、3.2、5.1、5.3、6 节及本变更日志。
+- 行为：四个 70k 有监督 trial 不再由两节点 14-world-size Ray 集群运行；每个 trial 改为一台独占的
+  32-GPU 节点上的 7-world-size Ray 集群。控制器要求恰有 1 个 alive Ray node 和 7 张已登记 Ray GPU，
+  trainer 以 `MULTINODE_ENABLED=true, NNODES=1, NUM_GPUS=7` 连接该集群。物理 GPU 0--6 用于训练、GPU 7
+  由单个 node-affine Llama judge actor 使用，GPU 8--31 不被本 trial 调度。训练入口的显式 Ray attach
+  模式现在接受 `NNODES=1|2`；纯 20k 两节点 controller 行为不变。对 7 个 rank，batch `112/224/56`
+  对应每 rank `16/32/8` parent prompt，`28/56/14` 对应 `4/8/2`；2:4:1、routing 和所有四组 loss
+  消融语义不变。
+- 验证：执行训练入口、supervised controller 和四个 env 的 `bash -n`，执行 supervised controller 的
+  `launch/status/stop --dry-run`、`local_llama_judge.py` 无缓存语法编译及 `git diff --check`；未连接
+  真实 Ray/H20/vLLM，未启动训练。
+
+### 2026-08-30 - 将 pixel-empty no-target reward 移入主 segmentation rollout
+
+- 代码：修改 `verl/trainer/ray_trainer.py`；未新增、移动或删除模块。
+- 行为：`NO_TARGET_REWARD_MODE=pixel_empty` 时，主 20k `gres_no_target` 行从外层 caption batch
+  移除，按原始 `grounding_query` 每个 UID 建立标准 segmentation rollout，并以
+  `supervised_grounding_no_target` source 使用 decoded-union 空 mask + non-repeat reward 计算
+  segmentation GRPO advantage。该梯度只更新 segmentation policy，不再更新 caption policy；
+  `text` 与 `official_bbox` 模式保持原 caption 分支行为。不同响应长度的 cycle/no-target segmentation
+  batch 不拼接，而是在同一 optimizer step 独立累积并按样本数分配 segmentation loss weight。
+- 文档：更新第 3.3、3.4、3.5 节，说明 pixel-empty 的新数据流、reward 生命周期和梯度归属；模块清单无变化。
+- 验证：执行 AST 语法解析、`git diff --check`；本机无 PyTorch/Ray/CUDA，未执行 GPU rollout smoke test，
+  服务器需用 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1` 验证 no-target segmentation 计数和 reward 指标。
+
+### 2026-08-30 - 将有监督多机控制器改为四组混合多任务实验
+
+- 代码：修改 `tools/multinode/launch_four_supervised_trials.sh`、`tools/multinode/supervised_clusters.tsv.example`、
+  `projects/rl/experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env`；未新增、移动或删除模块。
+- 行为：原有监督 controller 现在按每个 env 动态支持单节点 8-GPU 纯自监督或单节点 7-GPU+GPU7 Llama
+  有监督拓扑；不再强制四组都启动 judge。四组分别运行 pixel-empty 20k 自监督、pixel-empty 70k
+  （20k+30k+10k+DLC-QA，bs112，direct GRPO/CE/DLC-QA 全开）、official-bbox no-target 20k 自监督和
+  official source-aware prompt 的 pixel-empty 20k 自监督；20k 任务均 batch 128、156 step、G=K=6、response 256。
+- 文档：同步更新第 2.2、5.1、5.3 节和模块职责，说明清单中无 judge 使用 `-`，以及四组资源/数据契约。
+- 验证：执行四个 env 与 controller 的 `bash -n`、混合清单 `launch/status/stop --dry-run` 和
+  `git diff --check`；dry-run 确认三组使用 1 节点/8 GPU 且不启动 judge，70k 组使用 1 节点/7 GPU
+  并绑定 GPU 7 judge；未连接真实 Ray/H20 集群，未启动训练或 Llama 服务。
+
+### 2026-08-31 - 将混合多任务四组统一限制为单节点 8 卡
+
+- 代码：修改 `projects/rl/experiments/multinode/supervised_trial_01.env`、`supervised_trial_03.env`、
+  `supervised_trial_04.env` 和 `tools/multinode/supervised_clusters.tsv.example`；未修改训练算法或数据。
+- 行为：三个 20k 自监督任务的 `NNODES` 从 2 改为 1，仍由 Ray 登记 GPU 0--7、batch 128、156 step；
+  70k 任务保持单节点 7 卡训练并在 GPU 7 启动 Llama，因此每个任务物理最多使用 8 张卡。
+- 验证：执行四个 env 与 controller 的 `bash -n`、混合清单 `launch --dry-run`、确认 4 个 Ray 检查和仅 1 个
+  judge 启动命令，并通过 `git diff --check`；未连接真实 Ray/H20 集群。

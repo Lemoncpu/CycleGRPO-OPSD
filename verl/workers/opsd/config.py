@@ -19,8 +19,9 @@ class PixelIoUConfig:
     # ``mixed`` alternates RefCOCO and GroundingSuite wording. ``refcoco`` uses
     # the RefCOCO instruction for every image localization prompt.
     localization_prompt_mode: str = "mixed"
-    # ``text`` preserves the historical refusal proxy. ``pixel_empty`` uses
-    # the decoded SAMTok union, matching offline GRES N_acc semantics.
+    # ``text`` preserves the SAMTok refusal proxy. ``official_bbox`` matches
+    # public CycleGRPO's bbox-format proxy. ``pixel_empty`` uses the decoded
+    # SAMTok union, matching offline GRES N_acc semantics.
     no_target_reward_mode: str = "text"
 
     def post_init(self):
@@ -39,9 +40,10 @@ class PixelIoUConfig:
                 "pixel_iou.localization_prompt_mode must be one of "
                 "{'mixed', 'refcoco', 'groundingsuite', 'legacy'}."
             )
-        if self.no_target_reward_mode not in {"text", "pixel_empty"}:
+        if self.no_target_reward_mode not in {"text", "official_bbox", "pixel_empty"}:
             raise ValueError(
-                "pixel_iou.no_target_reward_mode must be one of {'text', 'pixel_empty'}."
+                "pixel_iou.no_target_reward_mode must be one of "
+                "{'text', 'official_bbox', 'pixel_empty'}."
             )
 
 

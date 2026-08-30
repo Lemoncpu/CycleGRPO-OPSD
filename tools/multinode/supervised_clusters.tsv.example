@@ -1,0 +1,8 @@
+# trial_id	ray_address	ray_namespace	head_judge_base_url	experiment_env
+# Use '-' for trials without DLC-QA/Llama. Pure 20k trials require a
+# platform-provided one-node, 8-GPU Ray cluster; the 70k trial advertises seven
+# Ray GPUs and reserves physical GPU 7 for its local judge.
+trial_pixel_empty	ray-head-01:6379	mixed-pixel-empty	-	projects/rl/experiments/multinode/supervised_trial_01.env
+trial_supervised_70k	ray-head-02:6379	mixed-supervised-70k	http://ray-head-02:8007/v1	projects/rl/experiments/multinode/supervised_trial_02.env
+trial_official_bbox	ray-head-03:6379	mixed-official-bbox	-	projects/rl/experiments/multinode/supervised_trial_03.env
+trial_official_prompt	ray-head-04:6379	mixed-official-prompt	-	projects/rl/experiments/multinode/supervised_trial_04.env

@@ -2,7 +2,7 @@
 
 import unittest
 
-from projects.rl.reward_function.text2mask import no_target_check
+from projects.rl.reward_function.text2mask import no_target_check, no_target_check_bbox, no_target_reward_score
 
 
 class NoTargetRewardTest(unittest.TestCase):
@@ -22,6 +22,23 @@ class NoTargetRewardTest(unittest.TestCase):
         for response in responses:
             with self.subTest(response=response):
                 self.assertEqual(no_target_check(response, "No target."), 0.0)
+
+    def test_official_bbox_proxy_matches_public_cyclegrpo(self):
+        self.assertEqual(no_target_check_bbox("<answer>No target.</answer>", "No target."), 1.0)
+        self.assertEqual(no_target_check_bbox("I cannot identify the object.", "No target."), 0.2)
+        self.assertEqual(
+            no_target_check_bbox("<answer>No target.</answer> [1, 2, 3, 4]", "No target."),
+            0.0,
+        )
+
+    def test_official_bbox_mode_is_selectable(self):
+        score = no_target_reward_score(
+            {
+                "response": "<answer>No target.</answer><|mt_start|><|mt_0003|><|mt_0331|><|mt_end|>",
+                "no_target_reward_mode": "official_bbox",
+            }
+        )
+        self.assertEqual(score, 1.0)
 
 
 if __name__ == "__main__":
