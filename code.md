@@ -381,6 +381,9 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
    每条 localization rollout 的生成上限由 `pixel_iou.segmentation_max_response_tokens` 控制（当前默认
    `256`，可显式设置为历史 `32`）；合法的多个 mask group 是否共同表示一个区域由
    `pixel_iou.mask_decode_mode` 控制。这不改变 caption rollout 上限、`K` 或 no-target 拒识生成。
+   当 parent 子批量不足 world size 时，输入 prompt 会临时补齐；生成结果去除补齐 response 后，展开的
+   UID、`localization_index`、source 等元数据严格按未补齐 prompt 数量构造，并检查输出为
+   `prompt_count × K`，避免 padding 后数量残留造成 DataProto 一致性错误。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
 6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
@@ -1908,3 +1911,13 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文档：更新第 3.4 节，说明总数据量与每 step 子批量的区别及 padding 生命周期。
 - 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 和
   `git diff --check`；未执行 GPU/Ray rollout smoke test。
+
+### 2026-08-31 - 修复 pixel-empty rollout 元数据错位
+
+- 代码：修改 `verl/trainer/ray_trainer.py`；未新增、移动或删除模块。
+- 行为：segmentation rollout 的输入 padding 在生成后已移除，但元数据展开仍误用 padding 后的 prompt
+  数量，导致 `localization_index` 等 non-tensor 字段与 response tensor batch 不一致。现在统一使用未补齐
+  的原始 prompt 数量，并在构造元数据前检查输出恰为 `prompt_count × K`；不一致时立即报告明确错误。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 与
+  `git diff --check`；未连接真实 Ray/CUDA，需服务器用 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1`
+  复跑 no-target segmentation smoke test。

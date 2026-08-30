@@ -950,7 +950,14 @@ class RayPPOTrainer:
         # Aggregate mask_token_accuracy and format_correct from gen_batch_output to batch
         # gen_batch_output has n_prompts * n_samples results, aggregate to n_prompts
         n_samples = self.config.worker.rollout.n  # 32
-        n_prompts = len(gen_batch)
+        n_prompts = len(gen_seg_batch)
+        expected_output_size = n_prompts * n_samples
+        if len(gen_batch_output) != expected_output_size:
+            raise RuntimeError(
+                "segmentation rollout size mismatch after padding: "
+                f"got {len(gen_batch_output)} responses, expected "
+                f"{expected_output_size} ({n_prompts} prompts x {n_samples} rollouts)."
+            )
         
         # Add uid to gen_batch_output: repeat each uid n_samples times to match the expanded batch size
         gen_batch_output.non_tensor_batch['uid'] = np.repeat(gen_seg_batch.non_tensor_batch["uid"], n_samples)
