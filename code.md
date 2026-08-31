@@ -509,9 +509,17 @@ localization positive:
 取值：响应必须含 `No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或
 `<|mt_end|>` 片段；任一完整或残缺 mask-token 都会使该项为 `0.0`。选择 opt-in
 `pixel_empty` 时，主 20k no-target 行不再计算 caption reward；FSDP worker 对 segmentation rollout 的同图每条 response 解析全部完整、codebook 合法的
-depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；union
-为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）时该正确性项为 `1.0`，否则为
-`0.0`。此模式不检查 `No target.` 文本，因而与 GRES `N_acc` 的 `not pred_mask.any()` 语义一致。
+depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；仅当 union
+为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）**且** response 以大小写不敏感的精确
+`No target.` 短语显式拒识时，该正确性项才为 `1.0`，否则为 `0.0`。因此 `null`、普通解释、空回复或仅 EOS
+即使没有 mask 也不会得到 pixel-empty 奖励；`<answer>No target.</answer>` 仍是合法拒识格式。该训练奖励比
+GRES `N_acc` 的单独 `not pred_mask.any()` 更严格，目的是避免模型以空生成钻取 reward 空子集。
+`worker.opsd.no_target_segmentation_loss_weight`（入口环境变量
+`NO_TARGET_SEGMENTATION_LOSS_WEIGHT`）进一步只缩放这个主 `pixel_empty` no-target segmentation
+batch 的 actor loss，默认 `1.0` 保持历史按 rollout 数量分配的梯度。设为 `0.25` 时，cycle segmentation、caption
+及所有 auxiliary loss 的权重不变，而 no-target 分支的既有 effective weight 再乘 `0.25`；不要试图通过缩放
+no-target reward 达到同样目的，因为 GRPO 对每个 rollout group 标准化 advantage。日志同时记录
+`opsd/main_no_target_segmentation_loss_weight_{target,base,effective}`。
 它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，
 不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。该 metadata 在 segmentation
 reward/advantage 阶段消费；no-target segmentation 与正例 cycle segmentation 合并时会补齐
@@ -1921,3 +1929,17 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 与
   `git diff --check`；未连接真实 Ray/CUDA，需服务器用 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1`
   复跑 no-target segmentation smoke test。
+
+### 2026-09-01 - 收紧 pixel-empty no-target 拒识奖励
+
+- 代码：修改 `verl/workers/opsd/mask_iou.py`、`verl/workers/fsdp_workers.py` 与 `tests/test_opsd_core.py`；未新增、移动或删除模块。
+- 文档：更新第 3.5 节 pixel-empty reward 语义及本日志；模块清单无变化。
+- 行为：`pixel_empty` 不再只因 decoded union 为空就给分。现在每条 segmentation rollout 必须同时包含大小写不敏感的精确 `No target.` 拒识短语，并解码为零像素 union，才得到 `1.0`；任何 nonempty mask、`null`、自由文本、空输出或仅 EOS 都得到 `0.0`。`text` 和 `official_bbox` reward 模式未改变。此为当前训练实现相对 GRES 单独 empty-mask N-acc 更严格的约束。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/opsd/mask_iou.py verl/workers/fsdp_workers.py tests/test_opsd_core.py` 与 `git diff --check` 通过；本机执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_opsd_core` 时因未安装 `torch` 无法导入。未执行 GPU/Ray rollout，服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1` 检查 no-target segmentation reward 不再为普通空输出给分。
+
+### 2026-09-01 - 参数化主 pixel-empty no-target segmentation loss
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/trainer/ray_trainer.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `tests/test_opsd_core.py`；未新增、移动或删除模块。
+- 文档：更新第 3.5 节 pixel-empty reward/loss 边界及本日志；模块清单无变化。
+- 行为：新增 `worker.opsd.no_target_segmentation_loss_weight` / `NO_TARGET_SEGMENTATION_LOSS_WEIGHT`，默认 `1.0` 完全保留既有 sample-proportional no-target gradient。设置 `0.25` 时，仅主 20k pixel-empty no-target segmentation actor loss 在现有 effective weight 上再乘 `0.25`，不改变 reward、组内 GRPO advantage、cycle segmentation、caption 或 auxiliary loss；双任务与 segmenter-only 更新路径均适用。日志新增 target/base/effective no-target 权重，负值在配置校验时拒绝。
+- 验证：受影响 Python 文件通过无缓存 AST 语法解析，`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_opsd_core` 时因未安装 `torch` 无法导入。服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty NO_TARGET_SEGMENTATION_LOSS_WEIGHT=0.25 MAX_STEPS=1` 检查 effective weight 为历史值的四分之一。

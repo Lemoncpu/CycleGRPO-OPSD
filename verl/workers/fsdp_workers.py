@@ -1792,7 +1792,7 @@ class FSDPWorker(Worker):
                 decode_mode=pixel_config.mask_decode_mode,
             )
             for data_index, prediction in zip(indices, decoded):
-                rewards[data_index] = pixel_empty_reward(prediction)
+                rewards[data_index] = pixel_empty_reward(prediction, responses[data_index])
 
         data.non_tensor_batch["no_target_pixel_empty"] = rewards
         data.non_tensor_batch["no_target_reward_mode"] = np.full(

@@ -80,6 +80,9 @@ worker:
     localization_rollouts: 6
     caption_loss_weight: 0.5
     localization_loss_weight: 0.5
+    # Multiplies only the main pixel-empty no-target segmentation loss.
+    # Keep 1.0 for historical behavior; use 0.25 to reduce false-refusal pressure.
+    no_target_segmentation_loss_weight: 1.0
     caption_anchor_kl_coef: 0.0
     caption_anchor_kl_all_safe_routes: false
     segmentation_anchor_kl_coef: 0.0

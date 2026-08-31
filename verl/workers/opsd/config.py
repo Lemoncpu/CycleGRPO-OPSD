@@ -170,6 +170,9 @@ class OPSDConfig:
     localization_rollouts: int = 6
     caption_loss_weight: float = 0.5
     localization_loss_weight: float = 0.5
+    # Scale only the main-parquet pixel-empty no-target segmentation gradient.
+    # One preserves the historical sample-proportional loss weighting.
+    no_target_segmentation_loss_weight: float = 1.0
     caption_anchor_kl_coef: float = 0.0
     caption_anchor_kl_all_safe_routes: bool = False
     segmentation_anchor_kl_coef: float = 0.0
@@ -190,6 +193,8 @@ class OPSDConfig:
             raise ValueError("OPSD task loss weights must be non-negative.")
         if self.caption_loss_weight + self.localization_loss_weight <= 0:
             raise ValueError("At least one OPSD task loss weight must be positive.")
+        if self.no_target_segmentation_loss_weight < 0:
+            raise ValueError("no_target_segmentation_loss_weight must be non-negative.")
         if self.caption_anchor_kl_coef < 0:
             raise ValueError("caption_anchor_kl_coef must be non-negative.")
         if self.segmentation_anchor_kl_coef < 0:

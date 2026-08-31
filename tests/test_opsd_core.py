@@ -103,6 +103,12 @@ class OPSDCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
             OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
 
+    def test_no_target_segmentation_loss_weight_defaults_to_one_and_rejects_negative_values(self):
+        self.assertEqual(OPSDConfig().no_target_segmentation_loss_weight, 1.0)
+        OPSDConfig(no_target_segmentation_loss_weight=0.25).post_init()
+        with self.assertRaisesRegex(ValueError, "no_target_segmentation_loss_weight"):
+            OPSDConfig(no_target_segmentation_loss_weight=-0.01).post_init()
+
     def test_no_target_reward_mode_validation(self):
         self.assertEqual(PixelIoUConfig().no_target_reward_mode, "text")
         self.assertEqual(PixelIoUConfig().mask_decode_mode, "union")
@@ -124,10 +130,15 @@ class OPSDCoreTest(unittest.TestCase):
                 )
             ).post_init()
 
-    def test_pixel_empty_reward_matches_empty_union_semantics(self):
-        self.assertEqual(pixel_empty_reward(None), 1.0)
-        self.assertEqual(pixel_empty_reward(torch.zeros((2, 2), dtype=torch.bool)), 1.0)
-        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]])), 0.0)
+    def test_pixel_empty_reward_requires_refusal_and_empty_union(self):
+        self.assertEqual(pixel_empty_reward(None, "No target."), 1.0)
+        self.assertEqual(
+            pixel_empty_reward(torch.zeros((2, 2), dtype=torch.bool), "<answer>No target.</answer>"), 1.0
+        )
+        self.assertEqual(pixel_empty_reward(None, "No target"), 0.0)
+        self.assertEqual(pixel_empty_reward(None, "null"), 0.0)
+        self.assertEqual(pixel_empty_reward(None, "I cannot identify the object."), 0.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), 0.0)
 
     def test_no_target_reward_score_uses_decoded_union_when_requested(self):
         response = "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>"

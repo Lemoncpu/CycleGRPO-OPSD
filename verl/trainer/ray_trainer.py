@@ -2510,6 +2510,10 @@ class RayPPOTrainer:
                         if total_segmentation_size > 0
                         else 0.0
                     )
+                    main_no_target_seg_base_grad_weight = main_no_target_seg_grad_weight
+                    main_no_target_seg_grad_weight *= (
+                        self.config.worker.opsd.no_target_segmentation_loss_weight
+                    )
                     direct_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_target_weight = direct_config.loss_weight if direct_config.enabled else 0.0
                     direct_grad_weight = direct_grounding_loss_weight(
@@ -2531,6 +2535,12 @@ class RayPPOTrainer:
                     )
                     metrics.update(
                         {
+                            "opsd/main_no_target_segmentation_loss_weight_target": (
+                                self.config.worker.opsd.no_target_segmentation_loss_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_base": (
+                                main_no_target_seg_base_grad_weight
+                            ),
                             "opsd/main_no_target_segmentation_loss_weight_effective": (
                                 main_no_target_seg_grad_weight
                             ),
@@ -2813,6 +2823,24 @@ class RayPPOTrainer:
                         segmenter_loss_weight * current_no_target_size / current_total_seg_size
                         if current_total_seg_size > 0
                         else 0.0
+                    )
+                    main_no_target_seg_base_grad_weight = main_no_target_seg_grad_weight
+                    main_no_target_seg_grad_weight *= (
+                        self.config.worker.opsd.no_target_segmentation_loss_weight
+                    )
+                    metrics.update(
+                        {
+                            "opsd/main_no_target_segmentation_loss_weight_target": (
+                                self.config.worker.opsd.no_target_segmentation_loss_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_base": (
+                                main_no_target_seg_base_grad_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_effective": (
+                                main_no_target_seg_grad_weight
+                            ),
+                            "opsd/cycle_segmentation_loss_weight_effective": cycle_seg_grad_weight,
+                        }
                     )
                     if self.config.trainer.critic_warmup <= self.global_step:
                         self.actor_rollout_ref_wg.clear_multi_modal_cache()
