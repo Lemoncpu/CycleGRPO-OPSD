@@ -1,7 +1,9 @@
 import unittest
 
 from evaluation.mask_protocol import (
+    cyclegrpo_legacy_raw_mask_token_count,
     complete_mask_group_count,
+    parse_cyclegrpo_legacy_mask_groups,
     parse_mask_groups,
     validate_mask_protocol,
 )
@@ -45,6 +47,25 @@ class MaskProtocolTest(unittest.TestCase):
         self.assertEqual(validate_mask_protocol("legacy_union"), "legacy_union")
         with self.assertRaises(ValueError):
             validate_mask_protocol("unknown")
+
+    def test_cyclegrpo_legacy_accepts_raw_pairs_and_invalid_second_code(self):
+        response = "No target. <|mt_0007|><|mt_0268|><|mt_0008|><|mt_0999|>"
+        self.assertEqual(cyclegrpo_legacy_raw_mask_token_count(response), 4)
+        self.assertEqual(
+            parse_cyclegrpo_legacy_mask_groups(response, codebook_size=256),
+            [[7, 12], [8, -1]],
+        )
+        self.assertEqual(
+            parse_mask_groups(response, codebook_size=256, protocol="legacy_union"),
+            [],
+        )
+
+    def test_cyclegrpo_legacy_repairs_a_single_wrapped_token(self):
+        response = "<|mt_start|><|mt_0007|><|mt_end|>"
+        self.assertEqual(
+            parse_cyclegrpo_legacy_mask_groups(response, codebook_size=256),
+            [[7, -1]],
+        )
 
 
 if __name__ == "__main__":

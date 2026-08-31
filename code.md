@@ -700,7 +700,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `reward_function/tg_reward.py` | temporal grounding 可组合奖励库 |
 | `reward_function/llm_judge_reward.py` | 可选外部 vLLM caption judge；包含无图 DLC-QA option judge，不占用训练 GPU |
 
-`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。三项分割评测都接受 `MASK_PROTOCOL=legacy_union|first_mask`；默认 `legacy_union` 用完整合法 depth-2 group 的解码 union 复现历史 SAMTok baseline，`first_mask` 才会在第一个 `<|mt_end|>` 终止并只解码首组，供严格单 mask 格式实验单独报告。逐样本 JSON 会保存 `mask_protocol`，resume 时协议不同或旧结果缺失该字段会自动重新推理，禁止混合两种口径。GRES 默认标注根为服务器实际目录 `${BASE_DIR}/gRefCOCO`；也可通过 `GRES_ROOT` 覆盖。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
+`projects/eval/qwen3vl_4b_volcengine.sh` 是评测编排入口，支持 FSDP actor 导出及 RefCOCO、GroundingSuite、GRES/gRefCOCO、DLC-Bench 的服务器路径、Conda/Ray 环境隔离和输出目录约定。三项分割评测都接受 `MASK_PROTOCOL=legacy_union|first_mask`；默认 `legacy_union` 用完整合法 depth-2 group 的解码 union 复现历史 SAMTok baseline，`first_mask` 才会在第一个 `<|mt_end|>` 终止并只解码首组，供严格单 mask 格式实验单独报告。RefCOCO 额外支持仅用于与公开 CycleGRPO 脚本交叉验证的 `cyclegrpo_legacy`：它强制单样本、128-token、`skip_special_tokens=True`，按原脚本从 raw `<|mt_####|>` 片段配对、修复奇数 token，并允许第二码本无效时传入 `-1`。这不是标准 benchmark 协议，不能与 `legacy_union` 或 `first_mask` 的结果直接比较，也不提供给 GRES/GroundingSuite。逐样本 JSON 会保存 `mask_protocol`，resume 时协议不同或旧结果缺失该字段会自动重新推理，禁止混合两种口径；兼容模式另写 raw/decoded token 数和实际生成参数，必须使用新的输出目录。GRES 默认标注根为服务器实际目录 `${BASE_DIR}/gRefCOCO`；也可通过 `GRES_ROOT` 覆盖。GRES action 通过 `GRES_REFS_FILE`、`GRES_INSTANCES_FILE` 和 `GRES_IMAGE_ROOT` 指定官方标注与 COCO 图像，先生成 `gres_<split>_samples.json`，再将逐样本预测放到 `EVAL_ROOT/gres/`，最终指标写入 `EVAL_ROOT/gres_metrics.json`。
 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
@@ -767,8 +767,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 目录 | 文件职责 |
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；分割生成默认最多 256 个新 token（可通过 `GRES_MAX_NEW_TOKENS` 覆盖）；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
-| `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数和协议，协议不匹配时会重新生成 |
+| `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的严格离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS；另提供仅供 RefCOCO 调用的公开 CycleGRPO raw-token 兼容解析 helper |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。`cyclegrpo_legacy` 是单独的公开脚本兼容模式，强制 batch 1、128 token、special-token skip 与宽松 raw-token parser，不得作为标准分数和严格协议对比。其他模式每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数、协议与实际生成参数，协议不匹配时会重新生成 |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成默认上限为 256（可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 覆盖），默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
@@ -1943,3 +1943,10 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文档：更新第 3.5 节 pixel-empty reward/loss 边界及本日志；模块清单无变化。
 - 行为：新增 `worker.opsd.no_target_segmentation_loss_weight` / `NO_TARGET_SEGMENTATION_LOSS_WEIGHT`，默认 `1.0` 完全保留既有 sample-proportional no-target gradient。设置 `0.25` 时，仅主 20k pixel-empty no-target segmentation actor loss 在现有 effective weight 上再乘 `0.25`，不改变 reward、组内 GRPO advantage、cycle segmentation、caption 或 auxiliary loss；双任务与 segmenter-only 更新路径均适用。日志新增 target/base/effective no-target 权重，负值在配置校验时拒绝。
 - 验证：受影响 Python 文件通过无缓存 AST 语法解析，`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check` 通过；本机执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_opsd_core` 时因未安装 `torch` 无法导入。服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty NO_TARGET_SEGMENTATION_LOSS_WEIGHT=0.25 MAX_STEPS=1` 检查 effective weight 为历史值的四分之一。
+
+### 2026-09-01 - 增加公开 CycleGRPO RefCOCO 评测兼容协议
+
+- 代码：修改 `evaluation/mask_protocol.py`、`evaluation/refcoco/qwen3vl_refcoco_eval.py` 与 `tests/test_mask_protocol.py`；未新增、移动或删除模块。
+- 文档：更新第 2.2、5.6 节与本变更日志；模块清单无变化。
+- 行为：RefCOCO 新增仅用于交叉验证公开 CycleGRPO 脚本的 `MASK_PROTOCOL=cyclegrpo_legacy`。该模式强制 `batch_size=1`、`max_new_tokens=128`、`skip_special_tokens=True`，并完全复用公开脚本的容错规则：直接从 raw `<|mt_####|>` 配对、奇数 token 时仅从修复后的完整 wrapper 重新提取、首码本越界丢弃、第二码本越界传入 `-1`，最后解码所有保留 pair 的像素 union。它不加入共享的 `legacy_union|first_mask` 协议集合，GRES/GroundingSuite 不会接受该参数；严格模式的 EOS、解析、batch 和默认 256-token 上限均不变。RefCOCO 输出额外记录 raw/decoded token 数、实际 batch 与 token cap，且 `mask_protocol` 继续作为 resume 隔离字段；兼容评测必须使用全新的输出目录，不能与标准 RefCOCO 分数比较或混写。
+- 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_mask_protocol`（6 tests）、`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/mask_protocol.py evaluation/refcoco/qwen3vl_refcoco_eval.py tests/test_mask_protocol.py`、`bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 与 `git diff --check` 通过。本机无 CUDA、HF checkpoint、VQ-SAM2 权重或 RefCOCO assets，未进行端到端推理；服务器应以新的输出目录运行八卡 `cyclegrpo_legacy` 交叉验证。

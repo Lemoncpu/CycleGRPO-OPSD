@@ -7,6 +7,7 @@ MASK_PROTOCOLS = ("legacy_union", "first_mask")
 _MASK_GROUP_PATTERN = re.compile(
     r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>"
 )
+_RAW_MASK_TOKEN_PATTERN = re.compile(r"<\|mt_(\d{4})\|>")
 
 
 def validate_mask_protocol(protocol: str) -> str:
@@ -41,6 +42,64 @@ def parse_mask_groups(
         first, second = int(first_text), int(second_text)
         if 0 <= first < codebook_size and codebook_size <= second < 2 * codebook_size:
             groups.append([first, second - codebook_size])
+    return groups
+
+
+def cyclegrpo_legacy_raw_mask_token_count(text: str) -> int:
+    """Count raw mask tokens using the public CycleGRPO RefCOCO regex."""
+    return len(_RAW_MASK_TOKEN_PATTERN.findall(text))
+
+
+def _repair_cyclegrpo_legacy_format(text: str) -> str:
+    """Reproduce the public CycleGRPO odd-mask-token repair exactly."""
+    text = re.sub(
+        r"(<\|mt_start\|>)(<\|mt_\d+\|>)(<\|mt_\d+\|>)(?:<\|mt_\d+\|>)+<\|mt_end\|>",
+        r"\1\2\3<|mt_end|>",
+        text,
+    )
+    text = re.sub(
+        r"(<\|mt_start\|>)(<\|mt_\d+\|>)(<\|mt_end\|>)",
+        r"\1\2<|mt_9999|><|mt_end|>",
+        text,
+    )
+    return re.sub(
+        r"(<\|mt_start\|>)(<\|mt_\d+\|>)(?!<\|mt_)",
+        r"\1\2<|mt_9999|><|mt_end|>",
+        text,
+    )
+
+
+def parse_cyclegrpo_legacy_mask_groups(text: str, *, codebook_size: int) -> list[list[int]]:
+    """Parse masks exactly as the public CycleGRPO RefCOCO evaluator does.
+
+    This intentionally accepts bare ``mt`` token pairs and uses the original
+    odd-token repair before falling back to ``-1`` for an invalid second code.
+    It is a RefCOCO compatibility helper, not a generic evaluation protocol.
+    """
+    quant_ids = [int(value) for value in _RAW_MASK_TOKEN_PATTERN.findall(text)]
+    if not quant_ids:
+        return []
+    if len(quant_ids) % 2:
+        repaired = _repair_cyclegrpo_legacy_format(text)
+        quant_ids = [
+            int(value)
+            for match in _MASK_GROUP_PATTERN.findall(repaired)
+            for value in match
+        ]
+    if len(quant_ids) % 2:
+        return []
+
+    groups = []
+    for first, second in zip(quant_ids[::2], quant_ids[1::2]):
+        if not 0 <= first < codebook_size:
+            continue
+        remapped_second = second - codebook_size
+        groups.append(
+            [
+                first,
+                remapped_second if 0 <= remapped_second < codebook_size else -1,
+            ]
+        )
     return groups
 
 

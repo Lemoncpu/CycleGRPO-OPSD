@@ -17,8 +17,10 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from evaluation.mask_protocol import (
     MASK_PROTOCOLS,
+    cyclegrpo_legacy_raw_mask_token_count,
     complete_mask_group_count,
     generation_eos_token_id,
+    parse_cyclegrpo_legacy_mask_groups,
     parse_mask_groups,
 )
 from projects.transformers.vq_sam2 import SAM2Config, VQ_SAM2, VQ_SAM2Config
@@ -30,6 +32,10 @@ class DirectResize:
 
     def apply_image(self, image: np.ndarray) -> np.ndarray:
         return np.array(to_pil_image(image, mode="RGB").resize((self.target_length, self.target_length)))
+
+
+CYCLEGRPO_LEGACY_PROTOCOL = "cyclegrpo_legacy"
+REFCOCO_MASK_PROTOCOLS = (*MASK_PROTOCOLS, CYCLEGRPO_LEGACY_PROTOCOL)
 
 
 def parse_args():
@@ -45,7 +51,7 @@ def parse_args():
     parser.add_argument("--num_tasks", type=int, default=1)
     parser.add_argument("--gpu_id", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--mask_protocol", choices=MASK_PROTOCOLS, default="legacy_union")
+    parser.add_argument("--mask_protocol", choices=REFCOCO_MASK_PROTOCOLS, default="legacy_union")
     parser.add_argument(
         "--max_new_tokens",
         type=int,
@@ -113,6 +119,8 @@ def load_samples(root: str, split_by: str, split: str) -> list[dict]:
 
 
 def parse_mask_codes(text: str, mask_protocol: str) -> list[list[int]]:
+    if mask_protocol == CYCLEGRPO_LEGACY_PROTOCOL:
+        return parse_cyclegrpo_legacy_mask_groups(text, codebook_size=256)
     return parse_mask_groups(text, codebook_size=256, protocol=mask_protocol)
 
 
@@ -179,10 +187,18 @@ def main():
     all_samples = load_samples(args.refcoco_root, args.split_by, args.split)
     per_task = math.ceil(len(all_samples) / args.num_tasks)
     samples = all_samples[args.task_id * per_task : min((args.task_id + 1) * per_task, len(all_samples))]
+    cyclegrpo_legacy = args.mask_protocol == CYCLEGRPO_LEGACY_PROTOCOL
+    effective_batch_size = 1 if cyclegrpo_legacy else args.batch_size
+    effective_max_new_tokens = 128 if cyclegrpo_legacy else args.max_new_tokens
     print(
         f"[task {args.task_id}/{args.num_tasks}] evaluating {len(samples)} RefCOCO samples "
-        f"on {device} with batch_size={args.batch_size}, mask_protocol={args.mask_protocol}."
+        f"on {device} with batch_size={effective_batch_size}, mask_protocol={args.mask_protocol}."
     )
+    if cyclegrpo_legacy:
+        print(
+            "Using public CycleGRPO compatibility mode: forcing batch_size=1, "
+            "max_new_tokens=128, skip_special_tokens=True, and permissive raw mt parsing."
+        )
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(args.model_path, torch_dtype="auto").to(device).eval()
     processor = AutoProcessor.from_pretrained(args.model_path)
@@ -205,9 +221,9 @@ def main():
             os.path.join(args.save_dir, f"{sample['case_id']}.json"), args.mask_protocol
         )
     ]
-    eos_token_id = generation_eos_token_id(model, processor, args.mask_protocol)
+    eos_token_id = None if cyclegrpo_legacy else generation_eos_token_id(model, processor, args.mask_protocol)
 
-    for sample_batch in batched(pending, args.batch_size):
+    for sample_batch in batched(pending, effective_batch_size):
         messages = [
             [
                 {
@@ -231,7 +247,7 @@ def main():
         with torch.no_grad():
             generation_kwargs = dict(
                 **inputs,
-                max_new_tokens=args.max_new_tokens,
+                max_new_tokens=effective_max_new_tokens,
                 do_sample=False,
             )
             if eos_token_id is not None:
@@ -239,7 +255,7 @@ def main():
             generated = model.generate(**generation_kwargs)
         responses = processor.batch_decode(
             generated[:, inputs.input_ids.shape[1] :],
-            skip_special_tokens=False,
+            skip_special_tokens=cyclegrpo_legacy,
             clean_up_tokenization_spaces=False,
         )
 
@@ -264,6 +280,10 @@ def main():
                         "response": response,
                         "mask_protocol": args.mask_protocol,
                         "mask_group_count": complete_mask_group_count(response),
+                        "raw_mask_token_count": cyclegrpo_legacy_raw_mask_token_count(response),
+                        "decoded_mask_group_count": len(codes),
+                        "generation_batch_size": effective_batch_size,
+                        "max_new_tokens": effective_max_new_tokens,
                     },
                     file,
                 )
