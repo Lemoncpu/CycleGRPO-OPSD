@@ -11,6 +11,7 @@ from .mask_iou import (
     mask_summary,
     parse_mask_codes,
     pixel_empty_reward,
+    positive_empty_mask_penalty,
 )
 from .routing import (
     GRPO_ROUTE,
@@ -54,6 +55,7 @@ __all__ = [
     "mask_summary",
     "parse_mask_codes",
     "pixel_empty_reward",
+    "positive_empty_mask_penalty",
     "regenerate_weight",
     "teacher_caption_is_safe",
     "uses_original_grpo",

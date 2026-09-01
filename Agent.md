@@ -26,6 +26,8 @@ ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo
 MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok
 
 TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet
+NO_TARGET_FREE_TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_refcoco_replacement_seed20260901/cyclegrpo_20k_45_20_25_10_refcoco_replacement_seed20260901.parquet
+NO_TARGET_FREE_TRAIN_MANIFEST=/volume/ybo/xyc/datasets/cyclegrpo_20k_refcoco_replacement_seed20260901/cyclegrpo_20k_45_20_25_10_refcoco_replacement_seed20260901.manifest.json
 OFFICIAL_HTG_TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_official_htg_seed20260825/cyclegrpo_20k_official_htg_15k_single_4k_multi_1k_gres_seed20260825.parquet
 OFFICIAL_HTG_TRAIN_MANIFEST=/volume/ybo/xyc/datasets/cyclegrpo_20k_official_htg_seed20260825/cyclegrpo_20k_official_htg_15k_single_4k_multi_1k_gres_seed20260825.manifest.json
 DIRECT_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet
@@ -41,6 +43,15 @@ RUN_ROOT=/volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo20k_direct30k_notarget10k_
 正例，`NO_TARGET_DATA` 是 disjoint gRefCOCO no-target，`DLC_DATA` 是 DLC-QA parquet，
 `DLC_QA` 是对应的 QA JSONL。启用 no-target direct GRPO/SFT 前仍需在服务器执行
 `test -f "$NO_TARGET_DATA"`，确认该实际文件存在。
+
+`NO_TARGET_FREE_TRAIN_DATA` 是当前用于不含主数据 no-target caption GRPO 的纯正样本 CycleGRPO 自监督的 20k 派生数据：从
+`TRAIN_DATA` 删除全部 1,000 条 `source=gres_no_target`，补入 1,000 条 `source=refcoco_cycle`
+正例。因此其 source 组成固定为 RefCOCO 9,000、gRefCOCO positive 4,000、COCO-Stuff 5,000、
+PACO part 2,000，且不含任何 no-target 行。补入的 RefCOCO 行按 `COCO image filename + 原始
+mask RLE` 排除了保留的主 19k 与 `DIRECT_DATA` 的 30k RefCOCO 正例；实际导出 seed 为
+`20260901`，候选池经排除后为 1,685 条，最终选择前 1,000 条。后续需要禁用主 CycleGRPO
+no-target caption GRPO 的实验应显式将 `TRAIN_DATA` 和 `VAL_DATA` 同时设为该路径；
+独立 direct no-target 监督仍只使用 `NO_TARGET_DATA`，不要用此主数据替代。
 
 `OFFICIAL_HTG_TRAIN_DATA` 是由 `TRAIN_DATA` 导出的官方 CycleGRPO 兼容副本，仅把
 `source` 映射为官方代码已有标签：RefCOCO/COCO-Stuff/PACO 的 15k 行为

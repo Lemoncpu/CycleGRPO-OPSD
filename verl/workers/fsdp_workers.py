@@ -98,6 +98,7 @@ from .opsd import (
     extract_mask_token,
     mask_group_metadata,
     pixel_empty_reward,
+    positive_empty_mask_penalty,
 )
 
 class DirectResize:
@@ -1639,6 +1640,7 @@ class FSDPWorker(Worker):
         )
         target_tokens = np.array([extract_mask_token(text) for text in targets], dtype=object)
         reference_sources = np.full(len(data), "rollout_score", dtype=object)
+        positive_empty_penalties = np.zeros(len(data), dtype=np.float32)
         decoded_predictions = [None] * len(data)
         decoded_targets = {}
 
@@ -1688,14 +1690,20 @@ class FSDPWorker(Worker):
                 decoded_predictions[data_index] = prediction
                 if target_mask is None or prediction is None:
                     pixel_ious[data_index] = pixel_config.invalid_iou
-                    continue
-                if prediction.shape != target_mask.shape:
+                elif prediction.shape != target_mask.shape:
                     prediction = torch.nn.functional.interpolate(
                         prediction[None, None].float(), size=target_mask.shape, mode="nearest"
                     )[0, 0].bool()
                     decoded_predictions[data_index] = prediction
-                pixel_ious[data_index] = float(
-                    compute_binary_iou(target_mask[None], prediction[None])[0].item()
+                if target_mask is not None and prediction is not None:
+                    pixel_ious[data_index] = float(
+                        compute_binary_iou(target_mask[None], prediction[None])[0].item()
+                    )
+                positive_empty_penalties[data_index] = positive_empty_mask_penalty(
+                    target_mask,
+                    prediction,
+                    responses[data_index],
+                    pixel_config.positive_empty_mask_penalty,
                 )
 
         caption_groups = {}
@@ -1740,6 +1748,7 @@ class FSDPWorker(Worker):
             [metadata["valid_group_count"] for metadata in response_mask_metadata], dtype=object
         )
         data.non_tensor_batch["pixel_iou"] = pixel_ious.astype(object)
+        data.non_tensor_batch["positive_empty_mask_penalty"] = positive_empty_penalties.astype(object)
         data.non_tensor_batch["mask_token_accuracy"] = pixel_ious.astype(object)
         data.non_tensor_batch["R_Ci"] = r_ci.astype(object)
         data.non_tensor_batch["route"] = routes

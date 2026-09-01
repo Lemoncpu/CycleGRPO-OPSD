@@ -21,8 +21,12 @@ class PixelIoUConfig:
     localization_prompt_mode: str = "mixed"
     # ``text`` preserves the SAMTok refusal proxy. ``official_bbox`` matches
     # public CycleGRPO's bbox-format proxy. ``pixel_empty`` uses the decoded
-    # SAMTok union, matching offline GRES N_acc semantics.
+    # SAMTok union while keeping the no-target samples in the caption-only
+    # non-cycle batch, as in the public CycleGRPO implementation.
     no_target_reward_mode: str = "text"
+    # Subtract this score from a positive segmentation rollout that explicitly
+    # refuses or decodes to an empty mask. Zero disables the term.
+    positive_empty_mask_penalty: float = 1.0
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -45,6 +49,8 @@ class PixelIoUConfig:
                 "pixel_iou.no_target_reward_mode must be one of "
                 "{'text', 'official_bbox', 'pixel_empty'}."
             )
+        if self.positive_empty_mask_penalty < 0.0:
+            raise ValueError("pixel_iou.positive_empty_mask_penalty must be non-negative.")
 
 
 @dataclass
@@ -170,9 +176,6 @@ class OPSDConfig:
     localization_rollouts: int = 6
     caption_loss_weight: float = 0.5
     localization_loss_weight: float = 0.5
-    # Scale only the main-parquet pixel-empty no-target segmentation gradient.
-    # One preserves the historical sample-proportional loss weighting.
-    no_target_segmentation_loss_weight: float = 1.0
     caption_anchor_kl_coef: float = 0.0
     caption_anchor_kl_all_safe_routes: bool = False
     segmentation_anchor_kl_coef: float = 0.0
@@ -193,8 +196,6 @@ class OPSDConfig:
             raise ValueError("OPSD task loss weights must be non-negative.")
         if self.caption_loss_weight + self.localization_loss_weight <= 0:
             raise ValueError("At least one OPSD task loss weight must be positive.")
-        if self.no_target_segmentation_loss_weight < 0:
-            raise ValueError("no_target_segmentation_loss_weight must be non-negative.")
         if self.caption_anchor_kl_coef < 0:
             raise ValueError("caption_anchor_kl_coef must be non-negative.")
         if self.segmentation_anchor_kl_coef < 0:

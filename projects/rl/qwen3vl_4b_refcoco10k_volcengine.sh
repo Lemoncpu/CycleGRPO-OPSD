@@ -30,9 +30,7 @@ MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
 LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
 CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
-# This is a loss scale rather than a reward scale: GRPO standardization makes
-# the latter largely invariant within a rollout group.
-NO_TARGET_SEGMENTATION_LOSS_WEIGHT="${NO_TARGET_SEGMENTATION_LOSS_WEIGHT:-1.0}"
+POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
@@ -615,7 +613,7 @@ echo "Training mask decode mode: ${MASK_DECODE_MODE}"
 echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
 echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
 echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
-echo "No-target segmentation loss weight: ${NO_TARGET_SEGMENTATION_LOSS_WEIGHT}"
+echo "Positive empty-mask penalty: ${POSITIVE_EMPTY_MASK_PENALTY}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -731,7 +729,6 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
     worker.opsd.caption_loss_weight=0.5 \
     worker.opsd.localization_loss_weight=0.5 \
-    worker.opsd.no_target_segmentation_loss_weight="${NO_TARGET_SEGMENTATION_LOSS_WEIGHT}" \
     worker.opsd.caption_anchor_kl_coef="${CAPTION_ANCHOR_KL_COEF}" \
     worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
     worker.opsd.segmentation_anchor_kl_coef="${SEGMENTATION_ANCHOR_KL_COEF}" \
@@ -745,6 +742,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.pixel_iou.mask_decode_mode="${MASK_DECODE_MODE}" \
     worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
+    worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \

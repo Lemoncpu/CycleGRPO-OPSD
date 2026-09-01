@@ -353,7 +353,7 @@ main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。入口保
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。`text` 或 `official_bbox` 模式仍走历史外层 caption GRPO；`pixel_empty` 模式则从 caption batch 移除 no-target 行，按每个原始 UID 保留一条 `grounding_query`，再生成标准 segmentation rollout 并加入主 segmentation GRPO。只有显式开启 direct grounding 后才会额外构造独立 batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。所有 `text`、`official_bbox` 与 `pixel_empty` 模式都让该 source 保持 caption-only non-cycle batch，与公开 CycleGRPO 一致；`pixel_empty` 只在 reward 前解码 caption response 的合法 group，提供严格空 union metadata，不生成 `grounding_query` 的 segmentation rollout。只有显式开启 direct grounding 后才会额外构造独立 segmentation batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -385,20 +385,17 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
    UID、`localization_index`、source 等元数据严格按未补齐 prompt 数量构造，并检查输出为
    `prompt_count × K`，避免 padding 后数量残留造成 DataProto 一致性错误。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
-6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。
+6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，`positive_empty_mask_penalty` 默认在 segmentation reward 额外扣 `1.0`；真实 IoU 本身保持不变，并独立记录该负项。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
-主 20k 的 `pixel_empty` no-target 行不依赖 actor caption 作为 query：每个原始 UID 直接使用 parquet
-的 `grounding_query` 建立 `supervised_grounding_no_target` 的 K 次 segmentation rollout。它的 decoded-union
-empty/non-repeat reward 单独进行 GRPO advantage、log-prob 和可选 reference-KL 计算，再在同一个 optimizer
-step 与 cycle segmentation 独立累积。两类 segmentation response 可具有不同 padding 宽度，因此不拼接；
-`localization_loss_weight` 按两个 rollout batch 的样本数分配，保持它们合计仍为原配置的 segmentation
-权重，而非将 5% no-target batch 意外提升为并列 0.5 loss。由于 20k 数据中的 1,000 条 no-target
-按主 batch 随机抽样后每 step 通常只有约 6 条，不能直接均分到 8 个 rollout rank；通用 segmentation
-rollout dispatcher 会临时补齐 parent prompt 到 world-size 的整倍数，再在生成后删除补齐 response，
-不会把重复样本计入 reward、优势或 loss 权重。
+主 20k 的 `pixel_empty` no-target 行与公开 CycleGRPO 一样保留为 caption-only non-cycle rollout，不读取
+`grounding_query`，也不构造 `supervised_grounding_no_target` 的 K 次 segmentation rollout。FSDP worker 在
+caption response 上按当前 decoder 模式解码合法 group；只有大小写不敏感的精确 `No target.` 拒识和零像素
+union 同时成立时，才把 `no_target_pixel_empty=1.0` 写回该 non-cycle batch。随后该 batch 仍由常规 caption
+reward、log-prob、KL 和 GRPO advantage 路径更新 captioner。独立 direct no-target segmentation rollout
+仅在外部 direct grounding 配置明确启用时运行。
 
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
@@ -508,23 +505,21 @@ localization positive:
 `supervised_grounding_no_target` 的正确性项。默认 `text` 保持原来的 `1.0 / 0.2 / 0.0`
 取值：响应必须含 `No target.`，且不含任何 SAMTok `<|mt_start|>`、`<|mt_####|>` 或
 `<|mt_end|>` 片段；任一完整或残缺 mask-token 都会使该项为 `0.0`。选择 opt-in
-`pixel_empty` 时，主 20k no-target 行不再计算 caption reward；FSDP worker 对 segmentation rollout 的同图每条 response 解析全部完整、codebook 合法的
-depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；仅当 union
+`pixel_empty` 时，主 20k no-target 行仍计算 caption reward；FSDP worker 在该 non-cycle caption response
+上解析全部完整、codebook 合法的 depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；仅当 union
 为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）**且** response 以大小写不敏感的精确
 `No target.` 短语显式拒识时，该正确性项才为 `1.0`，否则为 `0.0`。因此 `null`、普通解释、空回复或仅 EOS
 即使没有 mask 也不会得到 pixel-empty 奖励；`<answer>No target.</answer>` 仍是合法拒识格式。该训练奖励比
 GRES `N_acc` 的单独 `not pred_mask.any()` 更严格，目的是避免模型以空生成钻取 reward 空子集。
-`worker.opsd.no_target_segmentation_loss_weight`（入口环境变量
-`NO_TARGET_SEGMENTATION_LOSS_WEIGHT`）进一步只缩放这个主 `pixel_empty` no-target segmentation
-batch 的 actor loss，默认 `1.0` 保持历史按 rollout 数量分配的梯度。设为 `0.25` 时，cycle segmentation、caption
-及所有 auxiliary loss 的权重不变，而 no-target 分支的既有 effective weight 再乘 `0.25`；不要试图通过缩放
-no-target reward 达到同样目的，因为 GRPO 对每个 rollout group 标准化 advantage。日志同时记录
-`opsd/main_no_target_segmentation_loss_weight_{target,base,effective}`。
-它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，
-不会退回文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变。该 metadata 在 segmentation
-reward/advantage 阶段消费；no-target segmentation 与正例 cycle segmentation 合并时会补齐
-cycle-only metadata，避免 `DataProto.concat` 的字段长度断言，因此该模式的梯度更新作用于
-segmenter，不作用于 captioner。
+它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，不会退回
+文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变；主 no-target 更新始终作用于 captioner。独立
+direct no-target segmentation rollout 仍按其自己的外部监督配置运行。
+
+`worker.opsd.pixel_iou.positive_empty_mask_penalty`（入口环境变量
+`POSITIVE_EMPTY_MASK_PENALTY`）默认是 `1.0`。对有非空 GT 的正例 segmentation rollout，若 response
+包含大小写不敏感的 `No target.`，或其 decoded union 没有像素，则 `seg_overall` 额外加 `-1.0`；设为 `0.0`
+可关闭。它不改变 `pixel_iou`、`R_Ci` 或离线 cIoU 指标，只通过独立的
+`seg_positive_empty_mask_penalty` 奖励字段提供相对 GRPO 信号，也绝不作用于正确的 no-target 拒识。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -581,8 +576,8 @@ optimizer.step 后原地执行 EMA shard 更新；当 `ema_teacher.decay=1.0` �
 
 direct-grounding 显式启用时，其 GRPO loss 在 cycle localization 后、同一次 optimizer step 前累积，权重为
 `worker.supervised_anchors.direct_grounding.loss_weight`（generic YAML 默认 `0.25`）。火山引擎入口默认关闭该外部
-supervised anchor；在默认 text/official_bbox no-target 模式下，主数据仍保留原始 CycleGRPO 外层 GRPO 和两项拒识 reward，
-而 pixel-empty 模式改为上述主 segmentation rollout。若实验显式启用 no-target direct
+supervised anchor；所有 no-target reward 模式下，主数据都保留原始 CycleGRPO 外层 caption GRPO 和两项拒识 reward，
+而 pixel-empty 模式额外以 decoded empty-union 收紧其中的正确性项。若实验显式启用 no-target direct
 group，它会额外使用独立 `K=6` group；`consume_no_target_caption=true` 已由配置校验拒绝，避免 no-target 仅依赖
 direct rollout 而在同组正确拒识相同的情况下产生零 GRPO advantage。direct query 使用人工 expression 或类别模板，属于受控外部监督，不是 image-mask-only
 CycleGRPO 的核心奖励或纯 on-policy self-distillation。
@@ -642,6 +637,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/multinode/supervised_clusters.tsv.example` | 混合四组清单模板；无 judge 行使用 `-`，其余填写本机 Llama URL、Ray 地址/namespace 和 env 文件 |
 | `tools/multinode/local_llama_judge.py` / `tools/multinode/llama3_chat_template.jinja` | 在预期数量的 Ray 节点上用 CPU-only node-affine detached actor 管理 GPU 7 的本机 Llama vLLM；当前有监督 controller 要求单节点，健康检查要求 `/v1/models` 包含指定 served model，模板固定 Llama-3.1 对话格式 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
+| `tools/gpu_power_hold.sh` | 显式 GPU 压力占用工具；默认仅对 GPU 0--3 各启动一个独立 worker，预留约 40000 MiB 并持续 BF16 矩阵乘以维持 GPU 利用率/功耗。支持 `start`、`status`、`stop`，只按自身 worker tag 停止 PID，绝不扫描或终止其他 CUDA 进程 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
@@ -1950,3 +1946,20 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文档：更新第 2.2、5.6 节与本变更日志；模块清单无变化。
 - 行为：RefCOCO 新增仅用于交叉验证公开 CycleGRPO 脚本的 `MASK_PROTOCOL=cyclegrpo_legacy`。该模式强制 `batch_size=1`、`max_new_tokens=128`、`skip_special_tokens=True`，并完全复用公开脚本的容错规则：直接从 raw `<|mt_####|>` 配对、奇数 token 时仅从修复后的完整 wrapper 重新提取、首码本越界丢弃、第二码本越界传入 `-1`，最后解码所有保留 pair 的像素 union。它不加入共享的 `legacy_union|first_mask` 协议集合，GRES/GroundingSuite 不会接受该参数；严格模式的 EOS、解析、batch 和默认 256-token 上限均不变。RefCOCO 输出额外记录 raw/decoded token 数、实际 batch 与 token cap，且 `mask_protocol` 继续作为 resume 隔离字段；兼容评测必须使用全新的输出目录，不能与标准 RefCOCO 分数比较或混写。
 - 验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_mask_protocol`（6 tests）、`PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile evaluation/mask_protocol.py evaluation/refcoco/qwen3vl_refcoco_eval.py tests/test_mask_protocol.py`、`bash -n evaluation/refcoco/run_refcoco_multigpu.sh` 与 `git diff --check` 通过。本机无 CUDA、HF checkpoint、VQ-SAM2 权重或 RefCOCO assets，未进行端到端推理；服务器应以新的输出目录运行八卡 `cyclegrpo_legacy` 交叉验证。
+
+### 2026-09-01 - 将 pixel-empty no-target 恢复为官方 non-cycle 路径
+
+- 代码：修改 `verl/trainer/ray_trainer.py`、`verl/workers/opsd/__init__.py`、`verl/workers/opsd/config.py`、`verl/workers/opsd/mask_iou.py`、`verl/workers/fsdp_workers.py`、`projects/rl/reward_function/text2mask.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `tests/test_opsd_core.py`；未新增、移动或删除模块。
+- 文档：更新第 3.3--3.5、6 节、`Agent.md` 与本日志，废弃此前主 pixel-empty segmentation rollout/loss-weight 的当前路径描述；较早的变更日志保留为实验历史。
+- 行为：`NO_TARGET_REWARD_MODE=pixel_empty` 的主 `gres_no_target` 不再由 `grounding_query` 创建 K 次 `supervised_grounding_no_target` segmentation rollout，而是与公开 CycleGRPO 一样保持 caption-only non-cycle batch。FSDP worker 在 caption reward 前解码 response，只有精确 `No target.` 加零像素 union 才写入 `no_target_pixel_empty=1.0`，随后继续常规 caption GRPO；移除了不再适用的 `NO_TARGET_SEGMENTATION_LOSS_WEIGHT`。新增 `POSITIVE_EMPTY_MASK_PENALTY` / `pixel_iou.positive_empty_mask_penalty`，默认 `1.0`：对非空正例 GT，明确拒识或 decoded union 为空时在 `seg_overall` 额外扣分，同时保留真实 `pixel_iou` 并记录 `seg_positive_empty_mask_penalty`。该项不作用于正确 no-target 拒识。
+- 验证：受影响 Python 文件已通过无字节码 AST 语法解析，训练 shell 通过 `bash -n`，`git diff --check` 通过。`python3 -m unittest tests.test_opsd_core` 因本机系统 Python 未安装 `torch` 无法导入；未执行 GPU/Ray smoke test。服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1` 确认主 no-target 只出现在 non-cycle caption 指标，且正例空 mask 的 penalty 指标为非正值。
+
+### 2026-09-02 - 新增四卡显存与功耗占用工具
+
+- 代码：新增 `tools/gpu_power_hold.sh`；模块清单同步更新。
+- 行为：该独立运维脚本默认仅启动物理 GPU 0--3，每卡 worker 预留约 40000 MiB，并持续执行 BF16
+  matrix multiplication 以保持 GPU 利用率和功耗。`GPU_LIST`、`MEMORY_MIB`、`MATMUL_DIM`、`PYTHON_BIN`
+  与 `STATE_DIR` 均可覆盖；`status` 只读显示显存/功耗/PID，`stop` 只停止命令行带自身 worker tag 的
+  已记录 PID，拒绝杀死任何非本工具进程。该工具不参与训练、评测、Ray 或 checkpoint 行为。
+- 验证：执行 `bash -n tools/gpu_power_hold.sh` 与 `git diff --check`；本机无 CUDA/H20，未执行实际
+  显存分配或功耗负载。

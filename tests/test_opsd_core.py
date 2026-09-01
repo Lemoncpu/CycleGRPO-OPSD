@@ -15,6 +15,7 @@ from verl.workers.opsd.mask_iou import (
     mask_group_metadata,
     parse_mask_codes,
     pixel_empty_reward,
+    positive_empty_mask_penalty,
 )
 from verl.workers.supervised_anchors import localization_prompt_variants
 from verl.utils.dataset import RLHFDataset
@@ -103,12 +104,6 @@ class OPSDCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
             OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
 
-    def test_no_target_segmentation_loss_weight_defaults_to_one_and_rejects_negative_values(self):
-        self.assertEqual(OPSDConfig().no_target_segmentation_loss_weight, 1.0)
-        OPSDConfig(no_target_segmentation_loss_weight=0.25).post_init()
-        with self.assertRaisesRegex(ValueError, "no_target_segmentation_loss_weight"):
-            OPSDConfig(no_target_segmentation_loss_weight=-0.01).post_init()
-
     def test_no_target_reward_mode_validation(self):
         self.assertEqual(PixelIoUConfig().no_target_reward_mode, "text")
         self.assertEqual(PixelIoUConfig().mask_decode_mode, "union")
@@ -120,6 +115,9 @@ class OPSDCoreTest(unittest.TestCase):
             PixelIoUConfig(localization_prompt_mode="invalid").post_init()
         PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
         PixelIoUConfig(no_target_reward_mode="official_bbox").post_init()
+        PixelIoUConfig(positive_empty_mask_penalty=0.0).post_init()
+        with self.assertRaisesRegex(ValueError, "positive_empty_mask_penalty"):
+            PixelIoUConfig(positive_empty_mask_penalty=-0.01).post_init()
         with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
             PixelIoUConfig(no_target_reward_mode="unknown").post_init()
         with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):
@@ -139,6 +137,39 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(pixel_empty_reward(None, "null"), 0.0)
         self.assertEqual(pixel_empty_reward(None, "I cannot identify the object."), 0.0)
         self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), 0.0)
+
+    def test_positive_empty_mask_penalty_requires_nonempty_target(self):
+        target = torch.tensor([[False, True]], dtype=torch.bool)
+        self.assertEqual(positive_empty_mask_penalty(target, None, "No target.", 1.0), -1.0)
+        self.assertEqual(
+            positive_empty_mask_penalty(target, torch.zeros((1, 2), dtype=torch.bool), "mask", 1.0),
+            -1.0,
+        )
+        self.assertEqual(
+            positive_empty_mask_penalty(target, torch.tensor([[False, True]]), "No target.", 1.0),
+            -1.0,
+        )
+        self.assertEqual(positive_empty_mask_penalty(target, None, "No target.", 0.0), 0.0)
+        self.assertEqual(
+            positive_empty_mask_penalty(torch.zeros((1, 2), dtype=torch.bool), None, "No target.", 1.0),
+            0.0,
+        )
+
+    def test_positive_empty_mask_penalty_is_added_to_segmentation_reward(self):
+        reward_input = {
+            "source": "refcoco_cycle",
+            "response": "No target.",
+            "mask_token_accuracy": 0.0,
+            "iou_scores": 0.0,
+            "mask_group_count": 0,
+            "valid_mask_group_count": 0,
+        }
+        base_score = compute_score([reward_input], task="segmentation")[0]["seg_overall"]
+        score = compute_score(
+            [{**reward_input, "positive_empty_mask_penalty": -1.0}], task="segmentation"
+        )[0]
+        self.assertEqual(score["seg_positive_empty_mask_penalty"], -1.0)
+        self.assertEqual(score["seg_overall"], base_score - 1.0)
 
     def test_no_target_reward_score_uses_decoded_union_when_requested(self):
         response = "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>"

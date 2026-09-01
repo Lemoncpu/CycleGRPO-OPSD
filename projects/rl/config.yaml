@@ -80,9 +80,6 @@ worker:
     localization_rollouts: 6
     caption_loss_weight: 0.5
     localization_loss_weight: 0.5
-    # Multiplies only the main pixel-empty no-target segmentation loss.
-    # Keep 1.0 for historical behavior; use 0.25 to reduce false-refusal pressure.
-    no_target_segmentation_loss_weight: 1.0
     caption_anchor_kl_coef: 0.0
     caption_anchor_kl_all_safe_routes: false
     segmentation_anchor_kl_coef: 0.0
@@ -109,10 +106,13 @@ worker:
       # ``mixed`` alternates RefCOCO/GroundingSuite wording; ``refcoco`` makes
       # every image localization prompt use the RefCOCO instruction.
       localization_prompt_mode: mixed
-      # ``pixel_empty`` decodes all legal groups and rewards an empty union,
-      # matching offline gRefCOCO N_acc. ``text`` checks SAMTok fragments;
-      # ``official_bbox`` reproduces public CycleGRPO's bbox-format proxy.
+      # ``pixel_empty`` keeps no-target rows in the caption-only non-cycle
+      # batch, then requires a decoded empty union. ``text`` checks SAMTok
+      # fragments; ``official_bbox`` reproduces the public bbox-format proxy.
       no_target_reward_mode: text
+      # Deducted from a positive segmentation reward only when the response
+      # refuses or decodes to zero pixels. Set 0.0 to disable.
+      positive_empty_mask_penalty: 1.0
     routing:
       enabled: true
       low_threshold: 0.5

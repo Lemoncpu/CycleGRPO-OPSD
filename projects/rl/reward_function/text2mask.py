@@ -1378,9 +1378,11 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             if source == "supervised_grounding":
                 format_score, no_repeat_score, group_count, valid_count = mask_group_reward_terms(reward_input)
                 iou_score = float(reward_input["iou_scores"] or 0.0)
+                empty_penalty = float(reward_input.get("positive_empty_mask_penalty") or 0.0)
                 scores.append({
-                    "seg_overall": 10 * iou_score + format_score + no_repeat_score,
+                    "seg_overall": 10 * iou_score + format_score + no_repeat_score + empty_penalty,
                     "seg_supervised_grounding_iou": iou_score,
+                    "seg_positive_empty_mask_penalty": empty_penalty,
                     "seg_format": format_score,
                     "seg_no_repeat_score": no_repeat_score,
                     "seg_mask_group_count": group_count,
@@ -1434,13 +1436,15 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 # _, answer_content = extract_think_and_answer_robust(reward_input["response"])
                 mask_token_format_correct, answer_content_no_repeat_score, group_count, valid_count = mask_group_reward_terms(reward_input)
                 iou_score = reward_input["mask_token_accuracy"] * reward_input["iou_scores"]
+                empty_penalty = float(reward_input.get("positive_empty_mask_penalty") or 0.0)
 
                 # mask_token_format_correct = bbox_format_reward(reward_input["response"])
                 scores.append(
                     {
-                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct,
+                        "seg_overall": 10*iou_score + answer_content_no_repeat_score + mask_token_format_correct + empty_penalty,
                         # "seg_format": format_score,
                         "seg_iou_scores": iou_score,
+                        "seg_positive_empty_mask_penalty": empty_penalty,
                         "seg_answer_content_no_repeat_score": answer_content_no_repeat_score,
                         "seg_mask_token_format_correct": mask_token_format_correct,
                         "seg_mask_group_count": group_count,

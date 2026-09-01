@@ -80,6 +80,17 @@ def pixel_empty_reward(prediction: Optional[torch.Tensor], response: Optional[st
     return 1.0 if has_explicit_refusal and has_empty_union else 0.0
 
 
+def positive_empty_mask_penalty(
+    target: Optional[torch.Tensor], prediction: Optional[torch.Tensor], response: Optional[str], amount: float
+) -> float:
+    """Return a negative reward when a nonempty target is refused or decoded as empty."""
+    if amount <= 0.0 or target is None or not bool(target.any()):
+        return 0.0
+    has_explicit_refusal = isinstance(response, str) and NO_TARGET_REFUSAL_PATTERN.search(response) is not None
+    has_empty_union = prediction is None or not bool(prediction.any())
+    return -float(amount) if has_explicit_refusal or has_empty_union else 0.0
+
+
 def coerce_raw_mask(value, image_size: tuple[int, int]) -> Optional[torch.Tensor]:
     """Convert common dense, PIL, COCO RLE, or polygon annotations to one 2D mask."""
     if value is None:
