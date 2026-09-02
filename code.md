@@ -396,6 +396,10 @@ caption response 上按当前 decoder 模式解码合法 group；只有大小写
 union 同时成立时，才把 `no_target_pixel_empty=1.0` 写回该 non-cycle batch。随后该 batch 仍由常规 caption
 reward、log-prob、KL 和 GRPO advantage 路径更新 captioner。独立 direct no-target segmentation rollout
 仅在外部 direct grounding 配置明确启用时运行。
+`no_target_pixel_empty` 与 `no_target_reward_mode` 仅是上述 reward 阶段的临时 metadata：优势计算完成后、
+non-cycle caption batch 与 cycle caption batch 拼接为 actor PPO batch 前，trainer 会从两侧移除它们。
+这是 `DataProto.concat` 的必要约束，因为该字段只由 no-target 子 batch 生成；它不改变已经写入
+`token_level_scores`/advantage 的 no-target 奖励或 PPO 更新。
 
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
@@ -1963,3 +1967,17 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   已记录 PID，拒绝杀死任何非本工具进程。该工具不参与训练、评测、Ray 或 checkpoint 行为。
 - 验证：执行 `bash -n tools/gpu_power_hold.sh` 与 `git diff --check`；本机无 CUDA/H20，未执行实际
   显存分配或功耗负载。
+
+### 2026-09-02 - 修复 pixel-empty no-target caption batch 合并
+
+- 代码：修改 `verl/trainer/ray_trainer.py`；未新增、移动或删除模块。
+- 文档：更新第 3.4 节的 pixel-empty no-target metadata 生命周期；模块清单无变化。
+- 行为：主 `pixel_empty` no-target non-cycle batch 在完成 reward、KL 和 GRPO advantage 后，现会在与
+  cycle caption batch 合并前清理 `no_target_pixel_empty` 与 `no_target_reward_mode`。此前字段只存在于
+  no-target 一侧，`DataProto.concat` 会保留长度为 no-target rollout 数的数组并与总 tensor batch 长度冲突，
+  在第一个训练 step 触发一致性断言。修复不改变 strict `No target.` + decoded-empty 奖励、正样本空 mask
+  penalty、已计算 advantage 或任何 loss 权重。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 与 `git diff --check`；
+  本机未运行 CUDA/Ray 训练，服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1` 确认越过
+  第 0 step 的 caption concat。

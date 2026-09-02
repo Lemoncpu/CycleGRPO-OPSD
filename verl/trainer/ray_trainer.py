@@ -2330,9 +2330,8 @@ class RayPPOTrainer:
                             len(non_cycle_batch), dtype=non_cycle_batch.batch["response_mask"].dtype
                         )
                     # Remove cycle-only and reward-stage-only metadata before concat.
-                    # Remove cycle-only metadata before caption concat. Main
-                    # pixel-empty no-target rows are intentionally absent here:
-                    # they train through the segmentation rollout below.
+                    # Pixel-empty metadata is consumed by the non-cycle reward
+                    # before this point and exists only on that sub-batch.
                     concat_only_metadata = (
                         "iou_scores",
                         "correct_mask",
@@ -2352,6 +2351,8 @@ class RayPPOTrainer:
                         "iou_std",
                         "iou_min",
                         "iou_max",
+                        "no_target_pixel_empty",
+                        "no_target_reward_mode",
                     )
                     for key in concat_only_metadata:
                         non_cycle_batch.non_tensor_batch.pop(key, None)
