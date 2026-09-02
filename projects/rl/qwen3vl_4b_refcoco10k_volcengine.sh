@@ -169,7 +169,7 @@ if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
     fi
     expected_multinode_gpus="$((NUM_GPUS * NNODES))"
     if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "${NNODES}" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
-        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
+        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with exactly ${expected_multinode_gpus} training GPUs." >&2
         exit 1
     fi
 elif [[ "${NNODES}" != "1" ]]; then
@@ -667,7 +667,7 @@ while time.monotonic() < deadline:
         alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
         gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
         last_state = f"alive_nodes={len(alive_nodes)}, gpus={gpu_count:g}"
-        if len(alive_nodes) == expected_nodes and gpu_count >= expected_gpus:
+        if len(alive_nodes) == expected_nodes and gpu_count == expected_gpus:
             print(f"Verified multi-node Ray cluster: {last_state}")
             ray.shutdown()
             break
@@ -677,7 +677,7 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise RuntimeError(
-        f"Ray cluster {address} did not reach {expected_nodes} alive nodes and "
+        f"Ray cluster {address} did not reach exactly {expected_nodes} alive nodes and "
         f"{expected_gpus:g} GPUs within {timeout}s; last state: {last_state}"
     )
 PY

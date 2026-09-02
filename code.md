@@ -119,7 +119,7 @@ Ray。显式连接平台 Ray 时设置 `MULTINODE_ENABLED=true`、`NNODES=1|2` �
 创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前验证对应数量的节点和 Ray GPU。纯 20k
 controller 使用 `NNODES=2`、`NUM_GPUS=8`、GPU 0--7 全训练的拓扑（16 Ray GPU）；有监督 controller
 使用一台 32-GPU 节点、`NNODES=1`、`NUM_GPUS=7`，仅向 Ray 登记物理 GPU 0--6，预留物理 GPU 7
-运行本机 Llama，并要求恰有 1 个 Ray 节点和至少 7 张 Ray GPU。该实验不调度物理 GPU 8--31。为在开发机 smoke 验证外部 judge、Ray attach 和三流数据路径，入口也接受 `LOCAL_JUDGE_ENABLED=true` 的 `NUM_GPUS=1..7`；这不是正式实验拓扑，调用方必须显式设置与该 world size 整除的 main/direct/DLC-QA batch，并在 Ray 中只登记相同数量的 GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+运行本机 Llama，并要求恰有 1 个 Ray 节点和恰好 7 张 Ray GPU。该实验不调度物理 GPU 8--31。为在开发机 smoke 验证外部 judge、Ray attach 和三流数据路径，入口也接受 `LOCAL_JUDGE_ENABLED=true` 的 `NUM_GPUS=1..7`；这不是正式实验拓扑，调用方必须显式设置与该 world size 整除的 main/direct/DLC-QA batch，并在 Ray 中只登记相同数量的 GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
@@ -2010,7 +2010,8 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文档：更新第 2.2、3.2 节与本变更日志；模块清单无变化。
 - 行为：显式 Ray attach 且 `LOCAL_JUDGE_ENABLED=true` 时，训练 world size 从原先硬编码的
   `NUM_GPUS=7` 放宽为 `1..7`。这使开发机可用例如三张训练卡加一张独立 Llama judge 对完整
-  main/direct/DLC-QA 路径做 smoke；入口仍验证 Ray 节点/GPU 数与 `NUM_GPUS * NNODES` 一致。
+  main/direct/DLC-QA 路径做 smoke；入口现在精确验证 Ray 节点/GPU 数与 `NUM_GPUS * NNODES` 一致，拒绝
+  旧 Ray head 注册更多 GPU 时的静默附着。
   `LOCAL_JUDGE_ENABLED=false` 的 8 卡 attach 约束、正式 7+1 拓扑、训练算法和 loss 均不变。小 world-size
   调用方必须自行保证各 parent-prompt batch 能整除实际训练卡数；三流正式 7 卡 controller 仍使用
   `112:224:56`。同时，DLC-QA judge 启动前的 `/v1/models` 健康检查在
