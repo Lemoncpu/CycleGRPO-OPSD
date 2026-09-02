@@ -68,7 +68,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
 | 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
-| GPU | 默认 1 node x 8 GPU；显式 Ray attach 按试验族区分 | 单机仍由 Ray + FSDP + vLLM SPMD 运行；纯 20k controller 使用两节点、每节点 GPU 0--7 全部加入 Ray（单 trial 16 张训练 H20）；70k 有监督 controller 每 trial 使用一台 32-GPU 节点，仅向 Ray 登记 GPU 0--6，物理 GPU 7 运行本机 Llama judge（单 trial 7 训练卡 + 1 judge 卡，GPU 8--31 不使用） |
+| GPU | 默认 1 node x 8 GPU；显式 Ray attach 按试验族区分 | 单机仍由 Ray + FSDP + vLLM SPMD 运行；正式 70k 有监督 trial 使用物理 GPU 0--6 的 7 张 Ray 训练卡与 GPU 7 本机 Llama judge。attach 模式也允许 1--7 张 Ray 训练卡作开发 smoke，但必须在 `CUDA_VISIBLE_DEVICES` 外保留一张卡给外部 judge，且所有实际 parent-prompt batch 必须能被训练卡数整除。 |
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
@@ -119,7 +119,7 @@ Ray。显式连接平台 Ray 时设置 `MULTINODE_ENABLED=true`、`NNODES=1|2` �
 创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前验证对应数量的节点和 Ray GPU。纯 20k
 controller 使用 `NNODES=2`、`NUM_GPUS=8`、GPU 0--7 全训练的拓扑（16 Ray GPU）；有监督 controller
 使用一台 32-GPU 节点、`NNODES=1`、`NUM_GPUS=7`，仅向 Ray 登记物理 GPU 0--6，预留物理 GPU 7
-运行本机 Llama，并要求恰有 1 个 Ray 节点和至少 7 张 Ray GPU。该实验不调度物理 GPU 8--31。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
+运行本机 Llama，并要求恰有 1 个 Ray 节点和至少 7 张 Ray GPU。该实验不调度物理 GPU 8--31。为在开发机 smoke 验证外部 judge、Ray attach 和三流数据路径，入口也接受 `LOCAL_JUDGE_ENABLED=true` 的 `NUM_GPUS=1..7`；这不是正式实验拓扑，调用方必须显式设置与该 world size 整除的 main/direct/DLC-QA batch，并在 Ray 中只登记相同数量的 GPU。训练 stdout、W&B、teacher diagnosis 和 checkpoint 写到仓库内
 `logs/refcoco10k_opsd/`；Ray session、object store 与 spill 文件写到本地短路径
 `/dev/shm/cgrpo-ray-<uid>` 或其他本地数据盘上的短绝对路径（例如 `/data5/ray-<uid>`）。这同时保持 Ray socket 路径不超过 Linux `AF_UNIX` 的 107
 字节限制，并避免持久化 workspace 挂载接近满盘时使 Ray 停止创建/溢写对象。入口拒绝
@@ -348,8 +348,9 @@ caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、
 或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
 人工 referring/GT-mask 或 no-target refusal 监督来自独立 direct 流。
 单节点 `7+1` 有监督 controller 的 world size 为 7：`112:224:56` 对应每 rank `16:32:8` 个
-main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。入口保留 `NUM_GPUS=7` 的
-兼容性检查，controller 会在提交前额外检查三个 batch 都能被 7 整除。
+main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。正式 controller 仍使用
+`NUM_GPUS=7` 并在提交前检查三个 batch 都能被 7 整除。入口 attach 校验另允许 1--7 卡的外部-judge
+开发 smoke；例如三卡可使用 `120:240:60`，但不得将其结果视为正式 7+1 实验。
 
 ### 3.3 Phase 1：caption rollout
 
@@ -2002,3 +2003,18 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/reassemble_fsdp_checkpoint.py` 与 `git diff --check`；
   本机没有 PyTorch distributed/FSDP checkpoint，未执行真实 8-rank 重组，服务器首次运行应检查 manifest 的
   `source_world_size=8`，并用一个小型 RefCOCO shard 验证导出权重可加载。
+
+### 2026-09-02 - 允许外部 judge 的小 world-size Ray smoke
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`；未新增、移动或删除模块。
+- 文档：更新第 2.2、3.2 节与本变更日志；模块清单无变化。
+- 行为：显式 Ray attach 且 `LOCAL_JUDGE_ENABLED=true` 时，训练 world size 从原先硬编码的
+  `NUM_GPUS=7` 放宽为 `1..7`。这使开发机可用例如三张训练卡加一张独立 Llama judge 对完整
+  main/direct/DLC-QA 路径做 smoke；入口仍验证 Ray 节点/GPU 数与 `NUM_GPUS * NNODES` 一致。
+  `LOCAL_JUDGE_ENABLED=false` 的 8 卡 attach 约束、正式 7+1 拓扑、训练算法和 loss 均不变。小 world-size
+  调用方必须自行保证各 parent-prompt batch 能整除实际训练卡数；三流正式 7 卡 controller 仍使用
+  `112:224:56`。同时，DLC-QA judge 启动前的 `/v1/models` 健康检查在
+  `CAPTION_QA_JUDGE_API_KEY` 非空且非 `EMPTY` 时会发送对应的 Bearer token；这与 vLLM 的
+  `--api-key` 认证兼容，未启用认证的 judge 行为不变。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `git diff --check`；本机未连接
+  Ray/CUDA/Llama，尚未执行三卡端到端 smoke。

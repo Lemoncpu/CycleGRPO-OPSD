@@ -155,8 +155,8 @@ if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
         echo "MULTINODE_ENABLED=true supports NNODES=1 or NNODES=2." >&2
         exit 1
     fi
-    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && "${NUM_GPUS}" != "7" ]]; then
-        echo "A local Llama judge requires NUM_GPUS=7 so GPU 7 remains reserved." >&2
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && ( ! "${NUM_GPUS}" =~ ^[1-7]$ ) ]]; then
+        echo "A local Llama judge requires NUM_GPUS between 1 and 7 so at least one GPU remains reserved." >&2
         exit 1
     fi
     if [[ "${LOCAL_JUDGE_ENABLED}" == "false" && "${NUM_GPUS}" != "8" ]]; then
@@ -689,7 +689,11 @@ if [[ "${MULTINODE_ENABLED}" == "true" && "${SUPERVISED_CAPTION_QA_ENABLED}" == 
         exit 1
     fi
     JUDGE_MODELS_URL="${CAPTION_QA_JUDGE_BASE_URL%/}/models"
-    if ! curl --fail --silent --show-error --max-time 15 "${JUDGE_MODELS_URL}" >/dev/null; then
+    JUDGE_CURL_ARGS=(--fail --silent --show-error --max-time 15)
+    if [[ -n "${CAPTION_QA_JUDGE_API_KEY}" && "${CAPTION_QA_JUDGE_API_KEY}" != "EMPTY" ]]; then
+        JUDGE_CURL_ARGS+=(-H "Authorization: Bearer ${CAPTION_QA_JUDGE_API_KEY}")
+    fi
+    if ! curl "${JUDGE_CURL_ARGS[@]}" "${JUDGE_MODELS_URL}" >/dev/null; then
         echo "DLC-QA judge health check failed: ${JUDGE_MODELS_URL}" >&2
         exit 1
     fi
