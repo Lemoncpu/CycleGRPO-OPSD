@@ -187,6 +187,12 @@ right-padding 导致不同长度多模态 prompt 的生成位置错位；生成�
 `evaluation/*/*.py` 是按文件路径执行的脚本，Python 默认只会把其子目录加入 `sys.path`；若
 遗漏该设置，`from projects...` 会因找不到仓库顶层包而失败。
 
+当原始 FSDP world size 的 GPU 无法同时获得时，`tools/reassemble_fsdp_checkpoint.py` 是常规
+`export` action 的明确离线替代：用 `torchrun --nproc_per_node=<checkpoint world size>` 建立同等数量的
+CPU/Gloo rank，每 rank 读取一个同名 actor shard，rank 0 逐参数还原并写出 safetensors。它不使用 Ray、
+rollout 或 VQ-SAM2，也不改变 checkpoint；代价是需要足够的 CPU RAM 容纳 rank 0 的完整模型和临时 shard。
+该脚本不是降低 FSDP CUDA export world size 的通用开关，常规路径的 `NUM_GPUS` 仍必须匹配 shard 文件名。
+
 仓库 README 明确标记为 WIP，不应假设它是论文所有实验的逐字复现版本。
 
 ### 2.3 RefCOCO 20k 受控训练数据
@@ -642,6 +648,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/multinode/local_llama_judge.py` / `tools/multinode/llama3_chat_template.jinja` | 在预期数量的 Ray 节点上用 CPU-only node-affine detached actor 管理 GPU 7 的本机 Llama vLLM；当前有监督 controller 要求单节点，健康检查要求 `/v1/models` 包含指定 served model，模板固定 Llama-3.1 对话格式 |
 | `tools/cuda_keepalive.py` | 训练成功退出后的可选 CUDA 空闲卡监测/保活工具；用 `nvidia-smi` 监测整卡总显存，仅在低于 1 MiB 时为该可见卡预留约 40000 MiB，收到 SIGTERM/SIGINT 后释放 |
 | `tools/gpu_power_hold.sh` | 显式 GPU 压力占用工具；默认仅对 GPU 0--3 各启动一个独立 worker，预留约 40000 MiB 并持续 BF16 矩阵乘以维持 GPU 利用率/功耗。支持 `start`、`status`、`stop`，只按自身 worker tag 停止 PID，绝不扫描或终止其他 CUDA 进程 |
+| `tools/reassemble_fsdp_checkpoint.py` | CPU/Gloo 离线 FSDP checkpoint 重组器；按 checkpoint 文件名发现并启动同等数量 CPU rank，逐参数收集原 world-size shard 后在 rank 0 还原完整 state dict、复制 processor/config 并写出 HF safetensors。用于训练 world size 无法同时获得足量 GPU 时的评测导出 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
@@ -1981,3 +1988,17 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/trainer/ray_trainer.py` 与 `git diff --check`；
   本机未运行 CUDA/Ray 训练，服务器应以 `NO_TARGET_REWARD_MODE=pixel_empty MAX_STEPS=1` 确认越过
   第 0 step 的 caption concat。
+
+### 2026-09-02 - 增加 CPU/Gloo FSDP checkpoint 离线重组导出
+
+- 代码：新增 `tools/reassemble_fsdp_checkpoint.py` 和 `tests/test_fsdp_reassemble.py`；模块清单同步更新。
+- 行为：新增不依赖 CUDA 的 HF 导出路径。脚本从 `actor/model_world_size_<N>_rank_*.pt` 自动发现并验证
+  原始 world size，要求以同样数量的 CPU/Gloo rank 启动；每 rank 只读取自己的 checkpoint 文件，rank 0
+  按 ShardedTensor 或一维 DTensor metadata 逐参数重建完整 CPU tensor，然后以 checkpoint 的 processor/config
+  和原始 SAMTok model config 写出 safetensors。它拒绝缺失/混合 rank 文件、非空输出目录、重复 shard、未覆盖的
+  ShardedTensor 或不支持的多维 DTensor，而不会静默产生不完整权重。该工具是现有 CUDA/FSDP exporter 的离线运维
+  替代，不改变训练、reward 或评测协议；它以 CPU RAM 换取 GPU，rank 0 需要容纳完整约 4B 权重及临时 gather 数据。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_fsdp_reassemble`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tools/reassemble_fsdp_checkpoint.py` 与 `git diff --check`；
+  本机没有 PyTorch distributed/FSDP checkpoint，未执行真实 8-rank 重组，服务器首次运行应检查 manifest 的
+  `source_world_size=8`，并用一个小型 RefCOCO shard 验证导出权重可加载。
