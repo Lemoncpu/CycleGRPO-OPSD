@@ -215,7 +215,7 @@ def no_target_reward_score(reward_input: dict) -> float:
     if mode != "pixel_empty":
         raise ValueError(f"Unknown no-target reward mode: {mode!r}")
     pixel_empty = reward_input.get("no_target_pixel_empty")
-    if pixel_empty not in (0.0, 1.0):
+    if pixel_empty not in (-1.0, 0.0, 1.0):
         raise ValueError(
             "pixel_empty no-target reward requires GPU-decoded no_target_pixel_empty metadata."
         )
@@ -1201,12 +1201,14 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
             #         }
             #     )
             elif source in ['gres_no_target']:
-                accuracy_score = no_target_reward_score(reward_input)
+                no_target_score = no_target_reward_score(reward_input)
                 no_repeat_score = non_repeat_reward(reward_input["response"])
                 scores.append(
                     {
-                        "cap_overall": accuracy_score + no_repeat_score,
-                        "no_target_accuracy": accuracy_score,
+                        "cap_overall": no_target_score + no_repeat_score,
+                        "no_target_accuracy": float(no_target_score == 1.0),
+                        "no_target_pixel_empty_reward": no_target_score,
+                        "no_target_nonempty_mask_penalty": -1.0 if no_target_score == -1.0 else 0.0,
                         "no_repeat_score": no_repeat_score,
                     }
                 )
@@ -1394,7 +1396,9 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
                 no_repeat_score = non_repeat_reward(reward_input["response"])
                 scores.append({
                     "seg_overall": no_target_score + no_repeat_score,
-                    "seg_supervised_grounding_no_target": no_target_score,
+                    "seg_supervised_grounding_no_target": float(no_target_score == 1.0),
+                    "seg_no_target_pixel_empty_reward": no_target_score,
+                    "seg_no_target_nonempty_mask_penalty": -1.0 if no_target_score == -1.0 else 0.0,
                     "seg_no_repeat_score": no_repeat_score,
                 })
                 continue

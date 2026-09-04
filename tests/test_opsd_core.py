@@ -128,7 +128,7 @@ class OPSDCoreTest(unittest.TestCase):
                 )
             ).post_init()
 
-    def test_pixel_empty_reward_requires_refusal_and_empty_union(self):
+    def test_pixel_empty_reward_requires_refusal_and_penalizes_nonempty_union(self):
         self.assertEqual(pixel_empty_reward(None, "No target."), 1.0)
         self.assertEqual(
             pixel_empty_reward(torch.zeros((2, 2), dtype=torch.bool), "<answer>No target.</answer>"), 1.0
@@ -136,7 +136,8 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(pixel_empty_reward(None, "No target"), 0.0)
         self.assertEqual(pixel_empty_reward(None, "null"), 0.0)
         self.assertEqual(pixel_empty_reward(None, "I cannot identify the object."), 0.0)
-        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), 0.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), -1.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "mask"), -1.0)
 
     def test_positive_empty_mask_penalty_requires_nonempty_target(self):
         target = torch.tensor([[False, True]], dtype=torch.bool)
@@ -177,12 +178,28 @@ class OPSDCoreTest(unittest.TestCase):
             [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 1.0}],
             task="caption",
         )[0]
-        nonempty_score = compute_score(
+        invalid_empty_score = compute_score(
             [{"source": "supervised_grounding_no_target", "response": "No target.", "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 0.0}],
             task="segmentation",
         )[0]
+        nonempty_score = compute_score(
+            [{"source": "gres_no_target", "response": "No target.", "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": -1.0}],
+            task="caption",
+        )[0]
+        nonempty_seg_score = compute_score(
+            [{"source": "supervised_grounding_no_target", "response": "No target.", "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": -1.0}],
+            task="segmentation",
+        )[0]
         self.assertEqual(empty_score["no_target_accuracy"], 1.0)
-        self.assertEqual(nonempty_score["seg_supervised_grounding_no_target"], 0.0)
+        self.assertEqual(empty_score["no_target_pixel_empty_reward"], 1.0)
+        self.assertEqual(invalid_empty_score["seg_supervised_grounding_no_target"], 0.0)
+        self.assertEqual(nonempty_score["cap_overall"], -1.0 + nonempty_score["no_repeat_score"])
+        self.assertEqual(nonempty_score["no_target_accuracy"], 0.0)
+        self.assertEqual(nonempty_score["no_target_pixel_empty_reward"], -1.0)
+        self.assertEqual(nonempty_score["no_target_nonempty_mask_penalty"], -1.0)
+        self.assertEqual(nonempty_seg_score["seg_supervised_grounding_no_target"], 0.0)
+        self.assertEqual(nonempty_seg_score["seg_no_target_pixel_empty_reward"], -1.0)
+        self.assertEqual(nonempty_seg_score["seg_no_target_nonempty_mask_penalty"], -1.0)
         with self.assertRaisesRegex(ValueError, "GPU-decoded"):
             compute_score(
                 [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty"}],
