@@ -275,7 +275,11 @@ OPSD 扩展的 GroundingSuite 覆盖实验，并非论文原始 DenseWorld 数�
 negative 导出：它不加载 VQ-SAM2、不写空的 positive parquet，而写出带人工 `grounding_query`、
 `seg_answer=<answer>No target.</answer>` 和 `source=gres_no_target` 的 no-target parquet。这是 20k
 RefCOCO 正例 + 20k gRefCOCO negative direct GRPO/SFT 流的负样本输入，不应混入主 20k CycleGRPO
-parquet。
+parquet。该转换器也接受可重复的 `--exclude-parquet`：读取已有 cycle/direct parquet 的
+`(COCO image_id, normalized grounding_query)` 与 `(COCO image_id, union-mask RLE)` 身份并在抽样前排除
+对应 gRefCOCO ref，并在新候选内部按相同身份去重。用于新的 gRefCOCO direct multi 正例时，应同时传入主
+20k cycle parquet 和既有 RefCOCO direct parquet；共享 COCO 图像本身不会被排除，只有同图同人工表达或同一
+union target 才会被拒绝，输出 manifest 记录排除文件和两类身份数量。
 
 ## 3. 主训练调用链
 
@@ -660,7 +664,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_grefcoco_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、gRefCOCO 排除抽样、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -717,7 +721,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 `projects/rl/datasets/` 全部是离线数据工具，不在 trainer 内自动运行：
 
 - `prepare_dw_rl_dataset.py` / `prepare_dw_single_rl_dataset.py`：DenseWorld 多目标/单目标转 RL parquet，构造区域叠加图、caption/seg prompt 和 mask token。
-- `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
+- `prepare_grefcoco_cycle_dataset.py`：从 gRefCOCO `train` 按 seed 分层抽取 single/multi positive 与 `ann_id=[-1]` no-target 表达；可通过一个或多个既有 parquet 按 COCO 图像和规范化 expression 或 union-mask RLE 排除已使用记录。正样本合并多个 COCO instance mask 并编码为 `grefcoco_cycle`，no-target 保留为 `gres_no_target`，写出正样本、no-target、合并训练 parquet 与类别清单。gRefCOCO 不包含 part mask，清单明确记录 `part_instance=0`。
 - `prepare_paco_lvis_part_cycle_dataset.py`：从 PACO-LVIS train 的 `id != obj_ann_id` annotation 确定性抽取真 part mask；由于 PACO v1 不提供逐 mask part label，同图同 parent object 类别的所有 part mask 取 union、每图最多保留一个 query，写入 `paco_part_cycle` parquet 与 parent-category manifest。
 - `prepare_cocostuff_cycle_dataset.py`：从 COCO-Stuff 官方 stuffthingmaps 的真 Stuff 类别区域构造 `cocostuff_cycle` parquet；仅接受 PNG 值 91..181，并写入 canonical semantic-label `grounding_query`。
 - `grounding_queries.py`：COCO-Stuff 官方 91 类 PNG-to-label 映射，以及 Stuff/PACO label-template query 的唯一构造器；不读取模型、图像或评测数据。
@@ -2040,3 +2044,17 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   projects/rl/reward_function/text2mask.py tests/test_opsd_core.py tests/test_no_target_reward.py` 与
   `git diff --check`。尝试 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_opsd_core
   tests.test_no_target_reward`，但本机 Python 未安装 `torch`，测试在导入前失败；未执行 CUDA/Ray decoder smoke。
+
+### 2026-09-05 - 支持 disjoint gRefCOCO multi direct 数据导出
+
+- 代码：修改 `projects/rl/datasets/prepare_grefcoco_cycle_dataset.py`，新增
+  `tests/test_grefcoco_cycle_dataset.py`。
+- 文档：更新第 2.4、5.1、5.3 节和本变更日志，记录可审计的 cross-parquet 排除语义与测试模块。
+- 行为：gRefCOCO 转换器新增可重复的 `--exclude-parquet`。它在按 seed 分层抽样前，从每个已有
+  parquet 提取 `(COCO image_id, normalized grounding_query)` 与 `(COCO image_id, union-mask RLE)`，排除
+  相同身份的 gRefCOCO ref；因此可导出 10k multi-instance positive direct 数据，同时避免与主 cycle 数据和
+  既有 RefCOCO direct 数据复用同图同人工表达或同一 target union。共享 COCO 图像但表达和 target 均不同的
+  记录仍可使用，避免不必要缩小 multi 候选池；新候选也按这两种身份去重。输出 manifest 记录排除文件和两类
+  身份数。未指定该参数时不进行跨 parquet 排除，但仍执行候选内部去重。
+- 验证：使用 `ast.parse` 解析转换器和新增单测，且 `git diff --check` 通过；本机 Python 缺少
+  `numpy`/`torch`，无法导入转换器执行该单测，未在服务器执行 VQ-SAM2 编码或 parquet cross-check。
