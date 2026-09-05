@@ -416,8 +416,10 @@ non-cycle caption batch 与 cycle caption batch 拼接为 actor PPO batch 前，
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
 这些文件可以是 `DIRECT_TRAIN_DATA` 的 RefCOCO 正例和可选
-`DIRECT_NO_TARGET_TRAIN_DATA` 的 gRefCOCO no-target 行；按启用项，允许的 `source` 集合是
-`{refcoco_cycle}` 或 `{refcoco_cycle, gres_no_target}`，其余 source 在首 step 显式报错。每个
+`DIRECT_NO_TARGET_TRAIN_DATA` 的 gRefCOCO no-target 行；按启用项，人工表达正例集合始终为
+`{refcoco_cycle, grefcoco_cycle}`，可选 no-target 集合增加 `gres_no_target`，而
+`include_label_sources=true` 额外允许 `{cocostuff_cycle, paco_part_cycle}`；其余 source 在首 step
+显式报错。每个
 parent expression 建立一个独立 `K=6`
 text-to-mask rollout group，先裁到 world size 的整倍数；不足一个 rank-shard 时跳过并记录原因。
 这最多丢弃 `world_size-1` 个 direct prompt，不影响主 caption/cycle batch 或其 reward。query 按偶/奇
@@ -2074,3 +2076,18 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   不影响 `POSITIVE_EMPTY_MASK_PENALTY`，因此可单独保留正样本错误拒识/空 mask 的 `-1.0`。
 - 验证：执行受影响 Python 的 AST 语法解析、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与
   `git diff --check`；本机缺少 `torch`，未运行依赖模型模块的完整单测或 CUDA/Ray decoder smoke。
+
+### 2026-09-05 - 修复 gRefCOCO positive direct GRPO 的前置 source 校验
+
+- 代码：修改 `verl/workers/supervised_anchors.py`、`verl/trainer/ray_trainer.py` 与
+  `tests/test_supervised_anchors.py`；未新增、移动或删除模块。
+- 文档：更新第 3.4 节 direct loader 的 source 契约及本变更日志；模块清单无变化。
+- 行为：将 direct loader 的首 step source 校验与实际 direct grounding/SFT source 路由统一。启用
+  `include_positive_sources` 时，校验现在同时允许 `refcoco_cycle` 和 `grefcoco_cycle`，因此新的
+  30k RefCOCO + 10k gRefCOCO multi positive parquet 可进入 direct GRPO。可选 no-target 和 label
+  source 也从同一纯函数生成允许集合，避免校验与路由再次漂移；loss、数据抽样和现有 RefCOCO/no-target
+  行为不变。
+- 验证：执行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_supervised_anchors`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/supervised_anchors.py`
+  `verl/trainer/ray_trainer.py tests/test_supervised_anchors.py` 与 `git diff --check`；本机未运行 CUDA/Ray
+  端到端训练，服务器应以当前三卡配置确认进入 step 1。

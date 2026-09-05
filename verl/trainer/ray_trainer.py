@@ -58,6 +58,7 @@ from ..workers.opsd import (
 )
 from ..workers.supervised_anchors import (
     aligned_direct_prompt_count,
+    allowed_direct_supervision_sources,
     direct_grounding_loss_weight,
     direct_mask_ce_response_fields,
     direct_mask_ce_source,
@@ -1922,33 +1923,31 @@ class RayPPOTrainer:
                     direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
                     direct_grounding_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
-                    allowed_direct_sources = set()
-                    if (
-                        (
+                    allowed_direct_sources = allowed_direct_supervision_sources(
+                        include_positive_sources=(
                             direct_grounding_config.enabled
                             and direct_grounding_config.include_positive_sources
                         )
                         or (
                             direct_mask_ce_config.enabled
                             and direct_mask_ce_config.include_positive_sources
-                        )
-                    ):
-                        allowed_direct_sources.add("refcoco_cycle")
-                    if (
-                        (
+                        ),
+                        include_no_target=(
                             direct_grounding_config.enabled
                             and direct_grounding_config.include_no_target
                         )
                         or (
                             direct_mask_ce_config.enabled
                             and direct_mask_ce_config.include_no_target
-                        )
-                    ):
-                        allowed_direct_sources.add("gres_no_target")
+                        ),
+                        include_label_sources=(
+                            direct_grounding_config.enabled
+                            and direct_grounding_config.include_label_sources
+                        ),
+                    )
                     if not direct_sources or not direct_sources.issubset(allowed_direct_sources):
                         raise ValueError(
-                            "Direct supervision data may contain only enabled human-expression sources "
-                            "refcoco_cycle and gres_no_target; "
+                            "Direct supervision data may contain only enabled direct source families; "
                             f"allowed={sorted(allowed_direct_sources)}, got={sorted(direct_sources)}."
                         )
                 if cycle_batch is not None and (

@@ -23,6 +23,7 @@ DirectMaskCEConfig = _CONFIG_MODULE.DirectMaskCEConfig
 GradientDiagnosticsConfig = _CONFIG_MODULE.GradientDiagnosticsConfig
 aligned_direct_prompt_count = _CONFIG_MODULE.aligned_direct_prompt_count
 alternating_localization_prompt_variants = _CONFIG_MODULE.alternating_localization_prompt_variants
+allowed_direct_supervision_sources = _CONFIG_MODULE.allowed_direct_supervision_sources
 direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
 direct_mask_ce_response_fields = _CONFIG_MODULE.direct_mask_ce_response_fields
 direct_mask_ce_source = _CONFIG_MODULE.direct_mask_ce_source
@@ -105,6 +106,22 @@ class SupervisedAnchorsTest(unittest.TestCase):
         config = DirectGroundingConfig()
         self.assertEqual(config.rollouts, 6)
         self.assertFalse(config.consume_no_target_caption)
+
+    def test_direct_supervision_source_guard_matches_enabled_source_families(self):
+        self.assertEqual(
+            allowed_direct_supervision_sources(include_positive_sources=True),
+            {"refcoco_cycle", "grefcoco_cycle"},
+        )
+        self.assertEqual(
+            allowed_direct_supervision_sources(include_no_target=True),
+            {"refcoco_cycle", "grefcoco_cycle", "gres_no_target"},
+        )
+        self.assertEqual(
+            allowed_direct_supervision_sources(
+                include_positive_sources=False, include_label_sources=True
+            ),
+            {"cocostuff_cycle", "paco_part_cycle"},
+        )
 
     def test_pairwise_multitask_gradient_diagnostics_is_opt_in(self):
         self.assertFalse(GradientDiagnosticsConfig().enabled)

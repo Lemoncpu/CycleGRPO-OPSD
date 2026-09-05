@@ -4,6 +4,22 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 
+def allowed_direct_supervision_sources(
+    include_positive_sources: bool = True,
+    include_no_target: bool = False,
+    include_label_sources: bool = False,
+) -> set[str]:
+    """Return source labels permitted by the enabled direct-supervision paths."""
+    allowed_sources = set()
+    if include_positive_sources:
+        allowed_sources.update({"refcoco_cycle", "grefcoco_cycle"})
+    if include_label_sources:
+        allowed_sources.update({"cocostuff_cycle", "paco_part_cycle"})
+    if include_no_target:
+        allowed_sources.add("gres_no_target")
+    return allowed_sources
+
+
 def direct_grounding_source(
     source: object,
     include_no_target: bool,
