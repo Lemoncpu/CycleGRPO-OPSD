@@ -113,6 +113,9 @@ worker:
       # Deducted from a positive segmentation reward only when the response
       # refuses or decodes to zero pixels. Set 0.0 to disable.
       positive_empty_mask_penalty: 1.0
+      # In pixel_empty mode, decoded nonempty no-target masks receive this
+      # negative reward. Set 0.0 to retain the pre-penalty zero reward.
+      no_target_nonempty_mask_penalty: 1.0
     routing:
       enabled: true
       low_threshold: 0.5

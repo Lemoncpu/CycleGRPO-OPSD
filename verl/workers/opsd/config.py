@@ -27,6 +27,9 @@ class PixelIoUConfig:
     # Subtract this score from a positive segmentation rollout that explicitly
     # refuses or decodes to an empty mask. Zero disables the term.
     positive_empty_mask_penalty: float = 1.0
+    # In pixel_empty mode, subtract this score when a no-target response
+    # decodes to a nonempty union. Zero restores the pre-penalty 0 reward.
+    no_target_nonempty_mask_penalty: float = 1.0
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -51,6 +54,8 @@ class PixelIoUConfig:
             )
         if self.positive_empty_mask_penalty < 0.0:
             raise ValueError("pixel_iou.positive_empty_mask_penalty must be non-negative.")
+        if self.no_target_nonempty_mask_penalty < 0.0:
+            raise ValueError("pixel_iou.no_target_nonempty_mask_penalty must be non-negative.")
 
 
 @dataclass

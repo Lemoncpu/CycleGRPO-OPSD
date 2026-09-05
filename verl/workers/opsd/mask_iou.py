@@ -73,12 +73,14 @@ def compute_binary_iou(target: torch.Tensor, prediction: torch.Tensor) -> torch.
     return torch.where(union > 0, intersection / union, torch.zeros_like(union))
 
 
-def pixel_empty_reward(prediction: Optional[torch.Tensor], response: Optional[str]) -> float:
-    """Score decoded no-target responses and penalize nonempty mask hallucinations."""
+def pixel_empty_reward(
+    prediction: Optional[torch.Tensor], response: Optional[str], nonempty_mask_penalty: float = 1.0
+) -> float:
+    """Score decoded no-target responses with an optional nonempty-mask penalty."""
     has_explicit_refusal = isinstance(response, str) and NO_TARGET_REFUSAL_PATTERN.search(response) is not None
     has_empty_union = prediction is None or not bool(prediction.any())
     if not has_empty_union:
-        return -1.0
+        return -float(nonempty_mask_penalty)
     return 1.0 if has_explicit_refusal else 0.0
 
 

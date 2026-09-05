@@ -116,8 +116,11 @@ class OPSDCoreTest(unittest.TestCase):
         PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
         PixelIoUConfig(no_target_reward_mode="official_bbox").post_init()
         PixelIoUConfig(positive_empty_mask_penalty=0.0).post_init()
+        PixelIoUConfig(no_target_nonempty_mask_penalty=0.0).post_init()
         with self.assertRaisesRegex(ValueError, "positive_empty_mask_penalty"):
             PixelIoUConfig(positive_empty_mask_penalty=-0.01).post_init()
+        with self.assertRaisesRegex(ValueError, "no_target_nonempty_mask_penalty"):
+            PixelIoUConfig(no_target_nonempty_mask_penalty=-0.01).post_init()
         with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
             PixelIoUConfig(no_target_reward_mode="unknown").post_init()
         with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):
@@ -138,6 +141,7 @@ class OPSDCoreTest(unittest.TestCase):
         self.assertEqual(pixel_empty_reward(None, "I cannot identify the object."), 0.0)
         self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), -1.0)
         self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "mask"), -1.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target.", 0.0), 0.0)
 
     def test_positive_empty_mask_penalty_requires_nonempty_target(self):
         target = torch.tensor([[False, True]], dtype=torch.bool)

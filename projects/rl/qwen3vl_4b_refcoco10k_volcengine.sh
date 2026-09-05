@@ -31,6 +31,7 @@ LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
 CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
 POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
+NO_TARGET_NONEMPTY_MASK_PENALTY="${NO_TARGET_NONEMPTY_MASK_PENALTY:-1.0}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
@@ -614,6 +615,7 @@ echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
 echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
 echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
 echo "Positive empty-mask penalty: ${POSITIVE_EMPTY_MASK_PENALTY}"
+echo "No-target nonempty-mask penalty: ${NO_TARGET_NONEMPTY_MASK_PENALTY}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -747,6 +749,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
     worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.no_target_nonempty_mask_penalty="${NO_TARGET_NONEMPTY_MASK_PENALTY}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \

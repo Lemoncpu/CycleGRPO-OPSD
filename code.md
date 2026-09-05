@@ -404,9 +404,9 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
 主 20k 的 `pixel_empty` no-target 行与公开 CycleGRPO 一样保留为 caption-only non-cycle rollout，不读取
 `grounding_query`，也不构造 `supervised_grounding_no_target` 的 K 次 segmentation rollout。FSDP worker 在
 caption response 上按当前 decoder 模式解码合法 group；大小写不敏感的精确 `No target.` 拒识和零像素
-union 同时成立时，写回 `no_target_pixel_empty=1.0`；decoded union 非空时无论文本为何均写回 `-1.0`，空 union
-但拒识格式无效时写回 `0.0`。随后该 batch 仍由常规 caption reward、log-prob、KL 和 GRPO advantage 路径更新
-captioner。独立 direct no-target segmentation rollout
+union 同时成立时，写回 `no_target_pixel_empty=1.0`；decoded union 非空时默认写回 `-1.0`，但
+`pixel_iou.no_target_nonempty_mask_penalty=0.0` 时写回历史兼容的 `0.0`；空 union 但拒识格式无效时始终写回
+`0.0`。随后该 batch 仍由常规 caption reward、log-prob、KL 和 GRPO advantage 路径更新 captioner。独立 direct no-target segmentation rollout
 仅在外部 direct grounding 配置明确启用时运行。
 `no_target_pixel_empty` 与 `no_target_reward_mode` 仅是上述 reward 阶段的临时 metadata：优势计算完成后、
 non-cycle caption batch 与 cycle caption batch 拼接为 actor PPO batch 前，trainer 会从两侧移除它们。
@@ -524,12 +524,15 @@ localization positive:
 `pixel_empty` 时，主 20k no-target 行仍计算 caption reward；FSDP worker 在该 non-cycle caption response
 上解析全部完整、codebook 合法的 depth-2 group，以与离线 `legacy_union` 相同的 VQ-SAM2 和阈值解码并取像素 union；仅当 union
 为空（包括无合法 group、残缺 group 或合法 group 解码为零像素）**且** response 以大小写不敏感的精确
-`No target.` 短语显式拒识时，该正确性项才为 `1.0`。decoded union 非空时无论 response 是否写出拒识，均为
-`-1.0`，以惩罚 no-target 的 mask 假阳性；仅在 union 为空但拒识格式无效时为 `0.0`。因此 `null`、普通解释、
+`No target.` 短语显式拒识时，该正确性项才为 `1.0`。decoded union 非空时无论 response 是否写出拒识，默认
+为 `-1.0`，以惩罚 no-target 的 mask 假阳性；将
+`worker.opsd.pixel_iou.no_target_nonempty_mask_penalty`（入口环境变量
+`NO_TARGET_NONEMPTY_MASK_PENALTY`）设为 `0.0` 可恢复该惩罚加入前的 `0.0`，同时仍执行 decoded-union
+判定和正确拒识的 `+1.0`。仅在 union 为空但拒识格式无效时为 `0.0`。因此 `null`、普通解释、
 空回复或仅 EOS 即使没有 mask 也不会得到 pixel-empty 奖励；`<answer>No target.</answer>` 仍是合法拒识格式。
 `no_target_accuracy`/`seg_supervised_grounding_no_target` 继续记录正确拒识率，独立
 `*_no_target_pixel_empty_reward` 与 `*_no_target_nonempty_mask_penalty` 记录实际三值 reward 和 false-positive
-负分。该训练奖励比 GRES `N_acc` 的单独 `not pred_mask.any()` 更严格，目的是避免模型以空生成钻取 reward 空子集。
+负分；惩罚系数为零时该负分指标为 `0.0`。该训练奖励比 GRES `N_acc` 的单独 `not pred_mask.any()` 更严格，目的是避免模型以空生成钻取 reward 空子集。
 它要求 `worker.opsd.enabled=true` 和 `pixel_iou.enabled=true`，缺少 GPU 解码 metadata 会显式报错，不会退回
 文本奖励。无论模式如何，第二项原有的非重复奖励均保持不变；主 no-target 更新始终作用于 captioner。独立
 direct no-target segmentation rollout 仍按其自己的外部监督配置运行。
@@ -2058,3 +2061,16 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   身份数。未指定该参数时不进行跨 parquet 排除，但仍执行候选内部去重。
 - 验证：使用 `ast.parse` 解析转换器和新增单测，且 `git diff --check` 通过；本机 Python 缺少
   `numpy`/`torch`，无法导入转换器执行该单测，未在服务器执行 VQ-SAM2 编码或 parquet cross-check。
+
+### 2026-09-05 - 参数化 pixel-empty no-target 非空 mask 负分
+
+- 代码：修改 `verl/workers/opsd/mask_iou.py`、`verl/workers/opsd/config.py`、
+  `verl/workers/fsdp_workers.py`、`projects/rl/config.yaml`、
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与 `tests/test_opsd_core.py`；未新增、移动或删除模块。
+- 文档：更新第 3.4、3.5 节和本变更日志，区分正样本 empty/refusal penalty 与 no-target nonempty-mask penalty。
+- 行为：新增 `pixel_iou.no_target_nonempty_mask_penalty` / `NO_TARGET_NONEMPTY_MASK_PENALTY`，默认 `1.0`
+  保持 decoded nonempty no-target union 的 `-1.0` 行为。设置为 `0.0` 时，`pixel_empty` 仍解码 no-target
+  response，显式 `No target.` 加空 union 仍为 `+1.0`，但 nonempty union 恢复为负分加入前的 `0.0`。该开关
+  不影响 `POSITIVE_EMPTY_MASK_PENALTY`，因此可单独保留正样本错误拒识/空 mask 的 `-1.0`。
+- 验证：执行受影响 Python 的 AST 语法解析、`bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与
+  `git diff --check`；本机缺少 `torch`，未运行依赖模型模块的完整单测或 CUDA/Ray decoder smoke。
