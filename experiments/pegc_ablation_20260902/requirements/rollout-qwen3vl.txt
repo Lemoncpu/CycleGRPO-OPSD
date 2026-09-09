@@ -1,0 +1,4 @@
+# Native Qwen3-VL vLLM rollout required by projects/rl/qwen3vl_4b_mt.sh.
+# vLLM 0.8.x is not compatible with this project's Qwen3-VL rollout path.
+-r cuda-kernels.txt
+vllm==0.11.0

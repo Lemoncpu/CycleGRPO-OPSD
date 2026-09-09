@@ -1,0 +1,8 @@
+# trial_id	ray_address	ray_namespace	experiment_env
+# Ray head/worker processes are provisioned by the platform. Use one isolated
+# two-node, 16-GPU Ray address per trial; no SSH host or NCCL interface is
+# needed by this controller.
+trial_01	ray-head-01:6379	cyclegrpo-trial-01	projects/rl/experiments/multinode/trial_01.env
+trial_02	ray-head-02:6379	cyclegrpo-trial-02	projects/rl/experiments/multinode/trial_02.env
+trial_03	ray-head-03:6379	cyclegrpo-trial-03	projects/rl/experiments/multinode/trial_03.env
+trial_04	ray-head-04:6379	cyclegrpo-trial-04	projects/rl/experiments/multinode/trial_04.env

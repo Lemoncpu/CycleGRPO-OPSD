@@ -1,0 +1,551 @@
+import unittest
+
+import torch
+from PIL import Image
+
+from verl.workers.opsd.distillation import (
+    caption_blocked_special_token_ids,
+    chunked_weighted_jsd_loss,
+)
+from verl.workers.opsd.config import OPSDConfig, PixelIoUConfig, TeacherConfidenceConfig
+from verl.workers.opsd.mask_iou import (
+    coerce_raw_mask,
+    compute_binary_iou,
+    decode_mask_tokens,
+    mask_group_metadata,
+    parse_mask_codes,
+    pixel_empty_reward,
+    positive_empty_mask_penalty,
+)
+from verl.workers.supervised_anchors import localization_prompt_variants
+from verl.utils.dataset import RLHFDataset
+from projects.rl.reward_function.text2mask import compute_score
+from verl.workers.opsd.routing import (
+    GRPO_ROUTE,
+    ON_POLICY_DISTILL_ROUTE,
+    REGENERATE_ROUTE,
+    aggregate_caption_rollouts,
+    build_privileged_context,
+    build_privileged_teacher_images,
+    caption_safety_reason,
+    classify_route,
+    distillation_weight,
+    format_privileged_prompt,
+    regenerate_weight,
+    teacher_caption_is_safe,
+    uses_original_grpo,
+)
+from verl.workers.config import WorkerConfig
+
+
+class OPSDCoreTest(unittest.TestCase):
+    def test_source_aware_official_caption_templates(self):
+        dataset = RLHFDataset.__new__(RLHFDataset)
+        dataset.cycle_prompt_mode = "official_source_aware"
+        dataset.seg_answer_key = "seg_answer"
+        mask = "<|mt_start|><|mt_0001|><|mt_0002|><|mt_end|>"
+        ref_prompt = dataset._build_source_aware_caption_prompt(
+            {"source": "refcoco_cycle", "seg_answer": f"<answer>{mask}</answer>"}, "old"
+        )
+        gref_prompt = dataset._build_source_aware_caption_prompt(
+            {"source": "grefcoco_cycle", "seg_answer": f"<answer>{mask}</answer>"}, "old"
+        )
+        self.assertEqual(ref_prompt, f"<image>\nProvide a detailed description of this region {mask}.")
+        self.assertIn("following regions", gref_prompt)
+        self.assertIn("interleaved segmentation masks", gref_prompt)
+
+    def test_multi_group_reward_keeps_original_cyclegrpo_semantics(self):
+        first = "<|mt_start|><|mt_0007|><|mt_0268|><|mt_end|>"
+        second = "<|mt_start|><|mt_0008|><|mt_0269|><|mt_end|>"
+        repeated = first * 4
+        valid = mask_group_metadata(first)
+        multi_group = mask_group_metadata(first + second)
+        self.assertEqual(valid["complete_group_count"], 1)
+        self.assertEqual(valid["valid_group_count"], 1)
+        self.assertEqual(valid["first_valid_codes"], [7, 12])
+        self.assertEqual(multi_group["complete_group_count"], 2)
+        self.assertEqual(multi_group["valid_group_count"], 2)
+        self.assertEqual(parse_mask_codes(repeated), [7, 12])
+
+        reward_inputs = [
+            {
+                "source": "supervised_grounding",
+                "response": first,
+                "iou_scores": 0.8,
+                "mask_group_count": 1,
+                "valid_mask_group_count": 1,
+            },
+            {
+                "source": "supervised_grounding",
+                "response": first + second,
+                "iou_scores": 0.8,
+                "mask_group_count": 2,
+                "valid_mask_group_count": 2,
+            },
+            {
+                "source": "supervised_grounding",
+                "response": repeated,
+                "iou_scores": 0.8,
+                "mask_group_count": 4,
+                "valid_mask_group_count": 4,
+            },
+        ]
+        scores = compute_score(reward_inputs, task="segmentation")
+        self.assertAlmostEqual(scores[0]["seg_overall"], 10.0)
+        self.assertAlmostEqual(scores[1]["seg_overall"], 10.0)
+        self.assertAlmostEqual(scores[2]["seg_overall"], 9.0)
+        self.assertEqual(scores[2]["seg_no_repeat_score"], 0.0)
+
+    def test_anchor_kl_coefficients_must_be_non_negative(self):
+        config = OPSDConfig(caption_anchor_kl_coef=0.05, segmentation_anchor_kl_coef=0.05)
+        config.post_init()
+        self.assertFalse(config.asymmetric_gradient_projection)
+        self.assertTrue(OPSDConfig(asymmetric_gradient_projection=True).asymmetric_gradient_projection)
+        with self.assertRaisesRegex(ValueError, "segmentation_anchor_kl_coef"):
+            OPSDConfig(segmentation_anchor_kl_coef=-0.01).post_init()
+
+    def test_no_target_reward_mode_validation(self):
+        self.assertEqual(PixelIoUConfig().no_target_reward_mode, "text")
+        self.assertEqual(PixelIoUConfig().mask_decode_mode, "union")
+        self.assertEqual(PixelIoUConfig().localization_prompt_mode, "mixed")
+        PixelIoUConfig(mask_decode_mode="first_mask", localization_prompt_mode="refcoco").post_init()
+        with self.assertRaisesRegex(ValueError, "mask_decode_mode"):
+            PixelIoUConfig(mask_decode_mode="invalid").post_init()
+        with self.assertRaisesRegex(ValueError, "localization_prompt_mode"):
+            PixelIoUConfig(localization_prompt_mode="invalid").post_init()
+        PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
+        PixelIoUConfig(no_target_reward_mode="official_bbox").post_init()
+        PixelIoUConfig(positive_empty_mask_penalty=0.0).post_init()
+        with self.assertRaisesRegex(ValueError, "positive_empty_mask_penalty"):
+            PixelIoUConfig(positive_empty_mask_penalty=-0.01).post_init()
+        with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
+            PixelIoUConfig(no_target_reward_mode="unknown").post_init()
+        with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):
+            WorkerConfig(
+                opsd=OPSDConfig(
+                    enabled=False,
+                    pixel_iou=PixelIoUConfig(no_target_reward_mode="pixel_empty"),
+                )
+            ).post_init()
+
+    def test_pixel_empty_reward_requires_refusal_and_empty_union(self):
+        self.assertEqual(pixel_empty_reward(None, "No target."), 1.0)
+        self.assertEqual(
+            pixel_empty_reward(torch.zeros((2, 2), dtype=torch.bool), "<answer>No target.</answer>"), 1.0
+        )
+        self.assertEqual(pixel_empty_reward(None, "No target"), 0.0)
+        self.assertEqual(pixel_empty_reward(None, "null"), 0.0)
+        self.assertEqual(pixel_empty_reward(None, "I cannot identify the object."), 0.0)
+        self.assertEqual(pixel_empty_reward(torch.tensor([[False, True]]), "No target."), 0.0)
+
+    def test_positive_empty_mask_penalty_requires_nonempty_target(self):
+        target = torch.tensor([[False, True]], dtype=torch.bool)
+        self.assertEqual(positive_empty_mask_penalty(target, None, "No target.", 1.0), -1.0)
+        self.assertEqual(
+            positive_empty_mask_penalty(target, torch.zeros((1, 2), dtype=torch.bool), "mask", 1.0),
+            -1.0,
+        )
+        self.assertEqual(
+            positive_empty_mask_penalty(target, torch.tensor([[False, True]]), "No target.", 1.0),
+            -1.0,
+        )
+        self.assertEqual(positive_empty_mask_penalty(target, None, "No target.", 0.0), 0.0)
+        self.assertEqual(
+            positive_empty_mask_penalty(torch.zeros((1, 2), dtype=torch.bool), None, "No target.", 1.0),
+            0.0,
+        )
+
+    def test_positive_empty_mask_penalty_is_added_to_segmentation_reward(self):
+        reward_input = {
+            "source": "refcoco_cycle",
+            "response": "No target.",
+            "mask_token_accuracy": 0.0,
+            "iou_scores": 0.0,
+            "mask_group_count": 0,
+            "valid_mask_group_count": 0,
+        }
+        base_score = compute_score([reward_input], task="segmentation")[0]["seg_overall"]
+        score = compute_score(
+            [{**reward_input, "positive_empty_mask_penalty": -1.0}], task="segmentation"
+        )[0]
+        self.assertEqual(score["seg_positive_empty_mask_penalty"], -1.0)
+        self.assertEqual(score["seg_overall"], base_score - 1.0)
+
+    def test_no_target_reward_score_uses_decoded_union_when_requested(self):
+        response = "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>"
+        empty_score = compute_score(
+            [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 1.0}],
+            task="caption",
+        )[0]
+        nonempty_score = compute_score(
+            [{"source": "supervised_grounding_no_target", "response": "No target.", "no_target_reward_mode": "pixel_empty", "no_target_pixel_empty": 0.0}],
+            task="segmentation",
+        )[0]
+        self.assertEqual(empty_score["no_target_accuracy"], 1.0)
+        self.assertEqual(nonempty_score["seg_supervised_grounding_no_target"], 0.0)
+        with self.assertRaisesRegex(ValueError, "GPU-decoded"):
+            compute_score(
+                [{"source": "gres_no_target", "response": response, "no_target_reward_mode": "pixel_empty"}],
+                task="caption",
+            )
+
+    def test_teacher_confidence_thresholds_are_unit_intervals(self):
+        config = OPSDConfig(
+            teacher_confidence=TeacherConfidenceConfig(
+                enabled=True,
+                regenerate_min_teacher_score=0.65,
+                regenerate_min_normalized_improvement=0.30,
+                distill_min_caption_score=0.65,
+            )
+        )
+        config.post_init()
+        with self.assertRaisesRegex(ValueError, "teacher_confidence.distill_min_caption_score"):
+            OPSDConfig(
+                teacher_confidence=TeacherConfidenceConfig(distill_min_caption_score=1.01)
+            ).post_init()
+
+    def test_route_boundaries_are_strict(self):
+        self.assertEqual(classify_route(0.4999), REGENERATE_ROUTE)
+        self.assertEqual(classify_route(0.5), ON_POLICY_DISTILL_ROUTE)
+        self.assertEqual(classify_route(0.85), ON_POLICY_DISTILL_ROUTE)
+        self.assertEqual(classify_route(0.8501), GRPO_ROUTE)
+
+    def test_six_caption_routes_are_exhaustive(self):
+        routes = [classify_route(score) for score in (0.1, 0.4999, 0.5, 0.7, 0.85, 0.9)]
+        self.assertEqual(len(routes), 6)
+        self.assertEqual(routes.count(REGENERATE_ROUTE), 2)
+        self.assertEqual(routes.count(ON_POLICY_DISTILL_ROUTE), 3)
+        self.assertEqual(routes.count(GRPO_ROUTE), 1)
+
+    def test_mask_token_offsets_are_validated(self):
+        self.assertEqual(parse_mask_codes("<|mt_start|><|mt_0012|><|mt_0268|><|mt_end|>"), [12, 12])
+        self.assertIsNone(parse_mask_codes("<|mt_start|><|mt_0256|><|mt_0268|><|mt_end|>"))
+        self.assertIsNone(parse_mask_codes("not a mask"))
+
+    def test_binary_iou(self):
+        target = torch.tensor([[[1, 1], [0, 0]], [[0, 0], [0, 0]]])
+        prediction = torch.tensor([[[1, 0], [1, 0]], [[0, 0], [0, 0]]])
+        self.assertTrue(torch.allclose(compute_binary_iou(target, prediction), torch.tensor([1 / 3, 0.0])))
+        resized = coerce_raw_mask([[1, 0], [0, 1]], (4, 4))
+        self.assertEqual(tuple(resized.shape), (4, 4))
+
+    def test_decoder_reuses_one_image_embedding_across_chunks(self):
+        class FakeDecoder:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+            def __init__(self):
+                self.encode_calls = 0
+                self.decode_calls = 0
+
+            def encode_single_image(self, pixel_values):
+                self.encode_calls += 1
+                return pixel_values
+
+            def decode_codes_from_single_image(self, image_state, codes):
+                self.decode_calls += 1
+                logits = torch.zeros((len(codes), 1, 2, 2), dtype=torch.float32)
+                for index, code in enumerate(codes[:, 0].tolist()):
+                    logits[index, 0, code % 2, code // 2 % 2] = 1.0
+                return logits
+
+        decoder = FakeDecoder()
+        image = Image.new("RGB", (2, 2), color="white")
+        masks, size = decode_mask_tokens(
+            vq_sam2=decoder,
+            image=image,
+            token_texts=[
+                "<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>",
+                "<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|><|mt_start|><|mt_0003|><|mt_0259|><|mt_end|>",
+                "invalid",
+            ],
+            decode_batch_size=1,
+        )
+        self.assertEqual(decoder.encode_calls, 1)
+        self.assertEqual(decoder.decode_calls, 3)
+        self.assertEqual(size, (2, 2))
+        self.assertEqual(tuple(masks[0].shape), (2, 2))
+        self.assertEqual(int(masks[1].sum()), 2)
+        self.assertIsNone(masks[2])
+
+        first_masks, _ = decode_mask_tokens(
+            vq_sam2=decoder,
+            image=image,
+            token_texts=[
+                "<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|><|mt_start|><|mt_0003|><|mt_0259|><|mt_end|>"
+            ],
+            decode_batch_size=2,
+            decode_mode="first_mask",
+        )
+        self.assertEqual(int(first_masks[0].sum()), 1)
+
+    def test_localization_prompt_modes(self):
+        self.assertEqual(
+            localization_prompt_variants(4, "mixed"),
+            ["refcoco", "groundingsuite", "refcoco", "groundingsuite"],
+        )
+        self.assertEqual(localization_prompt_variants(3, "refcoco"), ["refcoco"] * 3)
+        self.assertEqual(localization_prompt_variants(2, "legacy"), ["legacy"] * 2)
+
+    def test_aggregate_and_privileged_context(self):
+        ious = [0.1, 0.4, 0.7, 0.8, 0.9, 0.6]
+        aggregate = aggregate_caption_rollouts(ious)
+        self.assertAlmostEqual(aggregate["R_Ci"], sum(ious) / len(ious), places=6)
+        self.assertEqual(aggregate["route"], ON_POLICY_DISTILL_ROUTE)
+
+        target = torch.tensor([[1, 1], [0, 0]], dtype=torch.bool)
+        predictions = [target.clone() for _ in ious]
+        context = build_privileged_context(
+            student_caption="a red object",
+            target_mask_token="<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>",
+            predicted_mask_tokens=[None] * len(ious),
+            pixel_ious=ious,
+            target_mask=target,
+            predicted_masks=predictions,
+        )
+        self.assertEqual(context["target_summary"]["area"], 2)
+        self.assertEqual(len(context["pixel_ious"]), 6)
+        self.assertEqual(context["representative_mask"]["shape"], [2, 2])
+        self.assertEqual(context["relative_position"]["horizontal"], "aligned")
+        self.assertEqual(context["valid_mask_token_count"], 0)
+        self.assertEqual(context["target_mask"]["shape"], [2, 2])
+        diagnosis_prompt = format_privileged_prompt(context, mode="analysis")
+        self.assertIn("failure_mode", diagnosis_prompt)
+        self.assertIn("correction_focus", diagnosis_prompt)
+        self.assertNotIn("Target region token", diagnosis_prompt)
+        self.assertNotIn("<|mt_start|>", diagnosis_prompt)
+
+    def test_privileged_teacher_images_keep_mask_evidence_out_of_text_prompt(self):
+        target = torch.tensor(
+            [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=torch.bool
+        )
+        reconstruction = torch.tensor(
+            [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.bool
+        )
+        context = build_privileged_context(
+            student_caption="a red object",
+            target_mask_token="<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>",
+            predicted_mask_tokens=["<|mt_start|><|mt_0002|><|mt_0258|><|mt_end|>"],
+            pixel_ious=[0.2],
+            target_mask=target,
+            predicted_masks=[reconstruction],
+        )
+        image = Image.new("RGB", (4, 4), color=(20, 40, 60))
+        evidence = build_privileged_teacher_images(image, context, padding_fraction=0.0)
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual(evidence[0].size, (4, 4))
+        self.assertEqual(evidence[1].size, evidence[2].size)
+        self.assertEqual(evidence[1].getpixel((0, 0)), (20, 40, 60))
+        self.assertEqual(evidence[1].getpixel((3, 3)), (127, 127, 127))
+        self.assertEqual(evidence[2].getpixel((0, 0)), (127, 127, 127))
+        self.assertEqual(evidence[2].getpixel((3, 3)), (20, 40, 60))
+        prompt = format_privileged_prompt(context, mode="distill")
+        self.assertIn("Image 2", prompt)
+        self.assertNotIn("IoU", prompt)
+        self.assertNotIn("<|mt_start|>", prompt)
+        target_only_evidence = build_privileged_teacher_images(
+            image, context, padding_fraction=0.0, include_reconstruction=False
+        )
+        self.assertEqual(len(target_only_evidence), 2)
+
+    def test_route_weights(self):
+        self.assertAlmostEqual(regenerate_weight(0.4, 0.7), 0.5)
+        self.assertEqual(regenerate_weight(0.4, 0.3), 0.0)
+        self.assertAlmostEqual(distillation_weight(0.5), 1.0)
+        self.assertAlmostEqual(distillation_weight(0.85), 0.1)
+
+    def test_teacher_caption_leakage_filter(self):
+        self.assertTrue(teacher_caption_is_safe("A red ceramic cup beside a silver spoon."))
+        self.assertFalse(teacher_caption_is_safe("The mask score has improved."))
+        self.assertFalse(
+            teacher_caption_is_safe("<|mt_start|><|mt_0001|><|mt_0257|><|mt_end|>")
+        )
+        self.assertFalse(teacher_caption_is_safe("A cup. <|im_start|>system"))
+
+    def test_caption_safety_rejects_special_tokens_json_and_overlength(self):
+        self.assertIsNone(
+            caption_safety_reason(
+                "<think>brief reasoning</think> A red ceramic cup.",
+                response_tokens=12,
+                max_response_tokens=256,
+            )
+        )
+        self.assertIsNone(caption_safety_reason("A red cup.<|im_end|>"))
+        self.assertEqual(
+            caption_safety_reason("<|mt_start|><|mt_0001|><|mt_end|>"),
+            "special_token",
+        )
+        self.assertEqual(
+            caption_safety_reason('{"mask_2d": "<|mt_start|>..."}'),
+            "mask_json",
+        )
+        self.assertEqual(
+            caption_safety_reason("A red cup.", response_tokens=257, max_response_tokens=256),
+            "overlength",
+        )
+
+    def test_b_mode_preserves_original_grpo_only_for_safe_captions(self):
+        self.assertTrue(
+            uses_original_grpo(
+                REGENERATE_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertTrue(
+            uses_original_grpo(
+                ON_POLICY_DISTILL_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertFalse(
+            uses_original_grpo(
+                REGENERATE_ROUTE,
+                caption_safe=False,
+                preserve_original_grpo=True,
+            )
+        )
+        self.assertFalse(
+            uses_original_grpo(
+                ON_POLICY_DISTILL_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=False,
+            )
+        )
+        self.assertTrue(
+            uses_original_grpo(
+                GRPO_ROUTE,
+                caption_safe=True,
+                preserve_original_grpo=False,
+            )
+        )
+
+    def test_caption_distillation_blocks_mask_and_object_reference_vocabulary(self):
+        vocab = {
+            "ordinary": 0,
+            "<|mt_start|>": 1,
+            "<|mt_0007|>": 2,
+            "<|mt_end|>": 3,
+            "<|object_ref_start|>": 4,
+            "<|object_ref_end|>": 5,
+            "<|im_end|>": 6,
+        }
+        self.assertEqual(caption_blocked_special_token_ids(vocab), [1, 2, 3, 4, 5])
+
+        torch.manual_seed(11)
+        student_logits = torch.randn(1, 2, 7, requires_grad=True)
+        teacher_logits = torch.randn(1, 2, 7)
+        blocked_ids = torch.tensor([5, 6])
+        common_kwargs = {
+            "target_ids": torch.tensor([[0, 1]]),
+            "response_mask": torch.ones(1, 2),
+            "sample_weight": torch.ones(1),
+            "beta": 0.5,
+            "temperature": 1.0,
+            "entropy_weight_beta": 1.0,
+            "token_chunk_size": 1,
+            "blocked_token_ids": blocked_ids,
+        }
+        baseline_loss, baseline_metrics = chunked_weighted_jsd_loss(
+            student_logits,
+            teacher_logits,
+            **common_kwargs,
+        )
+        self.assertTrue(torch.isfinite(baseline_loss))
+        self.assertTrue(torch.isfinite(baseline_metrics["teacher_entropy"]))
+        self.assertTrue(torch.isfinite(baseline_metrics["local_loss"]))
+        baseline_loss.backward()
+        self.assertTrue(torch.isfinite(student_logits.grad).all())
+        self.assertTrue(torch.equal(student_logits.grad[..., blocked_ids], torch.zeros_like(student_logits.grad[..., blocked_ids])))
+        self.assertEqual(baseline_metrics["blocked_vocab_size"].item(), 2.0)
+
+        changed_student = student_logits.detach().clone().requires_grad_(True)
+        changed_teacher = teacher_logits.detach().clone()
+        changed_student.data[..., blocked_ids] = 1e4
+        changed_teacher[..., blocked_ids] = -1e4
+        changed_loss, _ = chunked_weighted_jsd_loss(
+            changed_student,
+            changed_teacher,
+            **common_kwargs,
+        )
+        self.assertTrue(torch.isfinite(changed_loss))
+        changed_loss.backward()
+        self.assertTrue(torch.isfinite(changed_student.grad).all())
+        self.assertTrue(
+            torch.equal(
+                changed_student.grad[..., blocked_ids],
+                torch.zeros_like(changed_student.grad[..., blocked_ids]),
+            )
+        )
+        self.assertTrue(torch.allclose(changed_loss, baseline_loss.detach(), atol=1e-6, rtol=1e-6))
+
+    def test_chunked_jsd_matches_dense_loss_and_gradient(self):
+        torch.manual_seed(7)
+        student_logits = torch.randn(2, 5, 11, requires_grad=True)
+        teacher_logits = torch.randn(2, 5, 11)
+        target_ids = torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]])
+        response_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]])
+        sample_weight = torch.tensor([0.75, 0.25])
+        beta = 0.5
+        temperature = 0.8
+        entropy_weight_beta = 1.2
+
+        student_log_probs = torch.log_softmax(student_logits.float() / temperature, dim=-1)
+        teacher_log_probs = torch.log_softmax(teacher_logits.float() / temperature, dim=-1)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack(
+                [
+                    student_log_probs + torch.log(torch.tensor(1.0 - beta)),
+                    teacher_log_probs + torch.log(torch.tensor(beta)),
+                ]
+            ),
+            dim=0,
+        )
+        kl_student = (
+            student_log_probs.exp() * (student_log_probs - mixture_log_probs)
+        ).sum(dim=-1)
+        kl_teacher = (
+            teacher_log_probs.exp() * (teacher_log_probs - mixture_log_probs)
+        ).sum(dim=-1)
+        jsd = beta * kl_teacher + (1.0 - beta) * kl_student
+        entropy = -(teacher_log_probs.exp() * teacher_log_probs).sum(dim=-1)
+        token_mask = response_mask.float()
+        confidence = torch.exp(-entropy_weight_beta * entropy)
+        confidence = confidence / (
+            (confidence * token_mask).sum(dim=-1, keepdim=True)
+            / token_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ).clamp_min(1e-6)
+        weights = token_mask * confidence * sample_weight.unsqueeze(-1)
+        dense_loss = (jsd * weights).sum()
+        dense_metrics = {
+            "local_loss": dense_loss.detach() / token_mask.sum().clamp_min(1.0),
+            "teacher_entropy": (entropy * token_mask).sum() / token_mask.sum().clamp_min(1.0),
+            "teacher_sequence_score": (
+                teacher_log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1) * token_mask
+            ).sum()
+            / token_mask.sum().clamp_min(1.0),
+        }
+        dense_loss.backward()
+        dense_gradient = student_logits.grad.detach().clone()
+
+        chunked_student_logits = student_logits.detach().clone().requires_grad_(True)
+        chunked_loss, chunked_metrics = chunked_weighted_jsd_loss(
+            student_logits=chunked_student_logits,
+            teacher_logits=teacher_logits,
+            target_ids=target_ids,
+            response_mask=response_mask,
+            sample_weight=sample_weight,
+            beta=beta,
+            temperature=temperature,
+            entropy_weight_beta=entropy_weight_beta,
+            token_chunk_size=2,
+        )
+        chunked_loss.backward()
+
+        self.assertTrue(torch.allclose(chunked_loss, dense_loss.detach(), atol=1e-6, rtol=1e-6))
+        self.assertTrue(
+            torch.allclose(chunked_student_logits.grad, dense_gradient, atol=1e-6, rtol=1e-6)
+        )
+        for key, value in dense_metrics.items():
+            self.assertTrue(torch.allclose(chunked_metrics[key], value, atol=1e-6, rtol=1e-6))

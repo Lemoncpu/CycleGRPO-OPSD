@@ -1,0 +1,106 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+ActorRolloutRef config
+"""
+
+from dataclasses import dataclass, field
+
+from .actor import ActorConfig, FSDPConfig, ModelConfig, OptimConfig, RefConfig
+from .critic import CriticConfig
+from .reward import RewardConfig
+from .rollout import RolloutConfig
+from .opsd import OPSDConfig
+from .supervised_anchors import SupervisedAnchorsConfig
+
+
+__all__ = [
+    "ActorConfig",
+    "CriticConfig",
+    "FSDPConfig",
+    "ModelConfig",
+    "OptimConfig",
+    "OPSDConfig",
+    "RefConfig",
+    "RewardConfig",
+    "RolloutConfig",
+    "WorkerConfig",
+]
+
+
+@dataclass
+class WorkerConfig:
+    hybrid_engine: bool = True
+    export_mode: bool = False
+    """Build only the actor FSDP model for checkpoint-to-HF export."""
+    actor: ActorConfig = field(default_factory=ActorConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
+    ref: RefConfig = field(default_factory=RefConfig)
+    reward: RewardConfig = field(default_factory=RewardConfig)
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    opsd: OPSDConfig = field(default_factory=OPSDConfig)
+    supervised_anchors: SupervisedAnchorsConfig = field(default_factory=SupervisedAnchorsConfig)
+
+    def post_init(self):
+        self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
+        self.ref.padding_free = self.actor.padding_free
+        self.ref.dynamic_batching = self.actor.dynamic_batching
+        self.ref.ulysses_size = self.actor.ulysses_size
+        self.ref.use_torch_compile = self.actor.use_torch_compile
+        if self.opsd.enabled and self.actor.ulysses_size != 1:
+            raise ValueError("OPSD privileged distillation currently requires actor.ulysses_size=1.")
+        if self.opsd.pixel_iou.no_target_reward_mode == "pixel_empty" and (
+            not self.opsd.enabled or not self.opsd.pixel_iou.enabled
+        ):
+            raise ValueError(
+                "pixel_iou.no_target_reward_mode=pixel_empty requires "
+                "opsd.enabled=true and pixel_iou.enabled=true."
+            )
+        self.supervised_anchors.post_init()
+        if self.supervised_anchors.direct_grounding.enabled and (
+            not self.opsd.enabled or not self.opsd.pixel_iou.enabled
+        ):
+            raise ValueError("direct_grounding requires OPSD pixel_iou.enabled=true.")
+        if self.supervised_anchors.direct_grounding.enabled and not self.actor.optimize_segmenter:
+            raise ValueError("direct_grounding requires actor.optimize_segmenter=true.")
+        if self.supervised_anchors.direct_mask_ce.enabled and not self.actor.optimize_segmenter:
+            raise ValueError("direct_mask_ce requires actor.optimize_segmenter=true.")
+        if self.supervised_anchors.refusal_credit.enabled and not self.actor.optimize_segmenter:
+            raise ValueError("refusal_credit requires actor.optimize_segmenter=true.")
+        if (self.supervised_anchors.direct_mask_ce.enabled or self.supervised_anchors.refusal_credit.enabled) and (
+            not self.supervised_anchors.direct_grounding.train_files
+            or self.supervised_anchors.direct_grounding.batch_size <= 0
+        ):
+            raise ValueError(
+                "direct_mask_ce/refusal_credit use direct_grounding.train_files and batch_size; "
+                "both are required when enabled."
+            )
+        if self.supervised_anchors.direct_mask_ce.record_base_gradient_cosine and self.opsd.asymmetric_gradient_projection:
+            raise ValueError(
+                "direct_mask_ce.record_base_gradient_cosine is incompatible with "
+                "opsd.asymmetric_gradient_projection; disable the projection for an unambiguous base gradient."
+            )
+        if self.supervised_anchors.gradient_diagnostics.enabled and self.opsd.asymmetric_gradient_projection:
+            raise ValueError(
+                "supervised_anchors.gradient_diagnostics.enabled is incompatible with "
+                "opsd.asymmetric_gradient_projection; diagnostics require unprojected task gradients."
+            )
+        if (
+            self.supervised_anchors.gradient_diagnostics.enabled
+            and self.supervised_anchors.direct_mask_ce.record_base_gradient_cosine
+        ):
+            raise ValueError(
+                "supervised_anchors.gradient_diagnostics.enabled is incompatible with "
+                "direct_mask_ce.record_base_gradient_cosine; use the pairwise diagnostics instead."
+            )

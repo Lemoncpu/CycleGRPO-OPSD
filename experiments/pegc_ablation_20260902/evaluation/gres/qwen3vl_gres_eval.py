@@ -1,0 +1,822 @@
+import argparse
+import math
+import os
+import time
+import torch
+import tqdm
+from pycocotools import mask as mask_utils
+import numpy as np
+import re
+from PIL import Image
+import json
+import hydra
+
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+from evaluation.mask_protocol import (
+    MASK_PROTOCOLS,
+    complete_mask_group_count,
+    generation_eos_token_id,
+    parse_mask_groups,
+)
+
+from torchvision.transforms.functional import to_pil_image
+
+from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
+
+from projects.vlm.tokenmask.evaluation.grefer import G_REFER
+from evaluation.gres.subset_metrics import (
+    GresMetricAccumulator,
+    TwoInstanceDiagnosticAccumulator,
+    multi_instance_count_bucket,
+    target_area_bucket,
+    two_instance_area_balance_bucket,
+    two_instance_center_distance_bucket,
+    two_instance_diagnostic_sample,
+)
+
+CODEBOOK_SIZE = 256
+CODEBOOK_DEPTH = 2
+
+
+class DirectResize:
+    def __init__(self, target_length: int) -> None:
+        self.target_length = target_length
+
+    def apply_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Expects a numpy array with shape HxWxC in uint8 format.
+        """
+        img = to_pil_image(image, mode='RGB')
+        return np.array(img.resize((self.target_length, self.target_length)))
+
+def _decode_annotation(annotation, height, width):
+    segmentation = annotation.get("segmentation", []) if annotation else []
+    if not segmentation:
+        return np.zeros((height, width), dtype=np.uint8)
+    if isinstance(segmentation, dict):
+        if isinstance(segmentation.get("counts"), list):
+            rle = mask_utils.frPyObjects(segmentation, height, width)
+        else:
+            rle = segmentation
+        decoded = mask_utils.decode(rle)
+    else:
+        polygons = [p for p in segmentation if len(p) >= 6 and len(p) % 2 == 0]
+        if not polygons:
+            return np.zeros((height, width), dtype=np.uint8)
+        decoded = mask_utils.decode(mask_utils.merge(mask_utils.frPyObjects(polygons, height, width)))
+    if decoded.ndim == 3:
+        decoded = decoded.any(axis=2)
+    return (decoded > 0).astype(np.uint8)
+
+
+def _encode_mask(binary_mask):
+    rle = mask_utils.encode(np.asfortranarray(binary_mask.astype(np.uint8)))
+    rle["counts"] = rle["counts"].decode("utf-8")
+    return rle
+
+
+def load_dataset(grefs_file, instances_file, image_root, split="val", output_file=None):
+    """Convert official gRefCOCO annotations into inference-ready records."""
+    refer_api = G_REFER(image_root, grefs_file, instances_file)
+
+    ref_ids_val = refer_api.getRefIds(split=split)
+    images_ids_val = refer_api.getImgIds(ref_ids=ref_ids_val)
+    refs_val = refer_api.loadRefs(ref_ids=ref_ids_val)
+    refer_seg_ds = {}
+    refer_seg_ds["images"] = []
+    loaded_images = refer_api.loadImgs(image_ids=images_ids_val)
+    for item in loaded_images:
+        item = item.copy()
+        item["file_name"] = os.path.join(image_root, item["file_name"])
+
+        refer_seg_ds["images"].append(item)
+    refer_seg_ds["annotations"] = refer_api.Anns  # anns_val
+    img2refs = {}
+    for ref in refs_val:
+        image_id = ref["image_id"]
+        img2refs[image_id] = img2refs.get(image_id, []) + [ref]
+    refer_seg_ds["img2refs"] = img2refs
+
+
+    all_items = []
+    for index in range(len(refer_seg_ds["images"])):
+        image_info = refer_seg_ds["images"][index]
+        image_path = image_info["file_name"]
+        image_id = image_info["id"]
+        image_size = image_info["width"], image_info["height"]
+
+        refs = img2refs[image_id]
+        if len(refs) == 0:
+            continue
+
+        sents = []
+        ann_ids = []
+        for ref in refs:
+            for sent in ref["sentences"]:
+                sents.append(sent["sent"].strip().lower())
+                ann_ids.append(ref["ann_id"])
+        sampled_sents = sents
+        sampled_ann_ids = ann_ids
+
+        anno_masks = []
+        for i, ann_id in enumerate(sampled_ann_ids):
+            ann_ids = ann_id if isinstance(ann_id, list) else [ann_id]
+            mask = np.zeros((image_info["height"], image_info["width"]), dtype=np.uint8)
+            for sub_ann_id in ann_ids:
+                if sub_ann_id == -1:
+                    continue
+                mask |= _decode_annotation(
+                    refer_seg_ds["annotations"].get(sub_ann_id),
+                    image_info["height"], image_info["width"],
+                )
+            anno_masks.append(mask)
+
+        for sent, binary_mask in zip(sents, anno_masks):
+            assert len(binary_mask.shape) == 2
+            binary_mask = (binary_mask > 0).astype(np.uint8)
+            rle = _encode_mask(binary_mask)
+
+            all_items.append({
+                "image": image_path,
+                "phrase": sent,
+                "segmentation": rle,
+            })
+    
+    if output_file is None:
+        raise ValueError("output_file is required")
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    with open(output_file, 'w') as f:
+        json.dump(all_items, f)
+    print(f"Saved {len(all_items)} GRES samples at {output_file}")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='GRES')
+    parser.add_argument(
+        '--model_path',
+        default="zhouyik/Qwen3-VL-4B-SAMTok-co",
+        help='hf model path.')
+    parser.add_argument(
+        '--vq_sam2_path',
+        default="Qwen/Qwen3-VL-4B-SAMTok/mask_tokenizer_256x2.pth",
+        help='vq-sam2 model path.')
+    parser.add_argument(
+        '--sam2_path',
+        default="Qwen/sam2.1_hiera_large.pt",
+        help='sam2 model path.')
+    parser.add_argument(
+        '--save_dir',
+        default='./results/grefcoco/',
+        help='save path')
+    parser.add_argument(
+        '--dataset',
+        default=None,
+        help='Prepared JSON dataset; created with --prepare-dataset when omitted.')
+    parser.add_argument('--grefs-file', default=None,
+                        help='Official gRefCOCO refs JSON, e.g. grefs(unc).json.')
+    parser.add_argument('--instances-file', default=None,
+                        help='COCO instances JSON used by gRefCOCO.')
+    parser.add_argument('--image-root', default=None,
+                        help='Directory containing COCO train2014 images.')
+    parser.add_argument('--split', default='val', choices=('train', 'val', 'testA', 'testB'))
+    parser.add_argument('--prepare-dataset', action='store_true',
+                        help='Build the inference JSON from official gRefCOCO annotations and exit.')
+    parser.add_argument('--task_id', '--task-id', type=int, default=0,
+                        help='Shard index for this process (0 .. num_tasks-1).')
+    parser.add_argument('--num_tasks', '--num-tasks', type=int, default=1,
+                        help='Total number of shards / data-parallel processes (one per GPU).')
+    parser.add_argument('--gpu_id', '--gpu-id', type=int, default=-1,
+                        help='CUDA device to bind this process to. Default -1 => use task_id.')
+    parser.add_argument('--metric_only', '--metric-only', action='store_true',
+                        help='Skip inference; just compute the metric over existing save_dir.')
+    parser.add_argument('--mask_protocol', choices=MASK_PROTOCOLS, default='legacy_union',
+                        help='SAMTok decoding protocol. legacy_union matches historical SAMTok results.')
+    parser.add_argument('--max_new_tokens', type=int, default=256,
+                        help='Maximum generated segmentation response tokens (default: 256).')
+    parser.add_argument('--metrics-file', default=None,
+                        help='Optional JSON path for the aggregate GRES metrics.')
+    parser.add_argument('--subset-report-file', default=None,
+                        help='Optional JSONL path for exact cardinality and target-area subset metrics.')
+    parser.add_argument('--two-instance-member-recall-threshold', type=float, default=0.5,
+                        help='Constituent coverage threshold for two-instance recall diagnostics.')
+    args = parser.parse_args()
+    if args.max_new_tokens <= 0:
+        parser.error('--max_new_tokens must be positive.')
+    return args
+
+
+def load_image_with_retry(path, retries=6, base_delay=0.5):
+    """Open an image, retrying transient NAS I/O failures with backoff.
+
+    The coco images live on a slow NAS; under N concurrent shards Image.open can
+    raise transient I/O errors. Retrying (instead of silently skipping) avoids
+    dropping thousands of valid samples. Raises the last error if all retries fail.
+    """
+    last = None
+    for i in range(retries):
+        try:
+            return Image.open(path).convert('RGB')
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(base_delay * (2 ** i))  # 0.5, 1, 2, 4, 8, 16s
+    raise last
+
+
+def mask_to_rle(mask):
+    rle = []
+    for m in mask:
+        rle.append(mask_utils.encode(np.asfortranarray(m.astype(np.uint8))))
+        rle[-1]['counts'] = rle[-1]['counts'].decode()
+    return rle
+
+def rle_to_mask(rle):
+    mask = []
+    for r in rle:
+        m = mask_utils.decode(r)
+        m = np.uint8(m)
+        mask.append(m)
+    mask = np.stack(mask, axis=0)
+    return mask
+
+
+def extract_mt_token_ids(text, mask_protocol):
+    """Return raw token IDs for all legal groups selected by the protocol."""
+    return [
+        token_id
+        for first, second in parse_mask_groups(
+            text, codebook_size=CODEBOOK_SIZE, protocol=mask_protocol
+        )
+        for token_id in (first, second + CODEBOOK_SIZE)
+    ]
+
+
+def has_matching_protocol(path, mask_protocol):
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, 'r') as file:
+            return json.load(file).get('mask_protocol') == mask_protocol
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def write_prediction(path, prediction, mask_protocol):
+    prediction['mask_protocol'] = mask_protocol
+    with open(path, 'w') as file:
+        json.dump(prediction, file)
+
+def extract_mt_token_ids_v2(text):
+    pattern = re.compile(r'<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>')
+    matches = pattern.findall(text)
+    ret_list = []
+    for num1, num2 in matches:
+        ret_list.append(int(num1))
+        ret_list.append(int(num2))
+    return ret_list
+
+def find_first_index(arr, value):
+    """
+    在NumPy数组中找到第一个指定值的第一个出现的索引
+    
+    参数:
+        arr: NumPy数组
+        value: 要查找的值
+        
+    返回:
+        第一个匹配值的索引，如果没有找到则返回-1
+    """
+    # 使用where找到所有匹配值的索引
+    indices = np.where(arr == value)[0]
+    
+    # 返回第一个索引，如果没有找到则返回-1
+    return indices[0] if len(indices) > 0 else -1
+
+def fix_mt_format_comprehensive(text):
+    """
+    全面修正 <|mt_...> 格式的函数。
+    它会处理以下几种情况：
+    1. 标记太少 (1个): <|mt_start|><|mt_0198|><|mt_end|> -> <|mt_start|><|mt_0198|><|mt_-1|><|mt_end|>
+    2. 标记太少 (1个, 无end): <|mt_start|><|mt_0198|> -> <|mt_start|><|mt_0198|><|mt_-1|><|mt_end|>
+    3. 标记太多 (3个或以上): <|mt_start|><|mt_0186|><|mt_0410|><|mt_0186|><|mt_end|> -> <|mt_start|><|mt_0186|><|mt_0410|><|mt_end|>
+    4. 正确格式: <|mt_start|><|mt_0044|><|mt_0442|><|mt_end|> -> 不变
+    """
+    # 规则 1: 处理标记太多的情况 (3个或以上)
+    # 捕获前两个，匹配掉多余的，然后用前两个重构
+    pattern_too_many = r'(<\|mt_start\|>)(<\|mt_\d+\|>)(<\|mt_\d+\|>)(?:<\|mt_\d+\|>)+<\|mt_end\|>'
+    replacement_too_many = r'\1\2\3<|mt_end|>'
+    text = re.sub(pattern_too_many, replacement_too_many, text)
+    # 规则 2: 处理标记太少的情况 (只有1个，且有<|mt_end|>)
+    pattern_too_few_with_end = r'(<\|mt_start\|>)(<\|mt_\d+\|>)(<\|mt_end\|>)'
+    replacement_too_few = r'\1\2<|mt_9999|><|mt_end|>'
+    text = re.sub(pattern_too_few_with_end, replacement_too_few, text)
+    # 规则 3: 处理标记太少的情况 (只有1个，且没有<|mt_end|>)
+    # 使用负向前瞻确保后面不是另一个mt_token
+    pattern_too_few_no_end = r'(<\|mt_start\|>)(<\|mt_\d+\|>)(?!<\|mt_)'
+    replacement_too_few_no_end = r'\1\2<|mt_9999|><|mt_end|>'
+    text = re.sub(pattern_too_few_no_end, replacement_too_few_no_end, text)
+    return text
+
+
+def _iter_json_records(json_file_path):
+    """Yield dict records from JSON/JSONL/concatenated JSON content."""
+    with open(json_file_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+
+    if not content:
+        return []
+
+    def _collect(obj, out):
+        if isinstance(obj, dict):
+            out.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    out.append(item)
+
+    records = []
+    try:
+        parsed = json.loads(content)
+        _collect(parsed, records)
+        return records
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback 1: JSONL
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            _collect(parsed, records)
+        except json.JSONDecodeError:
+            continue
+    if records:
+        return records
+
+    # Fallback 2: concatenated JSON objects without separators
+    decoder = json.JSONDecoder()
+    idx = 0
+    n = len(content)
+    while idx < n:
+        while idx < n and content[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            parsed, end = decoder.raw_decode(content, idx)
+            _collect(parsed, records)
+            idx = end
+        except json.JSONDecodeError:
+            break
+    return records
+
+
+def _case_id_from_filename(filename):
+    match = re.fullmatch(r"case_(\d+)\.json", filename)
+    return int(match.group(1)) if match else None
+
+
+def _annotation_ids(ref):
+    values = ref.get("ann_id", [])
+    if isinstance(values, int):
+        values = [values]
+    return [int(value) for value in values]
+
+
+def _build_subset_metadata(args):
+    """Rebuild the exact case order and cardinality from official GRES refs."""
+
+    missing = [
+        name
+        for name, value in (
+            ("--dataset", args.dataset),
+            ("--grefs-file", args.grefs_file),
+            ("--instances-file", args.instances_file),
+            ("--image-root", args.image_root),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            "--subset-report-file requires " + ", ".join(missing) + " to verify case ordering."
+        )
+
+    refer_api = G_REFER(args.image_root, args.grefs_file, args.instances_file)
+    ref_ids = refer_api.getRefIds(split=args.split)
+    image_ids = refer_api.getImgIds(ref_ids=ref_ids)
+    refs = refer_api.loadRefs(ref_ids=ref_ids)
+    refs_by_image = {}
+    for ref in refs:
+        refs_by_image.setdefault(ref["image_id"], []).append(ref)
+
+    with open(args.instances_file, "r", encoding="utf-8") as file:
+        annotations = {int(item["id"]): item for item in json.load(file)["annotations"]}
+
+    metadata = []
+    for image_info in refer_api.loadImgs(image_ids=image_ids):
+        for ref in refs_by_image.get(image_info["id"], []):
+            positive_annotation_ids = [
+                annotation_id for annotation_id in _annotation_ids(ref) if annotation_id >= 0
+            ]
+            positive_count = len(positive_annotation_ids)
+            target_type = (
+                "no_target" if positive_count == 0
+                else "single_instance" if positive_count == 1
+                else "multi_instance"
+            )
+            for sentence in ref.get("sentences", []):
+                phrase = sentence["sent"].strip().lower()
+                metadata.append({
+                    "ref_id": int(ref["ref_id"]),
+                    "phrase": phrase,
+                    "target_type": target_type,
+                    "annotation_instance_count": positive_count,
+                    "annotation_ids": positive_annotation_ids,
+                })
+
+    with open(args.dataset, "r", encoding="utf-8") as file:
+        dataset = json.load(file)
+    if len(metadata) != len(dataset):
+        raise RuntimeError(
+            f"GRES metadata/data length mismatch: rebuilt {len(metadata)}, dataset has {len(dataset)}."
+        )
+    for case_id, (item, item_metadata) in enumerate(zip(dataset, metadata)):
+        if str(item.get("phrase", "")).strip().lower() != item_metadata["phrase"]:
+            raise RuntimeError(
+                f"GRES case ordering mismatch at case_{case_id}: "
+                f"dataset={item.get('phrase')!r}, refs={item_metadata['phrase']!r}."
+            )
+    return metadata, annotations
+
+
+def _two_instance_member_masks(metadata, annotations, gt_mask):
+    annotation_ids = metadata["annotation_ids"]
+    if len(annotation_ids) != 2:
+        raise RuntimeError(
+            f"Expected two positive annotation ids for ref {metadata['ref_id']}, got {annotation_ids}."
+        )
+    height, width = gt_mask.shape
+    member_masks = []
+    for annotation_id in annotation_ids:
+        annotation = annotations.get(annotation_id)
+        if annotation is None:
+            raise RuntimeError(f"Missing annotation {annotation_id} for ref {metadata['ref_id']}.")
+        member_masks.append(_decode_annotation(annotation, height, width).astype(bool))
+    reconstructed_union = np.logical_or(member_masks[0], member_masks[1])
+    if not np.array_equal(reconstructed_union, gt_mask):
+        raise RuntimeError(
+            f"Two-instance annotation union differs from case GT for ref {metadata['ref_id']}."
+        )
+    return member_masks
+
+
+def _write_subset_report(path, accumulators):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        for grouping, subset in sorted(accumulators):
+            row = {"grouping": grouping, "subset": subset}
+            row.update(accumulators[(grouping, subset)].as_dict())
+            file.write(json.dumps(row) + "\n")
+
+
+def metric(args):
+    if not 0.0 < args.two_instance_member_recall_threshold <= 1.0:
+        raise ValueError(
+            "--two-instance-member-recall-threshold must be in (0, 1], "
+            f"got {args.two_instance_member_recall_threshold}."
+        )
+    subset_metadata, annotations = _build_subset_metadata(args) if args.subset_report_file else (None, None)
+    metrics_accumulator = GresMetricAccumulator()
+    subset_accumulators = {}
+    observed_case_ids = set()
+
+    case_files = sorted(
+        (filename for filename in os.listdir(args.save_dir) if _case_id_from_filename(filename) is not None),
+        key=_case_id_from_filename,
+    )
+    for json_file in case_files:
+        case_id = _case_id_from_filename(json_file)
+        json_file_path = os.path.join(args.save_dir, json_file)
+        records = _iter_json_records(json_file_path)
+        if not records:
+            print(f"[warn] skip unreadable/empty file: {json_file_path}")
+            continue
+        if subset_metadata is not None:
+            if case_id >= len(subset_metadata):
+                raise RuntimeError(f"Prediction case_{case_id} is outside the verified GRES dataset.")
+            if len(records) != 1:
+                raise RuntimeError(f"Subset reporting requires exactly one record in {json_file_path}.")
+            observed_case_ids.add(case_id)
+
+        for json_data in records:
+            if "pred_masks" not in json_data or "gt_masks" not in json_data:
+                if subset_metadata is not None:
+                    raise RuntimeError(f"Subset reporting requires pred_masks and gt_masks in {json_file_path}.")
+                continue
+            pred_mask = rle_to_mask([json_data["pred_masks"]])[0].astype(bool)
+            gt_mask = rle_to_mask([json_data["gt_masks"]])[0].astype(bool)
+            metrics_accumulator.add(pred_mask, gt_mask)
+
+            if subset_metadata is None:
+                continue
+            metadata = subset_metadata[case_id]
+            expected_target = metadata["target_type"] != "no_target"
+            if expected_target != bool(gt_mask.any()):
+                raise RuntimeError(
+                    f"GT target mismatch for case_{case_id}: metadata={metadata['target_type']}, "
+                    f"mask_has_target={bool(gt_mask.any())}."
+                )
+            cardinality_key = ("target_cardinality", metadata["target_type"])
+            subset_accumulators.setdefault(cardinality_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+            if metadata["target_type"] == "multi_instance":
+                multi_count_key = (
+                    "multi_annotation_count",
+                    multi_instance_count_bucket(metadata["annotation_instance_count"]),
+                )
+                subset_accumulators.setdefault(multi_count_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+            if expected_target:
+                area_key = ("target_area", target_area_bucket(gt_mask))
+                subset_accumulators.setdefault(area_key, GresMetricAccumulator()).add(pred_mask, gt_mask)
+                if metadata["annotation_instance_count"] == 2:
+                    member_masks = _two_instance_member_masks(metadata, annotations, gt_mask)
+                    diagnostic_sample = two_instance_diagnostic_sample(
+                        pred_mask,
+                        member_masks,
+                        member_recall_threshold=args.two_instance_member_recall_threshold,
+                    )
+                    two_instance_area_key = ("two_instance_target_area", target_area_bucket(gt_mask))
+                    subset_accumulators.setdefault(two_instance_area_key, GresMetricAccumulator()).add(
+                        pred_mask, gt_mask
+                    )
+                    diagnostic_keys = (
+                        ("two_instance_member_recall", "all"),
+                        (
+                            "two_instance_area_balance",
+                            two_instance_area_balance_bucket(diagnostic_sample.small_to_large_area_ratio),
+                        ),
+                        (
+                            "two_instance_center_distance",
+                            two_instance_center_distance_bucket(diagnostic_sample.center_distance_diag),
+                        ),
+                    )
+                    for diagnostic_key in diagnostic_keys:
+                        accumulator = subset_accumulators.setdefault(
+                            diagnostic_key,
+                            TwoInstanceDiagnosticAccumulator(
+                                member_recall_threshold=args.two_instance_member_recall_threshold
+                            ),
+                        )
+                        accumulator.add(pred_mask, gt_mask, diagnostic_sample)
+
+    if subset_metadata is not None:
+        expected_case_ids = set(range(len(subset_metadata)))
+        if observed_case_ids != expected_case_ids:
+            missing_case_ids = sorted(expected_case_ids - observed_case_ids)
+            extra_case_ids = sorted(observed_case_ids - expected_case_ids)
+            raise RuntimeError(
+                "GRES subset report requires complete predictions: "
+                f"missing={missing_case_ids[:10]} ({len(missing_case_ids)} total), "
+                f"extra={extra_case_ids[:10]} ({len(extra_case_ids)} total)."
+            )
+        _write_subset_report(args.subset_report_file, subset_accumulators)
+        print(f"Saved GRES subset metrics to {args.subset_report_file}")
+
+    metrics = metrics_accumulator.as_dict()
+    if args.metrics_file:
+        os.makedirs(os.path.dirname(os.path.abspath(args.metrics_file)), exist_ok=True)
+        with open(args.metrics_file, "w", encoding="utf-8") as file:
+            json.dump(metrics, file, indent=2)
+    print(json.dumps(metrics, indent=2))
+    return metrics
+        
+def main():
+    args = parse_args()
+
+    if args.prepare_dataset:
+        required = ("dataset", "grefs_file", "instances_file", "image_root")
+        missing = [name for name in required if not getattr(args, name)]
+        if missing:
+            raise ValueError(f"Missing required preparation arguments: {', '.join(missing)}.")
+        for name in ("grefs_file", "instances_file", "image_root"):
+            path = getattr(args, name)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"GRES {name.replace('_', ' ')} not found: {path}")
+        load_dataset(args.grefs_file, args.instances_file, args.image_root, args.split, args.dataset)
+        return args
+
+    # metric-only: skip all model loading, just score existing predictions.
+    if args.metric_only:
+        metric(args)
+        return args
+
+    if not args.dataset:
+        raise ValueError("--dataset is required for GRES inference; run with --prepare-dataset first.")
+    if not os.path.isfile(args.dataset):
+        raise FileNotFoundError(f"GRES dataset not found: {args.dataset}")
+
+    # ---- multi-GPU data parallelism: bind this process to one GPU ----
+    gpu_id = args.task_id if args.gpu_id < 0 else args.gpu_id
+    torch.cuda.set_device(gpu_id)            # makes every subsequent .cuda() target this GPU
+    device = torch.device(f"cuda:{gpu_id}")
+    print(f"[task {args.task_id}/{args.num_tasks}] using GPU {gpu_id}")
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_path, torch_dtype="auto"
+    ).to(device).eval()
+
+    processor = AutoProcessor.from_pretrained(args.model_path)
+
+    # Build VQ-SAM2 with the same codebook contract used by token parsing.
+    config_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../projects/transformers/vq_sam2/sam2/sam2_configs"))
+    with hydra.initialize_config_dir(version_base=None, config_dir=config_dir):
+        sam2_config = SAM2Config(
+            cfg_path="sam2.1_hiera_l.yaml",
+            ckpt_path=args.sam2_path,
+        )
+        vq_sam2_config = VQ_SAM2Config(
+            sam2_config=sam2_config,
+            codebook_size=CODEBOOK_SIZE,
+            codebook_depth=CODEBOOK_DEPTH,
+            shared_codebook=False,
+            latent_dim=256,
+        )
+
+    vq_sam2 = VQ_SAM2(vq_sam2_config).to(device).eval()
+
+    state = torch.load(args.vq_sam2_path, map_location="cpu")
+    if "state_dict" in state:
+        state = state["state_dict"]
+    vq_sam2.load_state_dict({key.removeprefix("hf_model."): value for key, value in state.items()})
+
+    sam2_image_processor = DirectResize(1024)
+
+    os.makedirs(args.save_dir, exist_ok=True)  # exist_ok: shards may race to create it
+
+    all_data_dict = []
+    case_id = 0
+    with open(args.dataset, 'r') as f:
+        json_data = json.load(f)
+        for item in json_data:
+            item.update({'case_id': case_id})
+            all_data_dict.append(item)
+            case_id += 1
+    
+    rows = len(all_data_dict)
+    # Data-parallel sharding across `num_tasks` processes (one per GPU).
+    chunk_size = math.ceil(rows / args.num_tasks)
+    _start_ = args.task_id * chunk_size
+    _end_ = min(_start_ + chunk_size, rows)
+    print(f"[task {args.task_id}/{args.num_tasks}] rows {_start_}:{_end_} of {rows}")
+
+    count = 0
+    for data_dict in tqdm.tqdm(all_data_dict[_start_:_end_]):
+        image_path = data_dict['image']
+        phrase = data_dict['phrase']
+        rle = data_dict['segmentation']
+        case_id = data_dict['case_id']
+
+        try:
+            image = load_image_with_retry(image_path)
+        except Exception as e:
+            raise RuntimeError(f"Could not read GRES image {image_path}: {e}") from e
+
+        ori_width, ori_height = image.size
+
+        if rle['size'][0] != ori_height or rle['size'][1] != ori_width:
+            raise ValueError(
+                f"GRES annotation/image size mismatch for {image_path}: "
+                f"RLE={rle['size']}, image={[ori_height, ori_width]}"
+            )
+
+        # gt_masks = rle_to_mask([rle])
+        # output_image = visualize(image, gt_masks, ["gt"])
+        # output_image.save('grefcoco_gt.jpg')
+        # print("GT RLE: ", rle)
+
+        question = f"Please segment {phrase} in this image."
+        
+        output_path = os.path.join(args.save_dir, f"case_{case_id}.json")
+        if has_matching_protocol(output_path, args.mask_protocol):
+            print("file exists.............")
+            continue
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": image_path,
+                    },
+                    {"type": "text", "text": question},
+                ],
+            }
+        ]
+
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+        inputs = inputs.to(model.device)
+
+        # Inference: Generation of the output
+        generation_kwargs = dict(
+            **inputs, 
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,  # 关闭采样，使用贪婪解码
+            top_p=1.0,  # 配合do_sample=False使用
+        )
+        eos_token_id = generation_eos_token_id(model, processor, args.mask_protocol)
+        if eos_token_id is not None:
+            generation_kwargs['eos_token_id'] = eos_token_id
+        generated_ids = model.generate(**generation_kwargs)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output_text = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+        mask_group_count = complete_mask_group_count(output_text[0])
+
+        quant_ids = extract_mt_token_ids(output_text[0], args.mask_protocol)
+        if len(quant_ids) == 0:
+            zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
+            zero_mask = mask_to_rle(zero_mask)
+            prediction = {'gt_masks': rle, 'pred_masks': zero_mask[0], 'response': output_text[0], 'mask_group_count': mask_group_count}
+
+            # exit(0)
+
+            write_prediction(output_path, prediction, args.mask_protocol)
+            continue
+
+        if len(quant_ids) % CODEBOOK_DEPTH != 0:
+            print("FORMAT ERROR: ", output_text)
+            output_text = [fix_mt_format_comprehensive(output_text[0])]
+            print("FIXED OUTPUT TEXT: ", output_text)
+            quant_ids = extract_mt_token_ids(output_text[0], args.mask_protocol)
+        # assert len(quant_ids) % CODEBOOK_DEPTH == 0
+        if len(quant_ids) % CODEBOOK_DEPTH != 0:
+            zero_mask = np.zeros((1, ori_height, ori_width)).astype(np.uint8)
+            zero_mask = mask_to_rle(zero_mask)
+            prediction = {'gt_masks': rle, 'pred_masks': zero_mask[0], 'response': output_text[0], 'mask_group_count': mask_group_count}
+
+            write_prediction(output_path, prediction, args.mask_protocol)
+            continue
+
+        batch_size = len(quant_ids) // CODEBOOK_DEPTH
+        remap_quant_ids = []
+        for bs_id in range(batch_size):
+            chunk_quant_ids = quant_ids[bs_id*CODEBOOK_DEPTH:(bs_id+1)*CODEBOOK_DEPTH]
+            remap_chunk_quant_ids = [quant_id - book_id*CODEBOOK_SIZE for book_id, quant_id in enumerate(chunk_quant_ids)]
+            code1 = remap_chunk_quant_ids[0]
+            code2 = remap_chunk_quant_ids[1]
+            if not (code1 >= 0 and code1 < CODEBOOK_SIZE):
+                continue
+            if not (code2 >= 0 and code2 < CODEBOOK_SIZE):
+                code2 = -1
+            remap_chunk_quant_ids_error_handle = [code1, code2]
+            remap_quant_ids.append(remap_chunk_quant_ids_error_handle)
+
+        batch_size = len(remap_quant_ids)
+        if batch_size == 0:
+            zero_mask = mask_to_rle(np.zeros((1, ori_height, ori_width), dtype=np.uint8))
+            write_prediction(
+                output_path,
+                {'gt_masks': rle, 'pred_masks': zero_mask[0], 'response': output_text[0], 'mask_group_count': mask_group_count},
+                args.mask_protocol,
+            )
+            continue
+        sam2_image = np.array(image)
+        sam2_image = sam2_image_processor.apply_image(sam2_image)
+        sam2_pixel_values = torch.from_numpy(sam2_image).permute(2, 0, 1).contiguous()
+        sam2_pixel_values = sam2_pixel_values.unsqueeze(0).to(vq_sam2.dtype).to(vq_sam2.device)
+        sam2_pixel_values = sam2_pixel_values.repeat(batch_size, 1, 1, 1)
+
+        quant_ids = torch.LongTensor(remap_quant_ids).to(vq_sam2.device)
+
+        with torch.no_grad():
+            _pred_masks = vq_sam2.forward_with_codes(sam2_pixel_values, quant_ids)
+        _pred_masks = torch.nn.functional.interpolate(_pred_masks, size=(ori_height, ori_width), mode='bilinear')
+        _pred_masks = _pred_masks > 0.5
+        _pred_masks = _pred_masks[:, 0, :, :].cpu().numpy().astype(np.uint8)
+        _pred_masks = np.sum(_pred_masks, axis=0).astype(np.uint8)[np.newaxis, :, :]
+        _pred_masks = (_pred_masks > 0).astype(np.uint8)
+
+        # output_image = visualize(image, _pred_masks, tags=['pred'])
+        # output_image.save("grefcoco_pred.jpg")
+        # exit(0)
+
+        _pred_masks = mask_to_rle(_pred_masks)
+        prediction = {'gt_masks': rle, 'pred_masks': _pred_masks[0], 'response': output_text[0], 'mask_group_count': mask_group_count}
+        write_prediction(output_path, prediction, args.mask_protocol)
+
+    return args
+
+
+if __name__ == "__main__":
+    # load_dataset('testB')
+    main()

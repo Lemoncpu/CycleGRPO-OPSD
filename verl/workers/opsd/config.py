@@ -176,6 +176,26 @@ class TeacherAnalysisConfig:
 
 
 @dataclass
+class SECAConfig:
+    """Spatial-Evidence Credit Assignment for OPSD auxiliary supervision."""
+
+    enabled: bool = False
+    min_weight: float = 0.5
+    max_weight: float = 1.0
+    false_positive_penalty: float = 2.0
+    coarse_token_weight: float = 1.5
+    fine_token_weight: float = 1.0
+
+    def post_init(self):
+        if not 0.0 <= self.min_weight <= self.max_weight <= 1.0:
+            raise ValueError("seca weights must satisfy 0 <= min <= max <= 1.")
+        if self.false_positive_penalty < 0.0:
+            raise ValueError("seca.false_positive_penalty must be non-negative.")
+        if self.coarse_token_weight < 0.0 or self.fine_token_weight < 0.0:
+            raise ValueError("seca token weights must be non-negative.")
+
+
+@dataclass
 class OPSDConfig:
     enabled: bool = False
     localization_rollouts: int = 6
@@ -193,6 +213,7 @@ class OPSDConfig:
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     teacher_confidence: TeacherConfidenceConfig = field(default_factory=TeacherConfidenceConfig)
     teacher_analysis: TeacherAnalysisConfig = field(default_factory=TeacherAnalysisConfig)
+    seca: SECAConfig = field(default_factory=SECAConfig)
 
     def post_init(self):
         if self.localization_rollouts <= 0:
@@ -206,6 +227,7 @@ class OPSDConfig:
         if self.segmentation_anchor_kl_coef < 0:
             raise ValueError("segmentation_anchor_kl_coef must be non-negative.")
         self.teacher_confidence.post_init()
+        self.seca.post_init()
         if self.enabled and self.routing.enabled and not self.pixel_iou.enabled:
             raise ValueError("OPSD three-route training requires pixel_iou.enabled=true.")
         if self.enabled and self.routing.enabled and not self.ema_teacher.enabled:

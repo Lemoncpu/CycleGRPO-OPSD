@@ -1,0 +1,163 @@
+Sample 0:
+<answer>No target.</answer><|im_end|>
+
+Sample 1:
+<answer>No target.</answer><|im_end|>
+
+Sample 2:
+<answer>No target.</answer><|im_end|>
+
+Sample 3:
+<answer>No target.</answer><|im_end|>
+
+Sample 4:
+<answer>No target.</answer><|im_end|>
+
+Sample 5:
+<answer>No target.</answer><|im_end|>
+
+Sample 6:
+<answer>No target.</answer><|im_end|>
+
+Sample 7:
+<answer>No target.</answer><|im_end|>
+
+Sample 8:
+<answer>No target.</answer><|im_end|>
+
+Sample 9:
+<answer>No target.</answer><|im_end|>
+
+Sample 10:
+<answer>No target.</answer><|im_end|>
+
+Sample 11:
+<answer>No target.</answer><|im_end|>
+
+Sample 12:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 13:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0213|><|mt_0338|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 14:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0270|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 15:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 16:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0213|><|mt_0313|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 17:
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+```<|im_end|>
+
+Sample 18:
+<answer>No target.</answer><|im_end|>
+
+Sample 19:
+<answer>No target.</answer><|im_end|>
+
+Sample 20:
+<answer>No target.</answer><|im_end|>
+
+Sample 21:
+<answer>No target.</answer><|im_end|>
+
+Sample 22:
+<answer>No target.</answer><|im_end|>
+
+Sample 23:
+<answer>No target.</answer><|im_end|>
+
+Sample 24:
+<answer>No target.</answer><|im_end|>
+
+Sample 25:
+<answer>No target.</answer><|im_end|>
+
+Sample 26:
+<answer>No target.</answer><|im_end|>
+
+Sample 27:
+<answer>No target.</answer><|im_end|>
+
+Sample 28:
+<answer>No target.</answer><|im_end|>
+
+Sample 29:
+<answer>No target.</answer><|im_end|>
+
+Sample 30:
+<answer>No target.</answer><|im_end|>
+
+Sample 31:
+<answer>No target.</answer><|im_end|>
+left toilet
+left toilet
+left toilet
+left toilet
+left toilet
+left toilet
+middle white sheep
+middle white sheep
+middle white sheep
+middle white sheep
+middle white sheep
+middle white sheep
+top left white
+top left white
+top left white
+top left white
+top left white
+top left white
+front laptop
+front laptop
+front laptop
+front laptop
+front laptop
+front laptop
+second orange tree from left under the pizza
+second orange tree from left under the pizza
+second orange tree from left under the pizza
+second orange tree from left under the pizza
+second orange tree from left under the pizza
+second orange tree from left under the pizza
+left surfer
+left surfer

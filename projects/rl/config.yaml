@@ -157,6 +157,14 @@ worker:
       max_samples_per_step: 2
       max_new_tokens: 96
       temperature: 0.0
+    # Unified Spatial-Evidence Credit Assignment; disabled preserves baseline.
+    seca:
+      enabled: false
+      min_weight: 0.5
+      max_weight: 1.0
+      false_positive_penalty: 2.0
+      coarse_token_weight: 1.5
+      fine_token_weight: 1.0
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu

@@ -52,7 +52,9 @@ from ..workers.opsd import (
     build_privileged_teacher_images,
     distillation_weight,
     format_privileged_prompt,
+    hierarchical_mask_token_weights,
     regenerate_weight,
+    spatial_evidence_weight,
     teacher_caption_is_safe,
     uses_original_grpo,
 )
@@ -1205,6 +1207,7 @@ class RayPPOTrainer:
         position_ids = torch.cat(
             [prompt_position_ids, prompt_position_ids[..., -1:] + delta], dim=-1
         )
+        seca_config = self.config.worker.opsd.seca
         return DataProto.from_dict(
             tensors={
                 "prompts": prompts,
@@ -1214,6 +1217,16 @@ class RayPPOTrainer:
                 "response_mask": response_masks,
                 "position_ids": position_ids,
                 "sample_weight": torch.ones(len(prompt_records), dtype=torch.float32),
+                "token_weight": (
+                    hierarchical_mask_token_weights(
+                        responses,
+                        response_masks,
+                        coarse_weight=seca_config.coarse_token_weight,
+                        fine_weight=seca_config.fine_token_weight,
+                    )
+                    if seca_config.enabled
+                    else torch.ones_like(responses, dtype=torch.float32)
+                ),
             },
             non_tensors={
                 "multi_modal_data": np.array(
@@ -1685,6 +1698,23 @@ class RayPPOTrainer:
             ],
             dtype=torch.float32,
         )
+        seca_config = self.config.worker.opsd.seca
+        if seca_config.enabled:
+            gates = torch.tensor(
+                [
+                    spatial_evidence_weight(
+                        caption_batch.non_tensor_batch["privileged_context"][index],
+                        min_weight=seca_config.min_weight,
+                        max_weight=seca_config.max_weight,
+                        false_positive_penalty=seca_config.false_positive_penalty,
+                    )
+                    for index in mid_indices
+                ],
+                dtype=torch.float32,
+            )
+            weights = weights * gates
+            distill_metrics["opsd/seca_evidence_weight_mean"] = float(gates.mean())
+            distill_metrics["opsd/seca_evidence_active_count"] = int(gates.numel())
         student.batch["teacher_input_ids"] = teacher_input_ids
         student.batch["teacher_attention_mask"] = teacher_attention_mask
         student.batch["teacher_position_ids"] = teacher_position_ids

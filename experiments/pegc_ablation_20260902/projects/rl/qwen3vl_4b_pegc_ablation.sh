@@ -1,0 +1,842 @@
+#!/usr/bin/env bash
+# Single-node 8-GPU RefCOCO OPSD training for the current Volcengine workspace.
+
+set -euo pipefail
+
+BASE_DIR="${BASE_DIR:-/volume/ybo/xyc}"
+REPO_DIR="${REPO_DIR:-/volume/ybo/xyc/CycleGRPO-OPSD/experiments/pegc_ablation_20260902}"
+ENV_DIR="${ENV_DIR:-${BASE_DIR}/envs/cyclegrpo}"
+MODEL_PATH="${MODEL_PATH:-${BASE_DIR}/Qwen3-VL-4B-SAMTok}"
+TRAIN_DATA="${TRAIN_DATA:-${REPO_DIR}/data/cycle_4k.parquet}"
+VAL_DATA="${VAL_DATA:-${TRAIN_DATA}}"
+
+NUM_GPUS="${NUM_GPUS:-3}"
+MULTINODE_ENABLED="${MULTINODE_ENABLED:-false}"
+NNODES="${NNODES:-1}"
+LOCAL_JUDGE_ENABLED="${LOCAL_JUDGE_ENABLED:-false}"
+RAY_CLUSTER_EXPECTED_NODES="${RAY_CLUSTER_EXPECTED_NODES:-${NNODES}}"
+RAY_CLUSTER_EXPECTED_GPUS="${RAY_CLUSTER_EXPECTED_GPUS:-$((NUM_GPUS * NNODES))}"
+RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS="${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS:-90}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-108}"
+ACTOR_GLOBAL_BATCH_SIZE="${ACTOR_GLOBAL_BATCH_SIZE:-108}"
+CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
+LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
+OPSD_ENABLED="${OPSD_ENABLED:-true}"
+PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
+# Historical 20k OPSD training let localization inherit the 256-token global
+# rollout cap. Keep that behavior unless an experiment explicitly overrides it.
+SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-256}"
+MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
+LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
+CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
+NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
+POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
+ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
+CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
+CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
+CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB="${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB:-true}"
+EMA_TEACHER_ENABLED="${EMA_TEACHER_ENABLED:-true}"
+TEACHER_ANALYSIS_ENABLED="${TEACHER_ANALYSIS_ENABLED:-true}"
+# Caption rollouts should be short natural descriptions. This cap also bounds
+# the OPSD safety gate before any caption PPO or JSD update.
+CAPTION_MAX_RESPONSE_LENGTH="${CAPTION_MAX_RESPONSE_LENGTH:-256}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+# The controlled 20k+40k+10k experiment aligns all three loaders to one pass:
+# 20k/128 ~= 40k/256 ~= 10k/64 ~= 156 optimizer steps. Set MAX_STEPS=""
+# explicitly when a complete epoch should be used instead.
+MAX_STEPS="${MAX_STEPS-37}"
+# decay=1.0 makes the existing EMA update an identity, so teacher parameters
+# remain the SAMTok actor weights copied during worker initialization.
+TEACHER_EMA_DECAY="${TEACHER_EMA_DECAY:-1.0}"
+# B experiment: keep native CycleGRPO caption GRPO for every safe rollout;
+# regenerate CE and privileged JSD remain additive auxiliary gradients.
+PRESERVE_ORIGINAL_GRPO="${PRESERVE_ORIGINAL_GRPO:-true}"
+# C experiment: keep segmentation-only vocabulary out of privileged caption
+# JSD and anchor every safe caption to the frozen SAMTok reference.
+CAPTION_ANCHOR_KL_COEF="${CAPTION_ANCHOR_KL_COEF:-0.05}"
+CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES:-true}"
+SEGMENTATION_ANCHOR_KL_COEF="${SEGMENTATION_ANCHOR_KL_COEF:-0.05}"
+# The measured caption/segmentation cosine is nearly zero, so projection does
+# not materially alter updates and is disabled for the high-confidence teacher run.
+ASYMMETRIC_GRADIENT_PROJECTION="${ASYMMETRIC_GRADIENT_PROJECTION:-false}"
+JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB:-true}"
+TEACHER_CONFIDENCE_ENABLED="${TEACHER_CONFIDENCE_ENABLED:-true}"
+REGENERATE_MIN_TEACHER_SCORE="${REGENERATE_MIN_TEACHER_SCORE:-0.65}"
+REGENERATE_MIN_NORMALIZED_IMPROVEMENT="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT:-0.30}"
+DISTILL_MIN_CAPTION_SCORE="${DISTILL_MIN_CAPTION_SCORE:-0.65}"
+SUPERVISED_CAPTION_QA_ENABLED="${SUPERVISED_CAPTION_QA_ENABLED:-false}"
+CAPTION_QA_TRAIN_DATA="${CAPTION_QA_TRAIN_DATA:-${REPO_DIR}/data/qa_2k.parquet}"
+CAPTION_QA_BATCH_SIZE="${CAPTION_QA_BATCH_SIZE:-54}"
+CAPTION_QA_JSONL="${CAPTION_QA_JSONL:-${REPO_DIR}/data/qa_2k.jsonl}"
+CAPTION_QA_JUDGE_BASE_URL="${CAPTION_QA_JUDGE_BASE_URL:-http://127.0.0.1:8007/v1}"
+CAPTION_QA_JUDGE_MODEL="${CAPTION_QA_JUDGE_MODEL:-}"
+CAPTION_QA_JUDGE_API_KEY="${CAPTION_QA_JUDGE_API_KEY:-EMPTY}"
+CAPTION_QA_MAX_CONCURRENCY="${CAPTION_QA_MAX_CONCURRENCY:-16}"
+CAPTION_QA_TIMEOUT_SECONDS="${CAPTION_QA_TIMEOUT_SECONDS:-60}"
+CAPTION_QA_REWARD_WEIGHT="${CAPTION_QA_REWARD_WEIGHT:-1.0}"
+CAPTION_QA_LOSS_WEIGHT="${CAPTION_QA_LOSS_WEIGHT:-1.0}"
+EVIDENCE_GATE_ENABLED="${EVIDENCE_GATE_ENABLED:-false}"
+MASK_CREDIT_ENABLED="${MASK_CREDIT_ENABLED:-false}"
+REFUSAL_CREDIT_ENABLED="${REFUSAL_CREDIT_ENABLED:-false}"
+REFUSAL_CREDIT_LOSS_WEIGHT="${REFUSAL_CREDIT_LOSS_WEIGHT:-0.05}"
+REFUSAL_CREDIT_WARMUP_START_STEP="${REFUSAL_CREDIT_WARMUP_START_STEP:-0}"
+REFUSAL_CREDIT_WARMUP_END_STEP="${REFUSAL_CREDIT_WARMUP_END_STEP:-0}"
+ADAPTIVE_BALANCE_ENABLED="${ADAPTIVE_BALANCE_ENABLED:-false}"
+CBBA_ENABLED="${CBBA_ENABLED:-false}"
+CBBA_TARGET_CONFIDENCE="${CBBA_TARGET_CONFIDENCE:-0.70}"
+CBBA_GAIN="${CBBA_GAIN:-1.0}"
+CBBA_MIN_CYCLE_SCALE="${CBBA_MIN_CYCLE_SCALE:-0.75}"
+CBBA_MAX_CYCLE_SCALE="${CBBA_MAX_CYCLE_SCALE:-1.25}"
+CBBA_MIN_SUPERVISED_SCALE="${CBBA_MIN_SUPERVISED_SCALE:-0.75}"
+CBBA_MAX_SUPERVISED_SCALE="${CBBA_MAX_SUPERVISED_SCALE:-1.50}"
+# Direct grounding is an external supervised-anchor ablation, not part of the
+# original CycleGRPO path.  Keep it opt-in so gRefCOCO no-target rows retain
+# their outer-caption GRPO update by default.
+DIRECT_GROUNDING_ENABLED="${DIRECT_GROUNDING_ENABLED:-false}"
+DIRECT_TRAIN_DATA="${DIRECT_TRAIN_DATA:-${REPO_DIR}/data/direct_8k.parquet}"
+DIRECT_NO_TARGET_TRAIN_DATA="${DIRECT_NO_TARGET_TRAIN_DATA:-${REPO_DIR}/data/no_target_2k.parquet}"
+DIRECT_BATCH_SIZE="${DIRECT_BATCH_SIZE:-216}"
+DIRECT_GROUNDING_ROLLOUTS="${DIRECT_GROUNDING_ROLLOUTS:-6}"
+DIRECT_GROUNDING_LOSS_WEIGHT="${DIRECT_GROUNDING_LOSS_WEIGHT:-0.5}"
+DIRECT_GROUNDING_WARMUP_START_STEP="${DIRECT_GROUNDING_WARMUP_START_STEP:-10}"
+DIRECT_GROUNDING_WARMUP_END_STEP="${DIRECT_GROUNDING_WARMUP_END_STEP:-30}"
+DIRECT_GROUNDING_INCLUDE_NO_TARGET="${DIRECT_GROUNDING_INCLUDE_NO_TARGET:-false}"
+DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES:-false}"
+DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES:-false}"
+DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION:-false}"
+DIRECT_MASK_CE_ENABLED="${DIRECT_MASK_CE_ENABLED:-false}"
+DIRECT_MASK_CE_LOSS_WEIGHT="${DIRECT_MASK_CE_LOSS_WEIGHT:-0.02}"
+DIRECT_MASK_CE_INCLUDE_NO_TARGET="${DIRECT_MASK_CE_INCLUDE_NO_TARGET:-false}"
+DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE="${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE:-false}"
+MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED="${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED:-false}"
+DIRECT_MASK_CE_WARMUP_START_STEP="${DIRECT_MASK_CE_WARMUP_START_STEP:-0}"
+DIRECT_MASK_CE_WARMUP_END_STEP="${DIRECT_MASK_CE_WARMUP_END_STEP:-0}"
+# Seven training GPUs can consume a single 2:4:1 parent-prompt batch while a
+# separately launched DLC judge occupies the eighth GPU. Keep this opt-in so
+# historical arbitrary auxiliary batch sizes remain supported.
+THREE_STREAM_2_4_1_ENABLED="${THREE_STREAM_2_4_1_ENABLED:-false}"
+SAVE_FREQ="${SAVE_FREQ:-5}"
+SAVE_LIMIT="${SAVE_LIMIT:-20}"
+# A frozen-teacher run must start from MODEL_PATH. Set RESUME=true only when
+# continuing a checkpoint produced by this same frozen-teacher experiment.
+RESUME="${RESUME:-false}"
+
+RUN_NAME="${RUN_NAME:-pegc_baseline_4k}"
+RUN_ROOT="${RUN_ROOT:-${REPO_DIR}/logs/${RUN_NAME}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_ROOT}/checkpoints}"
+CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
+RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
+RUN_LOG="${RUN_LOG:-${RUN_ROOT}/train_${RUN_STAMP}.log}"
+# Keep Ray's object store and spill files on the local tmpfs.  RUN_ROOT is on
+# the persistent workspace mount, which can be nearly full independently.
+RAY_SHORT_ROOT="${RAY_SHORT_ROOT:-/dev/shm/cgrpo-ray-${UID:-$(id -u)}}"
+
+if [[ ! -d "${REPO_DIR}" ]]; then
+    echo "Repository directory not found: ${REPO_DIR}" >&2
+    exit 1
+fi
+
+if [[ ! "${TEACHER_EMA_DECAY}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
+    || ! awk -v value="${TEACHER_EMA_DECAY}" 'BEGIN { exit !(value > 0 && value <= 1) }'; then
+    echo "TEACHER_EMA_DECAY must be in (0, 1]: ${TEACHER_EMA_DECAY}" >&2
+    exit 1
+fi
+
+if [[ "${RESUME}" != "true" && "${RESUME}" != "false" ]]; then
+    echo "RESUME must be true or false: ${RESUME}" >&2
+    exit 1
+fi
+
+if [[ "${MULTINODE_ENABLED}" != "true" && "${MULTINODE_ENABLED}" != "false" ]]; then
+    echo "MULTINODE_ENABLED must be true or false: ${MULTINODE_ENABLED}" >&2
+    exit 1
+fi
+
+if [[ ! "${NNODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NNODES must be a positive integer: ${NNODES}" >&2
+    exit 1
+fi
+
+if [[ ! "${RAY_CLUSTER_EXPECTED_NODES}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${RAY_CLUSTER_EXPECTED_GPUS}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Ray cluster expected nodes/GPUs and connect timeout must be positive integers." >&2
+    exit 1
+fi
+
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    if [[ "${NNODES}" != "1" && "${NNODES}" != "2" ]]; then
+        echo "MULTINODE_ENABLED=true supports NNODES=1 or NNODES=2." >&2
+        exit 1
+    fi
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" ]] && (( NUM_GPUS < 1 || NUM_GPUS > 7 )); then
+        echo "A local Llama judge requires 1-7 training GPUs so one GPU remains reserved." >&2
+        exit 1
+    fi
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "false" && "${NUM_GPUS}" != "8" ]]; then
+        echo "Without a local Llama judge, MULTINODE_ENABLED=true requires NUM_GPUS=8." >&2
+        exit 1
+    fi
+    if [[ -z "${RAY_ADDRESS:-}" ]]; then
+        echo "MULTINODE_ENABLED=true requires RAY_ADDRESS for a Ray cluster started with this project environment." >&2
+        exit 1
+    fi
+    expected_multinode_gpus="$((NUM_GPUS * NNODES))"
+    if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "${NNODES}" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
+        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
+        exit 1
+    fi
+elif [[ "${NNODES}" != "1" ]]; then
+    echo "NNODES must remain 1 unless MULTINODE_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ "${PRESERVE_ORIGINAL_GRPO}" != "true" && "${PRESERVE_ORIGINAL_GRPO}" != "false" ]]; then
+    echo "PRESERVE_ORIGINAL_GRPO must be true or false: ${PRESERVE_ORIGINAL_GRPO}" >&2
+    exit 1
+fi
+
+if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
+    echo "OPSD_ENABLED must be true or false: ${OPSD_ENABLED}" >&2
+    exit 1
+fi
+
+if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
+    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
+    exit 1
+fi
+
+if [[ "${MASK_DECODE_MODE}" != "union" && "${MASK_DECODE_MODE}" != "first_mask" ]]; then
+    echo "MASK_DECODE_MODE must be union or first_mask: ${MASK_DECODE_MODE}" >&2
+    exit 1
+fi
+
+case "${LOCALIZATION_PROMPT_MODE}" in
+    mixed|refcoco|groundingsuite|legacy) ;;
+    *)
+        echo "LOCALIZATION_PROMPT_MODE must be mixed, refcoco, groundingsuite, or legacy: ${LOCALIZATION_PROMPT_MODE}" >&2
+        exit 1
+        ;;
+esac
+
+case "${CYCLE_PROMPT_MODE}" in
+    current|official_source_aware) ;;
+    *)
+        echo "CYCLE_PROMPT_MODE must be current or official_source_aware: ${CYCLE_PROMPT_MODE}" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "${NO_TARGET_REWARD_MODE}" == "pixel_empty" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
+    echo "NO_TARGET_REWARD_MODE=pixel_empty requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
+    exit 1
+fi
+
+for bool_name in \
+    PIXEL_IOU_ENABLED \
+    ROUTING_ENABLED \
+    CAPTION_SAFETY_ENABLED \
+    CAPTION_SAFETY_FORCE_REGENERATE \
+    CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB \
+    EMA_TEACHER_ENABLED \
+    TEACHER_ANALYSIS_ENABLED \
+    SUPERVISED_CAPTION_QA_ENABLED \
+    DIRECT_GROUNDING_ENABLED \
+    DIRECT_GROUNDING_INCLUDE_NO_TARGET \
+    DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES \
+    DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
+    DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
+    DIRECT_MASK_CE_ENABLED \
+    DIRECT_MASK_CE_INCLUDE_NO_TARGET \
+    REFUSAL_CREDIT_ENABLED \
+    MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED \
+    THREE_STREAM_2_4_1_ENABLED \
+    CBBA_ENABLED; do
+    bool_value="${!bool_name}"
+    if [[ "${bool_value}" != "true" && "${bool_value}" != "false" ]]; then
+        echo "${bool_name} must be true or false: ${bool_value}" >&2
+        exit 1
+    fi
+done
+
+if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    for caption_qa_required in CAPTION_QA_TRAIN_DATA CAPTION_QA_JSONL CAPTION_QA_JUDGE_BASE_URL CAPTION_QA_JUDGE_MODEL; do
+        if [[ -z "${!caption_qa_required}" ]]; then
+            echo "${caption_qa_required} is required when SUPERVISED_CAPTION_QA_ENABLED=true." >&2
+            exit 1
+        fi
+    done
+    if [[ ! -f "${CAPTION_QA_JSONL}" ]]; then
+        echo "CAPTION_QA_JSONL not found: ${CAPTION_QA_JSONL}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${CAPTION_QA_TRAIN_DATA}" ]]; then
+        echo "CAPTION_QA_TRAIN_DATA not found: ${CAPTION_QA_TRAIN_DATA}" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${DIRECT_GROUNDING_ENABLED}" == "true" || "${DIRECT_MASK_CE_ENABLED}" == "true" || "${REFUSAL_CREDIT_ENABLED}" == "true" ]]; then
+    if [[ -z "${DIRECT_TRAIN_DATA}" || ! -f "${DIRECT_TRAIN_DATA}" ]]; then
+        echo "DIRECT_TRAIN_DATA must point to the standalone RefCOCO direct-supervision parquet." >&2
+        exit 1
+    fi
+fi
+
+if [[ "${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" == "true" || "${DIRECT_MASK_CE_INCLUDE_NO_TARGET}" == "true" ]]; then
+    if [[ -z "${DIRECT_NO_TARGET_TRAIN_DATA}" || ! -f "${DIRECT_NO_TARGET_TRAIN_DATA}" ]]; then
+        echo "DIRECT_NO_TARGET_TRAIN_DATA must point to the gRefCOCO no-target parquet when no-target direct GRPO or SFT is enabled." >&2
+        exit 1
+    fi
+fi
+
+if [[ ! "${DIRECT_GROUNDING_ROLLOUTS}" =~ ^[2-9][0-9]*$ ]] \
+    || [[ ! "${CAPTION_QA_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${DIRECT_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${CAPTION_QA_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Direct/DLC-QA rollout and batch-size settings must be positive; direct rollouts must be >=2." >&2
+    exit 1
+fi
+
+if [[ "${THREE_STREAM_2_4_1_ENABLED}" == "true" ]]; then
+    if (( NUM_GPUS != 7 )); then
+        echo "THREE_STREAM_2_4_1_ENABLED requires NUM_GPUS=7; reserve the eighth GPU for the DLC judge." >&2
+        exit 1
+    fi
+    if [[ "${DIRECT_GROUNDING_ENABLED}" != "true" || "${DIRECT_MASK_CE_ENABLED}" != "true" || "${SUPERVISED_CAPTION_QA_ENABLED}" != "true" ]]; then
+        echo "THREE_STREAM_2_4_1_ENABLED requires direct GRPO, direct mask CE, and caption QA to all be enabled." >&2
+        exit 1
+    fi
+    if [[ "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" || "${ROUTING_ENABLED}" != "false" || "${EMA_TEACHER_ENABLED}" != "false" || "${TEACHER_ANALYSIS_ENABLED}" != "false" || "${CAPTION_SAFETY_ENABLED}" != "false" ]]; then
+        echo "THREE_STREAM_2_4_1_ENABLED keeps the 20k stream pure CycleGRPO plus pixel-IoU OPSD: enable OPSD/pixel IoU and disable teacher routing and safety auxiliaries." >&2
+        exit 1
+    fi
+    if ! awk -v caption_kl="${CAPTION_ANCHOR_KL_COEF}" -v segmentation_kl="${SEGMENTATION_ANCHOR_KL_COEF}" 'BEGIN { exit !(caption_kl == 0 && segmentation_kl == 0) }'; then
+        echo "THREE_STREAM_2_4_1_ENABLED requires CAPTION_ANCHOR_KL_COEF=0 and SEGMENTATION_ANCHOR_KL_COEF=0." >&2
+        exit 1
+    fi
+    if (( ROLLOUT_BATCH_SIZE % NUM_GPUS != 0 || DIRECT_BATCH_SIZE % NUM_GPUS != 0 || CAPTION_QA_BATCH_SIZE % NUM_GPUS != 0 )); then
+        echo "All three parent-prompt batch sizes must be divisible by the ${NUM_GPUS} training GPUs." >&2
+        exit 1
+    fi
+    if (( DIRECT_BATCH_SIZE != 2 * ROLLOUT_BATCH_SIZE || ROLLOUT_BATCH_SIZE != 2 * CAPTION_QA_BATCH_SIZE )); then
+        echo "2:4:1 requires ROLLOUT_BATCH_SIZE:DIRECT_BATCH_SIZE:CAPTION_QA_BATCH_SIZE = 2:4:1." >&2
+        exit 1
+    fi
+    if (( ROLLOUT_BATCH_SIZE % ACTOR_GLOBAL_BATCH_SIZE != 0 )); then
+        echo "ACTOR_GLOBAL_BATCH_SIZE must divide the main ROLLOUT_BATCH_SIZE in 2:4:1 mode." >&2
+        exit 1
+    fi
+fi
+
+if [[ ! "${DIRECT_GROUNDING_WARMUP_START_STEP}" =~ ^[0-9]+$ ]] \
+    || [[ ! "${DIRECT_GROUNDING_WARMUP_END_STEP}" =~ ^[0-9]+$ ]] \
+    || (( DIRECT_GROUNDING_WARMUP_END_STEP < DIRECT_GROUNDING_WARMUP_START_STEP )); then
+    echo "Direct grounding warmup must satisfy 0 <= start <= end: ${DIRECT_GROUNDING_WARMUP_START_STEP}, ${DIRECT_GROUNDING_WARMUP_END_STEP}" >&2
+    exit 1
+fi
+
+for direct_weight_name in DIRECT_GROUNDING_LOSS_WEIGHT DIRECT_MASK_CE_LOSS_WEIGHT REFUSAL_CREDIT_LOSS_WEIGHT; do
+    if ! awk -v value="${!direct_weight_name}" 'BEGIN { exit !(value >= 0) }'; then
+        echo "${direct_weight_name} must be non-negative: ${!direct_weight_name}" >&2
+        exit 1
+    fi
+done
+
+if [[ "${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" != "false" ]]; then
+    echo "DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION must be false: direct grounding is additive to main no-target caption GRPO." >&2
+    exit 1
+fi
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${OPSD_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires OPSD_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${PIXEL_IOU_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires PIXEL_IOU_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ "${ROUTING_ENABLED}" == "true" && "${EMA_TEACHER_ENABLED}" != "true" ]]; then
+    echo "ROUTING_ENABLED=true requires EMA_TEACHER_ENABLED=true." >&2
+    exit 1
+fi
+
+if [[ ! "${CAPTION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
+    || ! awk -v value="${CAPTION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
+    echo "CAPTION_ANCHOR_KL_COEF must be a non-negative number: ${CAPTION_ANCHOR_KL_COEF}" >&2
+    exit 1
+fi
+
+if [[ "${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" != "true" \
+    && "${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" != "false" ]]; then
+    echo "CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES must be true or false: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" >&2
+    exit 1
+fi
+
+if [[ ! "${SEGMENTATION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
+    || ! awk -v value="${SEGMENTATION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
+    echo "SEGMENTATION_ANCHOR_KL_COEF must be a non-negative number: ${SEGMENTATION_ANCHOR_KL_COEF}" >&2
+    exit 1
+fi
+
+if [[ "${ASYMMETRIC_GRADIENT_PROJECTION}" != "true" \
+    && "${ASYMMETRIC_GRADIENT_PROJECTION}" != "false" ]]; then
+    echo "ASYMMETRIC_GRADIENT_PROJECTION must be true or false: ${ASYMMETRIC_GRADIENT_PROJECTION}" >&2
+    exit 1
+fi
+
+if [[ "${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}" != "true" \
+    && "${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}" != "false" ]]; then
+    echo "DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE must be true or false: ${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}" >&2
+    exit 1
+fi
+
+if [[ ! "${DIRECT_MASK_CE_WARMUP_START_STEP}" =~ ^[0-9]+$ ]] \
+    || [[ ! "${DIRECT_MASK_CE_WARMUP_END_STEP}" =~ ^[0-9]+$ ]] \
+    || (( DIRECT_MASK_CE_WARMUP_END_STEP < DIRECT_MASK_CE_WARMUP_START_STEP )); then
+    echo "DIRECT_MASK_CE_WARMUP steps must satisfy 0 <= start <= end." >&2
+    exit 1
+fi
+
+if [[ ! "${REFUSAL_CREDIT_WARMUP_START_STEP}" =~ ^[0-9]+$ ]] \
+    || [[ ! "${REFUSAL_CREDIT_WARMUP_END_STEP}" =~ ^[0-9]+$ ]] \
+    || (( REFUSAL_CREDIT_WARMUP_END_STEP < REFUSAL_CREDIT_WARMUP_START_STEP )); then
+    echo "REFUSAL_CREDIT_WARMUP steps must satisfy 0 <= start <= end." >&2
+    exit 1
+fi
+
+if [[ "${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" != "true" \
+    && "${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" != "false" ]]; then
+    echo "JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB must be true or false: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" >&2
+    exit 1
+fi
+
+if [[ "${TEACHER_CONFIDENCE_ENABLED}" != "true" \
+    && "${TEACHER_CONFIDENCE_ENABLED}" != "false" ]]; then
+    echo "TEACHER_CONFIDENCE_ENABLED must be true or false: ${TEACHER_CONFIDENCE_ENABLED}" >&2
+    exit 1
+fi
+
+for threshold_name in REGENERATE_MIN_TEACHER_SCORE REGENERATE_MIN_NORMALIZED_IMPROVEMENT DISTILL_MIN_CAPTION_SCORE; do
+    threshold_value="${!threshold_name}"
+    if [[ ! "${threshold_value}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
+        || ! awk -v value="${threshold_value}" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
+        echo "${threshold_name} must be a number in [0, 1]: ${threshold_value}" >&2
+        exit 1
+    fi
+done
+
+if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
+    exit 1
+fi
+
+if [[ ! "${SAVE_LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAVE_LIMIT must be a positive integer: ${SAVE_LIMIT}" >&2
+    exit 1
+fi
+
+if [[ ! "${CAPTION_MAX_RESPONSE_LENGTH}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CAPTION_MAX_RESPONSE_LENGTH must be a positive integer: ${CAPTION_MAX_RESPONSE_LENGTH}" >&2
+    exit 1
+fi
+
+if [[ ! "${SEGMENTATION_MAX_RESPONSE_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SEGMENTATION_MAX_RESPONSE_TOKENS must be a positive integer: ${SEGMENTATION_MAX_RESPONSE_TOKENS}" >&2
+    exit 1
+fi
+
+TRAINER_MAX_STEPS_ARG=()
+if [[ -n "${MAX_STEPS}" ]]; then
+    TRAINER_MAX_STEPS_ARG=("trainer.max_steps=${MAX_STEPS}")
+fi
+
+# OmegaConf parses an empty command-line string as None. Keep disabled optional
+# caption-QA fields in their string defaults instead of overriding them with None.
+CAPTION_QA_OVERRIDES=(
+    "worker.supervised_anchors.caption_qa.enabled=${SUPERVISED_CAPTION_QA_ENABLED}"
+)
+if [[ "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    CAPTION_QA_OVERRIDES+=(
+        "worker.supervised_anchors.caption_qa.qa_jsonl=${CAPTION_QA_JSONL}"
+        "worker.supervised_anchors.caption_qa.train_files=['${CAPTION_QA_TRAIN_DATA}']"
+        "worker.supervised_anchors.caption_qa.batch_size=${CAPTION_QA_BATCH_SIZE}"
+        "worker.supervised_anchors.caption_qa.judge_base_url=${CAPTION_QA_JUDGE_BASE_URL}"
+        "worker.supervised_anchors.caption_qa.judge_model=${CAPTION_QA_JUDGE_MODEL}"
+        "worker.supervised_anchors.caption_qa.judge_api_key=${CAPTION_QA_JUDGE_API_KEY}"
+        "worker.supervised_anchors.caption_qa.max_concurrency=${CAPTION_QA_MAX_CONCURRENCY}"
+        "worker.supervised_anchors.caption_qa.timeout_seconds=${CAPTION_QA_TIMEOUT_SECONDS}"
+        "worker.supervised_anchors.caption_qa.reward_weight=${CAPTION_QA_REWARD_WEIGHT}"
+        "worker.supervised_anchors.caption_qa.loss_weight=${CAPTION_QA_LOSS_WEIGHT}"
+    )
+fi
+
+DIRECT_TRAIN_FILES_OVERRIDE="worker.supervised_anchors.direct_grounding.train_files=['${DIRECT_TRAIN_DATA}'"
+if [[ -n "${DIRECT_NO_TARGET_TRAIN_DATA}" ]]; then
+    DIRECT_TRAIN_FILES_OVERRIDE+=", '${DIRECT_NO_TARGET_TRAIN_DATA}'"
+fi
+DIRECT_TRAIN_FILES_OVERRIDE+="]"
+
+if [[ "${CONDA_PREFIX:-}" != "${ENV_DIR}" ]] && command -v conda >/dev/null 2>&1; then
+    CONDA_BASE="$(conda info --base)"
+    # shellcheck disable=SC1091
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${ENV_DIR}"
+fi
+
+export PATH="${ENV_DIR}/bin:${PATH}"
+PYTHON_BIN="${PYTHON_BIN:-${ENV_DIR}/bin/python3}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "Python executable not found: ${PYTHON_BIN}" >&2
+    exit 1
+fi
+RAY_BIN="${RAY_BIN:-${ENV_DIR}/bin/ray}"
+if [[ "${MULTINODE_ENABLED}" == "true" && ! -x "${RAY_BIN}" ]]; then
+    echo "Ray executable not found for multi-node mode: ${RAY_BIN}" >&2
+    exit 1
+fi
+
+required_paths=(
+    "${TRAIN_DATA}"
+    "${VAL_DATA}"
+    "${MODEL_PATH}/config.json"
+    "${MODEL_PATH}/model.safetensors.index.json"
+    "${MODEL_PATH}/mask_tokenizer_256x2.pth"
+    "${MODEL_PATH}/sam2.1_hiera_large.pt"
+    "${REPO_DIR}/projects/rl/config.yaml"
+    "${REPO_DIR}/projects/rl/format_prompt/non_thinking.jinja"
+)
+for path in "${required_paths[@]}"; do
+    if [[ ! -e "${path}" ]]; then
+        echo "Required path not found: ${path}" >&2
+        exit 1
+    fi
+done
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l | tr -d ' ')"
+    if (( GPU_COUNT < NUM_GPUS )); then
+        echo "Expected at least ${NUM_GPUS} GPUs, but nvidia-smi found ${GPU_COUNT}." >&2
+        exit 1
+    fi
+fi
+
+mkdir -p \
+    "${RUN_ROOT}" \
+    "${CHECKPOINT_DIR}" \
+    "${RUN_ROOT}/wandb" \
+    "${RUN_ROOT}/ray" \
+    "${CACHE_DIR}/huggingface" \
+    "${CACHE_DIR}/hf_datasets" \
+    "${CACHE_DIR}/modelscope"
+
+if [[ "${RAY_SHORT_ROOT}" != /* ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+    echo "RAY_SHORT_ROOT must be an absolute path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
+    exit 1
+fi
+
+if [[ -L "${RAY_SHORT_ROOT}" ]]; then
+    echo "RAY_SHORT_ROOT must be a real local directory, not a symlink: ${RAY_SHORT_ROOT}" >&2
+    echo "Use a new short path on a local filesystem; old launchers linked this path to RUN_ROOT." >&2
+    exit 1
+fi
+mkdir -p "${RAY_SHORT_ROOT}"
+
+if [[ ! -d "${RAY_SHORT_ROOT}" ]] || (( ${#RAY_SHORT_ROOT} > 32 )); then
+    echo "RAY_SHORT_ROOT must be an absolute path no longer than 32 characters: ${RAY_SHORT_ROOT}" >&2
+    exit 1
+fi
+
+RAY_TMP_USE_PERCENT="$(df -P "${RAY_SHORT_ROOT}" | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+if [[ ! "${RAY_TMP_USE_PERCENT}" =~ ^[0-9]+$ ]] || (( RAY_TMP_USE_PERCENT >= 95 )); then
+    echo "Ray temporary filesystem must be below 95% utilization: ${RAY_SHORT_ROOT}" >&2
+    df -h "${RAY_SHORT_ROOT}" >&2
+    exit 1
+fi
+
+validate_dataset_images() {
+    local dataset_path="$1"
+    "${PYTHON_BIN}" - "${dataset_path}" <<'PY'
+import os
+import sys
+
+import pyarrow.parquet as pq
+
+dataset_path = sys.argv[1]
+parquet = pq.ParquetFile(dataset_path)
+if "images" not in parquet.schema_arrow.names:
+    raise RuntimeError(f"{dataset_path} has no 'images' column")
+
+checked = 0
+for batch in parquet.iter_batches(columns=["images"], batch_size=2048):
+    for paths in batch.column(0).to_pylist():
+        if not isinstance(paths, list) or not paths:
+            raise RuntimeError(f"Invalid images entry: {paths!r}")
+        for image_path in paths:
+            checked += 1
+            if not os.path.isfile(image_path):
+                raise FileNotFoundError(
+                    f"Dataset image does not exist: {image_path}\n"
+                    "Re-export the parquet for this server or repair its images paths."
+                )
+
+print(f"Verified {checked} image paths in {dataset_path}")
+PY
+}
+
+validate_dataset_images "${TRAIN_DATA}"
+if [[ "${VAL_DATA}" != "${TRAIN_DATA}" ]]; then
+    validate_dataset_images "${VAL_DATA}"
+fi
+
+echo "CycleGRPO training output: ${RUN_LOG}"
+if [[ "${STREAM_LOG:-false}" == "true" ]]; then
+    if ! command -v tee >/dev/null 2>&1; then
+        echo "STREAM_LOG=true requires tee; falling back to file-only logging." >&2
+        exec >>"${RUN_LOG}" 2>&1
+    fi
+    exec > >(tee -a "${RUN_LOG}") 2>&1
+else
+    exec >>"${RUN_LOG}" 2>&1
+fi
+
+INHERITED_RAY_ADDRESS="${RAY_ADDRESS:-}"
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    # The orchestration tool starts this cluster with ENV_DIR's Ray. Preserve its
+    # address so verl.trainer.main attaches instead of creating a local cluster.
+    export RAY_ADDRESS
+    export RAY_NAMESPACE="${RAY_NAMESPACE:-cyclegrpo-${RUN_NAME}}"
+else
+    # Volcengine injects a Python 3.12 / Ray 2.53 cluster address. This job uses
+    # the repository Python 3.10 environment, so create a matching local cluster.
+    unset RAY_ADDRESS
+    unset RAY_NAMESPACE
+fi
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=true
+export HF_HOME="${CACHE_DIR}/huggingface"
+export HF_DATASETS_CACHE="${CACHE_DIR}/hf_datasets"
+export MODELSCOPE_CACHE="${CACHE_DIR}/modelscope"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_DIR="${RUN_ROOT}/wandb"
+TRAINER_LOGGERS="${TRAINER_LOGGERS:-[\"file\",\"wandb\"]}"
+export RAY_TMPDIR="${RAY_SHORT_ROOT}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+cd "${REPO_DIR}"
+
+echo "Start time: $(date --iso-8601=seconds)"
+echo "Repository: ${REPO_DIR}"
+echo "Training data: ${TRAIN_DATA}"
+echo "Model: ${MODEL_PATH}"
+echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
+echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
+echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
+echo "Positive segmentation mask decode mode: ${MASK_DECODE_MODE} (union or first_mask)"
+echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
+echo "Training mask decode mode: ${MASK_DECODE_MODE}"
+echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
+echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
+echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
+echo "Positive empty-mask penalty: ${POSITIVE_EMPTY_MASK_PENALTY}"
+echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
+echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
+echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
+echo "Preserve original caption GRPO: ${PRESERVE_ORIGINAL_GRPO}"
+echo "Caption anchor KL: ${CAPTION_ANCHOR_KL_COEF} (all safe routes: ${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES})"
+echo "Segmentation anchor KL: ${SEGMENTATION_ANCHOR_KL_COEF} (all cycle localization responses)"
+echo "Asymmetric caption-to-segmentation gradient projection: ${ASYMMETRIC_GRADIENT_PROJECTION}"
+echo "JSD blocks caption special-token vocabulary: ${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}"
+echo "PEGC modules: evidence_gate=${EVIDENCE_GATE_ENABLED}; mask_credit=${MASK_CREDIT_ENABLED}; refusal_credit=${REFUSAL_CREDIT_ENABLED}; adaptive_balance=${ADAPTIVE_BALANCE_ENABLED}"
+echo "CBBA: ${CBBA_ENABLED} (target=${CBBA_TARGET_CONFIDENCE}, gain=${CBBA_GAIN}, cycle=${CBBA_MIN_CYCLE_SCALE}-${CBBA_MAX_CYCLE_SCALE}, supervised=${CBBA_MIN_SUPERVISED_SCALE}-${CBBA_MAX_SUPERVISED_SCALE})"
+echo "High-confidence teacher gate: ${TEACHER_CONFIDENCE_ENABLED} (regenerate score >= ${REGENERATE_MIN_TEACHER_SCORE}, normalized gain >= ${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}, distill R_Ci >= ${DISTILL_MIN_CAPTION_SCORE})"
+echo "DLC-QA caption anchor: ${SUPERVISED_CAPTION_QA_ENABLED} (weight=${CAPTION_QA_REWARD_WEIGHT}, all questions per eligible rollout)"
+echo "DLC-QA train data: ${CAPTION_QA_TRAIN_DATA:-<disabled>} (batch=${CAPTION_QA_BATCH_SIZE}, loss weight=${CAPTION_QA_LOSS_WEIGHT})"
+echo "Direct grounding anchor: ${DIRECT_GROUNDING_ENABLED} (data=${DIRECT_TRAIN_DATA:-<disabled>}, batch=${DIRECT_BATCH_SIZE}, K=${DIRECT_GROUNDING_ROLLOUTS}, target weight=${DIRECT_GROUNDING_LOSS_WEIGHT}, warmup=${DIRECT_GROUNDING_WARMUP_START_STEP}-${DIRECT_GROUNDING_WARMUP_END_STEP}, human-positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, label-positive=${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}, no-target=${DIRECT_GROUNDING_INCLUDE_NO_TARGET}, consume no-target caption=${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION})"
+echo "Direct SFT anchor: ${DIRECT_MASK_CE_ENABLED} (weight=${DIRECT_MASK_CE_LOSS_WEIGHT}, human positive=${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}, no-target=${DIRECT_MASK_CE_INCLUDE_NO_TARGET})"
+echo "Direct CE/base gradient cosine diagnostic: ${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}"
+echo "Pairwise multitask gradient diagnostic: ${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}"
+echo "Direct CE warmup: ${DIRECT_MASK_CE_WARMUP_START_STEP}-${DIRECT_MASK_CE_WARMUP_END_STEP} (target=${DIRECT_MASK_CE_LOSS_WEIGHT})"
+echo "Refusal Credit: ${REFUSAL_CREDIT_ENABLED} (weight=${REFUSAL_CREDIT_LOSS_WEIGHT}, warmup=${REFUSAL_CREDIT_WARMUP_START_STEP}-${REFUSAL_CREDIT_WARMUP_END_STEP}, no-target only)"
+echo "Three-stream parent-prompt ratio 2:4:1: ${THREE_STREAM_2_4_1_ENABLED} (main=${ROLLOUT_BATCH_SIZE}, direct=${DIRECT_BATCH_SIZE}, DLC-QA=${CAPTION_QA_BATCH_SIZE}, training GPUs=${NUM_GPUS})"
+echo "Resume: ${RESUME}"
+echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
+echo "Caption response limit: ${CAPTION_MAX_RESPONSE_LENGTH} tokens"
+echo "Checkpoint directory: ${CHECKPOINT_DIR}"
+echo "Checkpoint retention limit: ${SAVE_LIMIT}"
+echo "Trainer loggers: ${TRAINER_LOGGERS}"
+echo "Ray temp root: ${RAY_SHORT_ROOT} (local filesystem ${RAY_TMP_USE_PERCENT}% used)"
+echo "Ray session logs: ${RAY_SHORT_ROOT}/ray"
+echo "Multi-node Ray mode: ${MULTINODE_ENABLED} (nnodes=${NNODES})"
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    echo "Ray address: ${RAY_ADDRESS}; expected nodes/GPUs: ${RAY_CLUSTER_EXPECTED_NODES}/${RAY_CLUSTER_EXPECTED_GPUS}"
+else
+    echo "Ignored inherited RAY_ADDRESS: ${INHERITED_RAY_ADDRESS:-<unset>}"
+fi
+"${PYTHON_BIN}" --version
+"${PYTHON_BIN}" -c 'import ray, torch, vllm; print(f"Ray: {ray.__version__}"); print(f"PyTorch: {torch.__version__}"); print(f"vLLM: {vllm.__version__}"); print(f"CUDA devices: {torch.cuda.device_count()}")'
+
+if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
+    "${PYTHON_BIN}" - "${RAY_ADDRESS}" "${RAY_CLUSTER_EXPECTED_NODES}" "${RAY_CLUSTER_EXPECTED_GPUS}" "${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS}" <<'PY'
+import sys
+import time
+
+import ray
+
+address, expected_nodes, expected_gpus, timeout = sys.argv[1:]
+expected_nodes = int(expected_nodes)
+expected_gpus = float(expected_gpus)
+deadline = time.monotonic() + int(timeout)
+last_state = "not connected"
+
+while time.monotonic() < deadline:
+    try:
+        ray.init(address=address, ignore_reinit_error=True, logging_level="ERROR")
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
+        last_state = f"alive_nodes={len(alive_nodes)}, gpus={gpu_count:g}"
+        if len(alive_nodes) == expected_nodes and gpu_count >= expected_gpus:
+            print(f"Verified multi-node Ray cluster: {last_state}")
+            ray.shutdown()
+            break
+        ray.shutdown()
+    except Exception as exc:
+        last_state = f"{type(exc).__name__}: {exc}"
+    time.sleep(2)
+else:
+    raise RuntimeError(
+        f"Ray cluster {address} did not reach {expected_nodes} alive nodes and "
+        f"{expected_gpus:g} GPUs within {timeout}s; last state: {last_state}"
+    )
+PY
+fi
+
+if [[ "${MULTINODE_ENABLED}" == "true" && "${SUPERVISED_CAPTION_QA_ENABLED}" == "true" ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "curl is required to verify CAPTION_QA_JUDGE_BASE_URL in multi-node mode." >&2
+        exit 1
+    fi
+    JUDGE_MODELS_URL="${CAPTION_QA_JUDGE_BASE_URL%/}/models"
+    if ! curl --fail --silent --show-error --max-time 15 "${JUDGE_MODELS_URL}" >/dev/null; then
+        echo "DLC-QA judge health check failed: ${JUDGE_MODELS_URL}" >&2
+        exit 1
+    fi
+    echo "DLC-QA judge health check passed: ${JUDGE_MODELS_URL}"
+fi
+
+# Generic trainer validation does not run the RefCOCO mask/cIoU path. Evaluate
+# the checkpoints saved below with the offline RefCOCO evaluator instead.
+exec "${PYTHON_BIN}" -m verl.trainer.main \
+    config=projects/rl/config.yaml \
+    "data.train_files=['${TRAIN_DATA}']" \
+    "data.val_files=['${VAL_DATA}']" \
+    data.format_prompt="${REPO_DIR}/projects/rl/format_prompt/non_thinking.jinja" \
+    data.region_format=mask_token \
+    data.cycle_prompt_mode="${CYCLE_PROMPT_MODE}" \
+    data.shuffle=true \
+    data.seed=1 \
+    data.rollout_batch_size="${ROLLOUT_BATCH_SIZE}" \
+    data.max_prompt_length=8192 \
+    data.max_response_length="${CAPTION_MAX_RESPONSE_LENGTH}" \
+    worker.actor.model.model_path="${MODEL_PATH}" \
+    worker.actor.model.freeze_vision_tower=true \
+    worker.actor.model.enable_gradient_checkpointing=true \
+    worker.actor.optimize_captioner=true \
+    worker.actor.optimize_segmenter=true \
+    worker.actor.global_batch_size="${ACTOR_GLOBAL_BATCH_SIZE}" \
+    worker.actor.micro_batch_size_per_device_for_update=1 \
+    worker.actor.micro_batch_size_per_device_for_experience=2 \
+    worker.actor.dynamic_batching=true \
+    worker.actor.padding_free=true \
+    worker.rollout.n="${CAPTION_ROLLOUTS}" \
+    worker.rollout.tensor_parallel_size=1 \
+    worker.rollout.gpu_memory_utilization=0.6 \
+    worker.rollout.max_num_batched_tokens=16384 \
+    worker.rollout.disable_tqdm=true \
+    worker.opsd.enabled="${OPSD_ENABLED}" \
+    worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
+    worker.opsd.caption_loss_weight=0.5 \
+    worker.opsd.localization_loss_weight=0.5 \
+    worker.opsd.caption_anchor_kl_coef="${CAPTION_ANCHOR_KL_COEF}" \
+    worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
+    worker.opsd.segmentation_anchor_kl_coef="${SEGMENTATION_ANCHOR_KL_COEF}" \
+    worker.opsd.asymmetric_gradient_projection="${ASYMMETRIC_GRADIENT_PROJECTION}" \
+    worker.opsd.teacher_confidence.enabled="${TEACHER_CONFIDENCE_ENABLED}" \
+    worker.opsd.teacher_confidence.regenerate_min_teacher_score="${REGENERATE_MIN_TEACHER_SCORE}" \
+    worker.opsd.teacher_confidence.regenerate_min_normalized_improvement="${REGENERATE_MIN_NORMALIZED_IMPROVEMENT}" \
+    worker.opsd.teacher_confidence.distill_min_caption_score="${DISTILL_MIN_CAPTION_SCORE}" \
+    worker.opsd.pixel_iou.enabled="${PIXEL_IOU_ENABLED}" \
+    worker.opsd.pixel_iou.segmentation_max_response_tokens="${SEGMENTATION_MAX_RESPONSE_TOKENS}" \
+    worker.opsd.pixel_iou.mask_decode_mode="${MASK_DECODE_MODE}" \
+    worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
+    worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
+    worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
+    worker.opsd.routing.low_threshold=0.5 \
+    worker.opsd.routing.high_threshold=0.85 \
+    worker.opsd.routing.preserve_original_grpo="${PRESERVE_ORIGINAL_GRPO}" \
+    worker.opsd.caption_safety.enabled="${CAPTION_SAFETY_ENABLED}" \
+    worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \
+    worker.opsd.caption_safety.force_regenerate="${CAPTION_SAFETY_FORCE_REGENERATE}" \
+    worker.opsd.caption_safety.block_special_token_vocab="${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}" \
+    worker.opsd.distillation.block_caption_special_token_vocab="${JSD_BLOCK_CAPTION_SPECIAL_TOKEN_VOCAB}" \
+    worker.opsd.ema_teacher.enabled="${EMA_TEACHER_ENABLED}" \
+    worker.opsd.ema_teacher.decay="${TEACHER_EMA_DECAY}" \
+    worker.opsd.teacher_analysis.enabled="${TEACHER_ANALYSIS_ENABLED}" \
+    worker.opsd.evidence_gate.enabled="${EVIDENCE_GATE_ENABLED}" \
+    worker.opsd.mask_credit.enabled="${MASK_CREDIT_ENABLED}" \
+    worker.opsd.adaptive_balance.enabled="${ADAPTIVE_BALANCE_ENABLED}" \
+    worker.opsd.cbba.enabled="${CBBA_ENABLED}" \
+    worker.opsd.cbba.target_confidence="${CBBA_TARGET_CONFIDENCE}" \
+    worker.opsd.cbba.gain="${CBBA_GAIN}" \
+    worker.opsd.cbba.min_cycle_scale="${CBBA_MIN_CYCLE_SCALE}" \
+    worker.opsd.cbba.max_cycle_scale="${CBBA_MAX_CYCLE_SCALE}" \
+    worker.opsd.cbba.min_supervised_scale="${CBBA_MIN_SUPERVISED_SCALE}" \
+    worker.opsd.cbba.max_supervised_scale="${CBBA_MAX_SUPERVISED_SCALE}" \
+    "${CAPTION_QA_OVERRIDES[@]}" \
+    worker.supervised_anchors.direct_grounding.enabled="${DIRECT_GROUNDING_ENABLED}" \
+    "${DIRECT_TRAIN_FILES_OVERRIDE}" \
+    worker.supervised_anchors.direct_grounding.batch_size="${DIRECT_BATCH_SIZE}" \
+    worker.supervised_anchors.direct_grounding.rollouts="${DIRECT_GROUNDING_ROLLOUTS}" \
+    worker.supervised_anchors.direct_grounding.loss_weight="${DIRECT_GROUNDING_LOSS_WEIGHT}" \
+    worker.supervised_anchors.direct_grounding.warmup_start_step="${DIRECT_GROUNDING_WARMUP_START_STEP}" \
+    worker.supervised_anchors.direct_grounding.warmup_end_step="${DIRECT_GROUNDING_WARMUP_END_STEP}" \
+    worker.supervised_anchors.direct_grounding.include_no_target="${DIRECT_GROUNDING_INCLUDE_NO_TARGET}" \
+    worker.supervised_anchors.direct_grounding.include_positive_sources="${DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES}" \
+    worker.supervised_anchors.direct_grounding.include_label_sources="${DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES}" \
+    worker.supervised_anchors.direct_grounding.consume_no_target_caption="${DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION}" \
+    worker.supervised_anchors.direct_mask_ce.enabled="${DIRECT_MASK_CE_ENABLED}" \
+    worker.supervised_anchors.direct_mask_ce.loss_weight="${DIRECT_MASK_CE_LOSS_WEIGHT}" \
+    worker.supervised_anchors.direct_mask_ce.include_positive_sources=true \
+    worker.supervised_anchors.direct_mask_ce.include_no_target="${DIRECT_MASK_CE_INCLUDE_NO_TARGET}" \
+    worker.supervised_anchors.direct_mask_ce.record_base_gradient_cosine="${DIRECT_MASK_CE_RECORD_BASE_GRADIENT_COSINE}" \
+    worker.supervised_anchors.direct_mask_ce.warmup_start_step="${DIRECT_MASK_CE_WARMUP_START_STEP}" \
+    worker.supervised_anchors.direct_mask_ce.warmup_end_step="${DIRECT_MASK_CE_WARMUP_END_STEP}" \
+    worker.supervised_anchors.refusal_credit.enabled="${REFUSAL_CREDIT_ENABLED}" \
+    worker.supervised_anchors.refusal_credit.loss_weight="${REFUSAL_CREDIT_LOSS_WEIGHT}" \
+    worker.supervised_anchors.refusal_credit.include_positive_sources=false \
+    worker.supervised_anchors.refusal_credit.include_no_target=true \
+    worker.supervised_anchors.refusal_credit.warmup_start_step="${REFUSAL_CREDIT_WARMUP_START_STEP}" \
+    worker.supervised_anchors.refusal_credit.warmup_end_step="${REFUSAL_CREDIT_WARMUP_END_STEP}" \
+    worker.supervised_anchors.gradient_diagnostics.enabled="${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}" \
+    worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
+    worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \
+    trainer.project_name=cyclegrpo \
+    trainer.experiment_name="${RUN_NAME}" \
+    trainer.total_epochs="${TOTAL_EPOCHS}" \
+    "${TRAINER_MAX_STEPS_ARG[@]+"${TRAINER_MAX_STEPS_ARG[@]}"}" \
+    trainer.nnodes="${NNODES}" \
+    trainer.n_gpus_per_node="${NUM_GPUS}" \
+    trainer.val_freq=-1 \
+    trainer.val_before_train=false \
+    trainer.save_freq="${SAVE_FREQ}" \
+    trainer.save_limit="${SAVE_LIMIT}" \
+    trainer.save_checkpoint_path="${CHECKPOINT_DIR}" \
+    trainer.find_last_checkpoint="${RESUME}" \
+    "trainer.logger=${TRAINER_LOGGERS}"

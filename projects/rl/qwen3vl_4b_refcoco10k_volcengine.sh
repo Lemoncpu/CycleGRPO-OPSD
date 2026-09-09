@@ -23,6 +23,12 @@ CAPTION_ROLLOUTS="${CAPTION_ROLLOUTS:-6}"
 LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
 PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
+SECA_ENABLED="${SECA_ENABLED:-false}"
+SECA_MIN_WEIGHT="${SECA_MIN_WEIGHT:-0.5}"
+SECA_MAX_WEIGHT="${SECA_MAX_WEIGHT:-1.0}"
+SECA_FALSE_POSITIVE_PENALTY="${SECA_FALSE_POSITIVE_PENALTY:-2.0}"
+SECA_COARSE_TOKEN_WEIGHT="${SECA_COARSE_TOKEN_WEIGHT:-1.5}"
+SECA_FINE_TOKEN_WEIGHT="${SECA_FINE_TOKEN_WEIGHT:-1.0}"
 # Historical 20k OPSD training let localization inherit the 256-token global
 # rollout cap. Keep that behavior unless an experiment explicitly overrides it.
 SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-256}"
@@ -234,6 +240,7 @@ for bool_name in \
     DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
     DIRECT_MASK_CE_ENABLED \
+    SECA_ENABLED \
     DIRECT_MASK_CE_INCLUDE_NO_TARGET \
     MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED \
     THREE_STREAM_2_4_1_ENABLED; do
@@ -607,6 +614,7 @@ echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
+echo "SECA: ${SECA_ENABLED} (evidence min/max=${SECA_MIN_WEIGHT}/${SECA_MAX_WEIGHT}, fp penalty=${SECA_FALSE_POSITIVE_PENALTY}, coarse/fine token=${SECA_COARSE_TOKEN_WEIGHT}/${SECA_FINE_TOKEN_WEIGHT})"
 echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
 echo "Positive segmentation mask decode mode: ${MASK_DECODE_MODE} (union or first_mask)"
 echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
@@ -732,6 +740,12 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.rollout.max_num_batched_tokens=16384 \
     worker.rollout.disable_tqdm=true \
     worker.opsd.enabled="${OPSD_ENABLED}" \
+    worker.opsd.seca.enabled="${SECA_ENABLED}" \
+    worker.opsd.seca.min_weight="${SECA_MIN_WEIGHT}" \
+    worker.opsd.seca.max_weight="${SECA_MAX_WEIGHT}" \
+    worker.opsd.seca.false_positive_penalty="${SECA_FALSE_POSITIVE_PENALTY}" \
+    worker.opsd.seca.coarse_token_weight="${SECA_COARSE_TOKEN_WEIGHT}" \
+    worker.opsd.seca.fine_token_weight="${SECA_FINE_TOKEN_WEIGHT}" \
     worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
     worker.opsd.caption_loss_weight=0.5 \
     worker.opsd.localization_loss_weight=0.5 \

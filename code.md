@@ -5,6 +5,10 @@
 
 ## 1. 项目定位
 
+### 隔离 PEGC Refusal Credit 对照（2026-09-07）
+
+`experiments/pegc_ablation_20260902/` 新增了只作用于该探索副本的 `worker.supervised_anchors.refusal_credit`：它对 gRefCOCO no-target 文本执行独立 `No target.` teacher-forcing，并统计每个 prompt 的 6-rollout 全 mask/全空/同质率；根目录主训练入口和主代码实现不受影响。
+
 论文标题是 **Actor as Its Own Critic: Unifying Region Understanding and Localization via CycleGRPO**。核心目标不是单独优化“区域描述”或“文本定位”，而是把二者视为互逆映射：
 
 ```text
@@ -72,7 +76,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | vision tower | frozen | shell 覆盖为 `true` |
 | caption/segmenter | 都优化 | 最终按 `0.5/0.5` 梯度权重累积 |
 | 验证 | checkpoint 后离线 RefCOCO | 入口默认每 5 step 保存 checkpoint，`SAVE_LIMIT` 可限制保留数量；`val_freq=-1`、`val_before_train=false`；通用 trainer validation 不执行 mask reconstruction，不能代替标准 RefCOCO cIoU/mIoU |
-| 日志 | file + wandb | shell 强制 `WANDB_MODE=offline`；可设 `TRAINER_LOGGERS='["file"]'`，不需要安装 W&B |
+| 日志 | file + wandb | shell 强制 `WANDB_MODE=offline`；未安装可选 `wandb` 依赖的服务器应设 `TRAINER_LOGGERS='["file"]'`，避免条件导入后的 `NameError` 并将指标完整写入本地 JSONL |
 
 火山引擎入口默认使用 `/mnt/cxzx/workspace/data_transfer/houzhiyan` 下的仓库、Conda
 环境、已修复绝对图像路径的 RefCOCO 10k parquet 和 SAMTok checkpoint，可用同名环境变量覆盖。当前默认输出根为
@@ -114,7 +118,7 @@ rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpo
 离线评测入口执行 RefCOCO val。入口默认 `MAX_STEPS=156`，用于使 20k/40k/10k 三条流在同一轮内对齐；设置 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
 再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
-2.56；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
+2.56；独立 70k 命令文件必须用 `$ENV_DIR/bin/ray` 启动和停止本地 head，并先清理旧 head，确保 ray CLI 与 trainer 使用同一解释器环境；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。显式连接平台 Ray 时设置 `MULTINODE_ENABLED=true`、`NNODES=1|2` 和由项目 `$ENV_DIR/bin/ray`
 创建的私有 `RAY_ADDRESS`；入口会保留该地址，并在 trainer 启动前验证对应数量的节点和 Ray GPU。纯 20k
 controller 使用 `NNODES=2`、`NUM_GPUS=8`、GPU 0--7 全训练的拓扑（16 Ray GPU）；有监督 controller
@@ -581,6 +585,8 @@ mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：
 
 C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。非对称梯度投影仍保留为可选诊断：`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。当前服务器日志的 cosine 仅约 `-0.004` 到 `-0.018`，故入口默认关闭它。高置信 gate 新增 `opsd/regenerate_validated_candidate_count`、`opsd/regenerate_confident_candidate_{count,rate}`、`opsd/regenerate_confident_target_acceptance_rate`、`opsd/distillation_route_count`、`opsd/distillation_confident_{count,rate}` 与 `opsd/distillation_confident_R_Ci_mean`，必须同时检查这些项，避免阈值过严而使辅助 loss 静默为空。原有 anchor、projection、JSD finite 检查行为不变。
 
+主代码将已验证的 Evidence Gate 与 Mask Credit 统一封装为 `verl/workers/opsd/seca.py` 的 **SECA (Spatial-Evidence Credit Assignment)** 模块。`worker.opsd.seca.enabled`（入口环境变量 `SECA_ENABLED`）默认关闭；开启后不改动 pixel-IoU、`R_Ci`、reward 或原始 GRPO：`spatial_evidence_weight` 用 IoU 与 reconstruction-only 面积比计算 `[min_weight,max_weight]` 门控，只乘到 mid-route privileged JSD 的 sample weight；`hierarchical_mask_token_weights` 在 direct mask CE 的有效 response mask token 中识别 SAMTok depth-2 code，将首个 coarse code 乘 `coarse_token_weight`、第二个 fine code 乘 `fine_token_weight`，其余 token 保持 1。没有 direct mask CE batch 时，SECA 的 token-credit 子路径自然不产生更新；没有 mid-route 时，evidence 子路径自然不产生更新。`projects/rl/config.yaml` 保留默认关闭，`qwen3vl_4b_refcoco10k_volcengine.sh` 暴露开关和五个参数，因而可在同一主训练入口复现实验分支的 Evidence+Mask Credit 行为。
+
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
 当 captioner 和 segmenter 都启用时，trainer 不分别 optimizer step，而是：
@@ -665,11 +671,12 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/reassemble_fsdp_checkpoint.py` | CPU/Gloo 离线 FSDP checkpoint 重组器；按 checkpoint 文件名发现并启动同等数量 CPU rank，逐参数收集原 world-size shard 后在 rank 0 还原完整 state dict、复制 processor/config 并写出 HF safetensors。用于训练 world size 无法同时获得足量 GPU 时的评测导出 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
+| `experiments/pegc_ablation_20260902/tools/eval_direct_grpo_refusal_suite.sh` | 探索副本两版 direct-GRPO/Refusal Credit checkpoint 的四 bench 串行评测；使用本地 Llama-3.1 8B 评分 DLC，汇总 GRES 的 T_acc/N_acc/gIoU/cIoU，并在完成后恢复 GPU 占卡
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_grefcoco_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、gRefCOCO 排除抽样、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_grefcoco_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` / `tests/test_seca.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、gRefCOCO 排除抽样、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -690,6 +697,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
 | `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 配置及边界校验 |
+| `workers/opsd/seca.py` | 统一的 SECA 空间证据信用分配：mid-route JSD evidence gate 与 direct mask CE hierarchical token credit；由 `worker.opsd.seca.enabled` 控制 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
 | `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、共享 image embedding 的批量 `union`/`first_mask` 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
@@ -830,7 +838,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 26. **正例 segmentation 的 mask 解码可配置。** 在线 CycleGRPO 与 direct reward 默认记录 `mask_group_count`、`valid_mask_group_count`，将一条 response 中全部完整、codebook 合法 group 的 decoded mask union 后计算 IoU 和 `R_Ci`。通过 `MASK_DECODE_MODE=first_mask` 可以恢复原始训练时只解码第一个合法 group 的语义；`union` 是当前默认值。多 group 是原始 CycleGRPO 允许的表达形式，不会被置零或逐组扣分；只有同一完整 group 出现超过三次时，原有 `non_repeat` 一分正则为零。训练日志应检查 `opsd/seg_multi_mask_rate`、`opsd/seg_mean_mask_group_count` 与 direct 对应指标，用于定位退化的重复输出。训练解码模式必须与离线评测协议单独记录，不能混合比较。
 27. **三条监督流必须严格隔离。** `data.train_files` 只能是 20k image-mask cycle mix；不得把它传给 `DIRECT_TRAIN_DATA`、`DIRECT_NO_TARGET_TRAIN_DATA` 或 `CAPTION_QA_TRAIN_DATA`。`DIRECT_TRAIN_DATA` 必须是 RefCOCO 人工正 expression（`source=refcoco_cycle`）；启用 no-target direct GRPO/SFT 时，`DIRECT_NO_TARGET_TRAIN_DATA` 必须是 gRefCOCO no-target expression（`source=gres_no_target`），推荐各 20k。`CAPTION_QA_TRAIN_DATA` 必须含全部可 join 的 `dam_source_id`，并与 `CAPTION_QA_JSONL` 一一对应。三条 loader 的 batch size 各自独立，主训练 epoch/step/save cadence 只由 20k loader 决定；resume 必须保留 checkpoint 内 `auxiliary_dataloaders.pt`，否则两条外部流会从头开始。
 28. **2:4:1 配额按 parent prompt 而不是生成 response 计数。** 在 `28:56:14`、`G=K=6`、7 个训练 rank 下，每 step 先采样 4 个主 cycle、8 个 RefCOCO direct、2 个 DLC-QA parent prompt/rank；随后主 caption 生成 24 条、main localization 生成 144 条、direct localization 生成 48 条、QA caption 生成 12 条 response/rank。它们的 loss 仍在同一次 optimizer step 累积，但 `caption_loss_weight`、`localization_loss_weight`、direct warmup/CE 权重和 `caption_qa.loss_weight` 继续决定实际梯度尺度，数据配额本身不等价于 loss 等权。`THREE_STREAM_2_4_1_ENABLED=true` 是旧的严格纯三流模式，会强制关闭 teacher routing/regenerate/JSD、caption/segmentation anchor KL 与 caption safety；当前有监督多机 sweep 不开启该 flag，而是让 controller 校验相同的 2:4:1 配额，以保留 v1/v2 routing、EMA teacher 和 teacher diagnosis。
-29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；RefCOCO 正例通过 `DIRECT_TRAIN_DATA`，DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。`DIRECT_NO_TARGET_TRAIN_DATA` 必须指向实际存在的 `source=gres_no_target` parquet，启动前必须执行 `test -f "$DIRECT_NO_TARGET_TRAIN_DATA"`，不能假定历史命名或未核验路径。
+29. **当前服务器 disjoint 诊断环境变量记录。** 固定基础变量为 `BASE_DIR=/volume/ybo/xyc`、`REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD`、`ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo`、`MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`，训练 GPU 为 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`、`NUM_GPUS=7`。主 cycle 数据为 `/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`；70k 入口的 `DIRECT_TRAIN_DATA` 固定为 `/volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet`，`DIRECT_NO_TARGET_TRAIN_DATA` 固定为 `/volume/ybo/xyc/datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet`；两条 direct 流合计 40k 分割监督样本（30k RefCOCO + 10k no-target）；DLC-QA 通过 `CAPTION_QA_TRAIN_DATA` 与 `CAPTION_QA_JSONL`。两个 direct 文件均须在路径重写后实际存在且保留 `source=refcoco_cycle`/`source=gres_no_target` 契约，启动前必须执行 `test -f`，不能假定历史命名或未核验路径。
 30. **混合四组多机试验必须使用五列清单与动态资源契约。** `launch_four_supervised_trials.sh` 的每行是
 `trial_id`、`ray_address`、`ray_namespace`、`head_judge_base_url`、`experiment_env`；无 DLC-QA 的 20k 行将
 judge URL 填为 `-`。pixel-empty 20k、official-bbox 20k 和 official source-aware prompt 20k 均要求单节点、
@@ -2091,3 +2099,87 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
   `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/supervised_anchors.py`
   `verl/trainer/ray_trainer.py tests/test_supervised_anchors.py` 与 `git diff --check`；本机未运行 CUDA/Ray
   端到端训练，服务器应以当前三卡配置确认进入 step 1。
+
+### 2026-09-07 - 将 Evidence+Mask Credit 迁移为主代码可切换的 SECA 模块
+
+- 代码：新增 `verl/workers/opsd/seca.py`、`tests/test_seca.py`；修改 `verl/workers/opsd/{config,__init__}.py`、`verl/trainer/ray_trainer.py`、`verl/workers/actor/dp_actor.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 和 `projects/rl/qwen3vl_4b_mt.sh`。
+- 行为：将已验证分支的 Evidence Gate 与 Mask Credit 统一命名为 SECA（Spatial-Evidence Credit Assignment），由 `worker.opsd.seca.enabled` / `SECA_ENABLED` 单一开关控制，默认关闭以保持 baseline。开启后，mid-route privileged JSD 的 sample weight 按 IoU 与 reconstruction-only false-positive 面积门控；direct mask CE 的首个/第二个 SAMTok depth-2 code 分别使用 coarse/fine token credit；pixel-IoU、`R_Ci`、reward、原始 GRPO 和无 token-weight 监督批次均不变。
+- 文档：更新第 3.6 节、模块清单与本日志，明确 SECA 的调用路径、适用的两条辅助梯度边界以及没有对应 batch 时的空路径语义。
+- 验证：执行 `bash -n projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh projects/rl/qwen3vl_4b_mt.sh`、受影响 Python 文件的 `py_compile`、`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_seca`（依赖当前训练环境的 PyTorch）、YAML/脚本静态检查和 `git diff --check`；未启动 GPU/Ray 训练，未修改占卡进程。
+
+### 2026-09-07 - 隔离探索副本新增 no-target Refusal Credit 对照
+
+- 代码：仅修改 `experiments/pegc_ablation_20260902/` 内的 supervised-anchor 配置、trainer/FSDP worker、branch launcher，并新增两套 3+1 卡 1/10 训练入口。
+- 行为：实验组独立 teacher-force no-target `No target.` token，baseline 保持 direct GRPO + 正样本 empty-mask penalty；两者均关闭 direct mask CE 与 Mask Credit，并记录每个 no-target prompt 的 6-rollout all-mask/all-empty/同质率。根目录主训练入口不变。
+- 验证：分支 Python `py_compile`、四个 shell `bash -n` 通过；训练与四 bench 评测待执行。
+
+### 2026-09-07 - 探索副本追加 Mask Credit + Refusal Credit 联合训练
+
+- 代码：仅新增 `experiments/pegc_ablation_20260902/tools/train_mask_refusal_credit_1of10_3gpu.sh`，根目录主训练入口不变。
+- 行为：该入口与 Refusal Credit 对照共享 1/10 数据、三卡训练 + 一卡本地 Llama 和 direct GRPO 设置，仅额外打开 hierarchical Mask Credit，关闭 direct mask CE；用于和 baseline、Refusal Credit 两版统一评测 N acc 是否恢复。
+- 验证：新增脚本通过 `bash -n`；训练与四 bench 评测待三版依次完成后执行。
+
+### 2026-09-08 - 隔离探索副本增加干净 direct GRPO 对照入口
+
+- 代码：新增 `experiments/pegc_ablation_20260902/tools/train_direct_grpo_only_baseline_1of10_3gpu.sh` 与 `experiments/pegc_ablation_20260902/tools/train_direct_grpo_only_refusal_credit_1of10_3gpu.sh`；根目录主训练入口不变。
+- 行为：新增对照明确关闭 DLC-QA、Mask Credit、direct mask CE 及其他 PEGC 模块，仅保留正样本/no-target direct GRPO；实验组额外启用 Refusal Credit，direct grounding 从第 0 步生效，用于单独测量拒识梯度对 N acc 的影响。
+- 验证：两个脚本通过 `bash -n`；训练与四 bench 评测在当前服务器依次执行，DLC-Bench 评测使用本地 Llama 3.1 8B judge。
+
+### 2026-09-08 - 修复 70k 八卡命令的 Ray 环境不一致
+
+- 代码：修改 `opsd_70k_positive_empty_penalty_only_8gpu.txt`。
+- 文档：更新 Ray 环境约束说明和本变更日志。
+- 行为：70k 入口现在把项目环境的 `$ENV_DIR/bin` 放在 PATH 前，并使用同一环境的 `ray start/stop`；启动前清理本机旧 Ray head，避免全局 Ray 2.35/Python 3.10.12 与训练环境 Ray 2.57/Python 3.10.20 混用导致版本校验失败。
+- 验证：复现并确认原日志中的 Ray version mismatch 根因；执行 `bash -n opsd_70k_positive_empty_penalty_only_8gpu.txt`，检查命令包含环境内 `ray` 和 stale-head 清理。
+
+### 2026-09-08 - 增加 Refusal Credit 对照的四 bench 评测编排
+
+- 代码：新增 `experiments/pegc_ablation_20260902/tools/eval_direct_grpo_refusal_suite.sh`，根目录主训练入口不变。
+- 行为：训练完成后从探索分支目录依次执行两版 HF 导出、RefCOCO、GroundingSuite、GRES 四项指标及 DLC-Bench 本地 Llama-3.1 8B judge；严格检查 benchmark 产物并在末尾恢复 GPU0--3 占卡。
+- 验证：脚本通过 `bash -n`，训练链路继续运行中。
+
+
+### 2026-09-09 - 修复 70k 离线训练缺少 wandb 依赖的启动失败
+
+- 代码：修改 `opsd_70k_positive_empty_penalty_only_8gpu.txt`；未新增、移动或删除模块。
+- 文档：更新第 2.2 节日志配置说明和本变更日志。
+- 行为：70k 正样本 pixel-empty 训练改用 `TRAINER_LOGGERS='["file"]'`。当前环境未安装可选
+  `wandb` 包，原 `['file','wandb']` 配置会在 `verl/utils/logger/logger.py` 的条件导入后调用
+  不存在的 `wandb` 名称并触发 `NameError`；file-only 模式保留本地 experiment/generation JSONL，
+  不改变训练、数据、reward 或 Ray 拓扑。
+- 验证：根据 `logs/cyclegrpo70k_opsd_seca_positive_only_8gpu/train_20260909_031958.log` 的
+  `NameError: name 'wandb' is not defined` 堆栈确认根因；执行 `bash -n opsd_70k_positive_empty_penalty_only_8gpu.txt`
+  和 `git diff --check`，未重新启动训练。
+
+
+### 2026-09-09 - 完善跨服务器 70k 全流程 README
+
+- 代码：未修改训练、评测或数据处理实现；修改 `README.md`，无新增、移动、删除模块。
+- 文档：将 RefCOCO 明确指向 `Untitled111/refcoco-train2014-assets`，其余已上传数据指向 `Untitled111/train-opsd`；固定 20k cycle、30k direct、10k no-target、10k DLC-QA 的实际 parquet 路径；补充绝对路径重写、DLC-QA join 检查、7+1 GPU 训练、四 bench 评测、本地 Llama-3.1-8B DLC judge 与权重上传流程。
+- 行为：跨服务器使用者只需下载模型/数据、执行路径重写和 preflight，即可从任意工作目录调用单一训练脚本；脚本内部自动启动 Ray 和训练期 Llama judge。旧版公共下载段落保留为可选的原始数据重建说明，不再与已上传数据冲突。
+- 验证：执行 `bash -n` 检查 70k 训练、RL launcher 和 eval launcher；抽取 README 全部 bash 代码块执行语法检查；执行 `git diff --check`；静态确认 README 不再包含旧 parquet 路径或“not mirrored”矛盾说明。未启动新的 70k 训练，避免占用当前正在进行的评测资源。
+
+### 2026-09-09 - 修正 70k 训练入口的 direct parquet 路径
+
+- 代码：修改 `opsd_70k_positive_empty_penalty_only_8gpu.txt`；未新增、移动或删除模块。
+- 行为：`DIRECT_TRAIN_DATA` 和 `DIRECT_NO_TARGET_TRAIN_DATA` 现在指向 `train-opsd` 中实际存在的 30k direct 与 10k no-target parquet；避免跨服务器按 README 下载后因旧目录名导致启动前数据文件不存在。
+- 验证：使用 `rg` 核对脚本路径与 README 第 3、4 节 canonical exports 一致；执行 `bash -n opsd_70k_positive_empty_penalty_only_8gpu.txt` 与 `git diff --check`，未启动新的 GPU 训练。
+
+### 2026-09-09 - 补充 70k direct 数据路径契约
+
+- 代码：未新增模块；同步更新 `code.md` 第 29 条数据/资源契约说明。
+- 文档：明确 70k 入口实际使用的 30k direct 与 10k no-target parquet 文件名，并要求路径重写后执行存在性检查和 source 契约检查。
+- 验证：核对 `opsd_70k_positive_empty_penalty_only_8gpu.txt`、`README.md` 与本机四个 parquet 的行数；执行 `git diff --check`。
+
+### 2026-09-09 - 明确 40k 分割监督组成与 70k 运行时依赖
+
+- 代码：未修改训练算法；同步修正 `code.md` 当前数据路径说明。
+- 文档：明确 40k 分割监督由 30k `refcoco_cycle` 正例和 10k `gres_no_target` 组成；README 增加依赖 profile、系统工具要求与运行时 import smoke。
+- 配置：确认 70k 使用 20k cycle + 40k direct 分割监督 + 10k DLC-QA；SECA、OPSD/pixel-IoU、routing、EMA teacher、teacher analysis/confidence、caption safety、direct GRPO、direct mask CE 均开启；main/rollout batch=112，direct=224，QA=56，GPU 0--6 为 Ray 训练、GPU 7 为本地 Llama judge，no-target reward=`pixel_empty`。
+- 验证：实际检查两条监督 parquet 的 source/行数（30,000 + 10,000）、当前环境核心 import（torch 2.8.0+cu128、Ray 2.57.0、vLLM 0.11.0 等）和 `verl.trainer.main` import；执行训练/评测脚本 `bash -n`、README bash block 语法检查及 `git diff --check`。
+
+### 2026-09-09 - 修正 70k README 预检开关与依赖说明
+
+- 代码：未修改训练算法；修改 `README.md` 与 `code.md` 数据/环境说明。
+- 文档：预检现在使用入口真实变量名 `DIRECT_GROUNDING_ENABLED`、`DIRECT_MASK_CE_ENABLED`、`SUPERVISED_CAPTION_QA_ENABLED`，并检查 OPSD、SECA、routing、EMA teacher、teacher analysis/confidence、caption safety 全部开启；明确合并 40k 文件仅作说明，正式入口使用 30k+10k split。
+- 验证：README 全部 bash block、70k 训练入口和 eval 入口通过 `bash -n`；核心依赖 import smoke 通过；两条监督 parquet source 严格为 30,000 `refcoco_cycle` 与 10,000 `gres_no_target`；`git diff --check` 通过。

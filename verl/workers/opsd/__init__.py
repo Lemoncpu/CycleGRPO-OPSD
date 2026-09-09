@@ -1,4 +1,4 @@
-from .config import CaptionSafetyConfig, OPSDConfig
+from .config import CaptionSafetyConfig, OPSDConfig, SECAConfig
 from .distillation import caption_blocked_special_token_ids, chunked_weighted_jsd_loss
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
@@ -28,6 +28,7 @@ from .routing import (
     teacher_caption_is_safe,
     uses_original_grpo,
 )
+from .seca import hierarchical_mask_token_weights, spatial_evidence_weight
 
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "ON_POLICY_DISTILL_ROUTE",
     "CaptionSafetyConfig",
     "OPSDConfig",
+    "SECAConfig",
     "REGENERATE_ROUTE",
     "aggregate_caption_rollouts",
     "build_privileged_teacher_images",
@@ -57,6 +59,8 @@ __all__ = [
     "pixel_empty_reward",
     "positive_empty_mask_penalty",
     "regenerate_weight",
+    "hierarchical_mask_token_weights",
+    "spatial_evidence_weight",
     "teacher_caption_is_safe",
     "uses_original_grpo",
 ]

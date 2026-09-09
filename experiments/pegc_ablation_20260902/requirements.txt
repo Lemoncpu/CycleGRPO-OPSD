@@ -1,0 +1,4 @@
+# Default: lightweight shared dependencies only.
+# Choose an additional requirements/<profile>.txt file for data conversion,
+# training, vLLM rollout, evaluation, tracking, or historical utilities.
+-r requirements/base.txt

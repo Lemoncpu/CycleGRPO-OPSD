@@ -13,6 +13,7 @@ export HF_DATASETS_CACHE='./hf_dataset_cache'
 
 # Cold-start (co-SFT) checkpoint that RL starts from. See README for how to obtain it.
 MODEL_PATH="<PATH_TO_COLD_START_CKPT>"
+SECA_ENABLED="${SECA_ENABLED:-false}"
 
 python3 -m verl.trainer.main \
     config=projects/rl/config.yaml \
@@ -24,6 +25,7 @@ python3 -m verl.trainer.main \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.optimize_captioner=true \
     worker.actor.optimize_segmenter=true \
+    worker.opsd.seca.enabled=${SECA_ENABLED} \
     worker.rollout.n=6 \
     trainer.experiment_name=cyclegrpo_qwen3vl_4b \
     trainer.total_epochs=1 \

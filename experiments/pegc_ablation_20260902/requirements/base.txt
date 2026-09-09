@@ -1,0 +1,8 @@
+# Shared pure-Python dependencies. CUDA/PyTorch packages intentionally live in
+# separate profiles so this file is usable on CPU-only login nodes as well.
+numpy<2
+omegaconf
+hydra-core
+pillow
+transformers>=4.54.0,<=4.57.0
+qwen-vl-utils

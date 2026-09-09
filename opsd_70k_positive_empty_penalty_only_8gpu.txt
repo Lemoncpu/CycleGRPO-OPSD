@@ -1,0 +1,122 @@
+# 70k mixed training: only positive empty-mask penalty is enabled.
+# no-target rows use NO_TARGET_NONEMPTY_MASK_PENALTY=0.0.
+# GPUs 0-6: Ray training; GPU 7: local Llama3.1-8B DLC-QA judge.
+
+cd /volume/ybo/xyc/CycleGRPO-OPSD
+
+export BASE_DIR=/volume/ybo/xyc
+export REPO_DIR=/volume/ybo/xyc/CycleGRPO-OPSD
+export ENV_DIR=/volume/ybo/xyc/envs/cyclegrpo
+export PATH="$ENV_DIR/bin:$PATH"
+export MODEL_PATH=/volume/ybo/xyc/Qwen3-VL-4B-SAMTok
+export TRAIN_DATA=/volume/ybo/xyc/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet
+export VAL_DATA="$TRAIN_DATA"
+export DIRECT_TRAIN_DATA=/volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet
+export DIRECT_NO_TARGET_TRAIN_DATA=/volume/ybo/xyc/datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet
+export CAPTION_QA_TRAIN_DATA=/volume/ybo/xyc/datasets/dlc_qa/dlc_qa_10000.parquet
+export CAPTION_QA_JSONL=/volume/ybo/xyc/datasets/dlc_qa/dam_caption_qa_10000.jsonl
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
+export RAY_ADDRESS=127.0.0.1:6379
+export RAY_NAMESPACE=cyclegrpo-70k-positive-only-8gpu
+export RAY_SHORT_ROOT=/dev/shm/cgrpo-ray70kpos
+
+# Use the same Ray/Python environment as the trainer and clear stale local state.
+"$ENV_DIR/bin/ray" stop --force >/dev/null 2>&1 || true
+"$ENV_DIR/bin/ray" start --head --node-ip-address=127.0.0.1 --port=6379 --num-gpus=7 \
+  --dashboard-host=127.0.0.1 --temp-dir="$RAY_SHORT_ROOT" --disable-usage-stats
+
+cleanup() {
+  "$ENV_DIR/bin/python3" "$REPO_DIR/tools/multinode/local_llama_judge.py" stop \
+    --ray-address "$RAY_ADDRESS" --namespace "$RAY_NAMESPACE" --expected-nodes 1 \
+    --env-dir "$ENV_DIR" \
+    --model-path /volume/ybo/xyc/models/Meta-Llama-3.1-8B-Instruct-hf-v2 \
+    --served-model-name llama3.1-8b --port 18007 --gpu-device 7 \
+    --gpu-memory-utilization 0.85 \
+    --chat-template "$REPO_DIR/tools/multinode/llama3_chat_template.jinja" \
+    --log-dir "$REPO_DIR/logs/llama_judge_70k_positive_only_8gpu" \
+    --name-prefix cyclegrpo-70k-positive-llama --timeout-seconds 180 || true
+  "$ENV_DIR/bin/ray" stop --force || true
+}
+trap cleanup EXIT INT TERM
+
+"$ENV_DIR/bin/python3" "$REPO_DIR/tools/multinode/local_llama_judge.py" start \
+  --ray-address "$RAY_ADDRESS" --namespace "$RAY_NAMESPACE" --expected-nodes 1 \
+  --env-dir "$ENV_DIR" \
+  --model-path /volume/ybo/xyc/models/Meta-Llama-3.1-8B-Instruct-hf-v2 \
+  --served-model-name llama3.1-8b --port 18007 --gpu-device 7 \
+  --gpu-memory-utilization 0.85 \
+  --chat-template "$REPO_DIR/tools/multinode/llama3_chat_template.jinja" \
+  --log-dir "$REPO_DIR/logs/llama_judge_70k_positive_only_8gpu" \
+  --name-prefix cyclegrpo-70k-positive-llama --timeout-seconds 180
+
+export MULTINODE_ENABLED=true
+export LOCAL_JUDGE_ENABLED=true
+export NNODES=1
+export NUM_GPUS=7
+export RAY_CLUSTER_EXPECTED_NODES=1
+export RAY_CLUSTER_EXPECTED_GPUS=7
+
+export OPSD_ENABLED=true
+export PIXEL_IOU_ENABLED=true
+export SECA_ENABLED=true
+export NO_TARGET_REWARD_MODE=pixel_empty
+export POSITIVE_EMPTY_MASK_PENALTY=1.0
+export NO_TARGET_NONEMPTY_MASK_PENALTY=0.0
+
+export ROUTING_ENABLED=true
+export PRESERVE_ORIGINAL_GRPO=true
+export EMA_TEACHER_ENABLED=true
+export TEACHER_EMA_DECAY=1.0
+export TEACHER_ANALYSIS_ENABLED=true
+export TEACHER_CONFIDENCE_ENABLED=true
+export CAPTION_SAFETY_ENABLED=true
+export CAPTION_SAFETY_FORCE_REGENERATE=true
+export CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB=true
+export CAPTION_ANCHOR_KL_COEF=0
+export SEGMENTATION_ANCHOR_KL_COEF=0
+export ASYMMETRIC_GRADIENT_PROJECTION=false
+
+export DIRECT_GROUNDING_ENABLED=true
+export DIRECT_GROUNDING_ROLLOUTS=6
+export DIRECT_GROUNDING_LOSS_WEIGHT=0.15
+export DIRECT_GROUNDING_WARMUP_START_STEP=10
+export DIRECT_GROUNDING_WARMUP_END_STEP=30
+export DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES=true
+export DIRECT_GROUNDING_INCLUDE_NO_TARGET=true
+export DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES=false
+export DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION=false
+
+export DIRECT_MASK_CE_ENABLED=true
+export DIRECT_MASK_CE_LOSS_WEIGHT=0.005
+export DIRECT_MASK_CE_INCLUDE_NO_TARGET=true
+export DIRECT_MASK_CE_WARMUP_START_STEP=10
+export DIRECT_MASK_CE_WARMUP_END_STEP=30
+
+export SUPERVISED_CAPTION_QA_ENABLED=true
+export CAPTION_QA_BATCH_SIZE=56
+export CAPTION_QA_MAX_CONCURRENCY=16
+export CAPTION_QA_TIMEOUT_SECONDS=90
+export CAPTION_QA_REWARD_WEIGHT=1.0
+export CAPTION_QA_LOSS_WEIGHT=1.0
+export CAPTION_QA_JUDGE_BASE_URL=http://127.0.0.1:18007/v1
+export CAPTION_QA_JUDGE_MODEL=llama3.1-8b
+export CAPTION_QA_JUDGE_API_KEY=EMPTY
+
+export ROLLOUT_BATCH_SIZE=112
+export ACTOR_GLOBAL_BATCH_SIZE=112
+export DIRECT_BATCH_SIZE=224
+export CAPTION_ROLLOUTS=6
+export LOCALIZATION_ROLLOUTS=6
+export TOTAL_EPOCHS=1
+export MAX_STEPS=178
+export SAVE_FREQ=5
+export SAVE_LIMIT=2
+export RESUME=false
+
+export TRAINER_LOGGERS='["file"]'
+export RUN_NAME=cyclegrpo70k_opsd_seca_positive_only_8gpu
+export RUN_ROOT="$REPO_DIR/logs/cyclegrpo70k_opsd_seca_positive_only_8gpu"
+export CHECKPOINT_DIR="$RUN_ROOT/checkpoints"
+
+bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"

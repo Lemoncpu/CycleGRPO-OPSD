@@ -1,0 +1,2 @@
+# Compile/install only after torch and the local CUDA toolkit are compatible.
+flash-attn>=2.4.3
