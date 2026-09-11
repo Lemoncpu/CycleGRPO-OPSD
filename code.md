@@ -9,12 +9,6 @@
 
 `experiments/pegc_ablation_20260902/` 新增了只作用于该探索副本的 `worker.supervised_anchors.refusal_credit`：它对 gRefCOCO no-target 文本执行独立 `No target.` teacher-forcing，并统计每个 prompt 的 6-rollout 全 mask/全空/同质率；根目录主训练入口和主代码实现不受影响。
 
-该探索副本还支持隔离 cycle 与 direct 正例的 empty/refusal penalty：
-`pixel_iou.positive_empty_mask_penalty` 继续控制 cycle 正例，新增的
-`pixel_iou.direct_positive_empty_mask_penalty` 只控制 `source=supervised_grounding` 的 direct 正例；后者为
-`null` 或入口未设置 `DIRECT_POSITIVE_EMPTY_MASK_PENALTY` 时继承前者，保持旧实验行为。当前
-`cycle=1.0/direct=0.0` 入口只存在于探索副本，不改变根目录主训练配置或论文 CycleGRPO 目标。
-
 论文标题是 **Actor as Its Own Critic: Unifying Region Understanding and Localization via CycleGRPO**。核心目标不是单独优化“区域描述”或“文本定位”，而是把二者视为互逆映射：
 
 ```text
@@ -406,7 +400,7 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
    UID、`localization_index`、source 等元数据严格按未补齐 prompt 数量构造，并检查输出为
    `prompt_count × K`，避免 padding 后数量残留造成 DataProto 一致性错误。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
-6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，`positive_empty_mask_penalty` 默认在 segmentation reward 额外扣 `1.0`；真实 IoU 本身保持不变，并独立记录该负项。探索副本可用 `direct_positive_empty_mask_penalty` 为 `supervised_grounding` 单独覆盖强度；cycle source 仍使用前者。
+6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，`positive_empty_mask_penalty` 默认在 segmentation reward 额外扣 `1.0`；真实 IoU 本身保持不变，并独立记录该负项。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
@@ -554,12 +548,6 @@ direct no-target segmentation rollout 仍按其自己的外部监督配置运行
 包含大小写不敏感的 `No target.`，或其 decoded union 没有像素，则 `seg_overall` 额外加 `-1.0`；设为 `0.0`
 可关闭。它不改变 `pixel_iou`、`R_Ci` 或离线 cIoU 指标，只通过独立的
 `seg_positive_empty_mask_penalty` 奖励字段提供相对 GRPO 信号，也绝不作用于正确的 no-target 拒识。
-在 `experiments/pegc_ablation_20260902/` 探索副本中，新增
-`worker.opsd.pixel_iou.direct_positive_empty_mask_penalty`（入口环境变量
-`DIRECT_POSITIVE_EMPTY_MASK_PENALTY`）：仅 `supervised_grounding` direct 正例读取该值，cycle 正例继续读取
-`positive_empty_mask_penalty`。direct 值未显式设置时继承 cycle 值，因此既有脚本数值不变；新隔离实验显式使用
-`1.0/0.0`。该项仍只改变 `seg_overall` 的 GRPO reward，不改变 IoU、OPSD route、direct mask CE、DLC-QA
-或 no-target reward。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -684,7 +672,6 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `experiments/pegc_ablation_20260902/tools/eval_direct_grpo_refusal_suite.sh` | 探索副本两版 direct-GRPO/Refusal Credit checkpoint 的四 bench 串行评测；使用本地 Llama-3.1 8B 评分 DLC，汇总 GRES 的 T_acc/N_acc/gIoU/cIoU，并在完成后恢复 GPU 占卡
-| `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_pos1_direct_pos0_1of10_3gpu.sh` | 探索副本的 1/10 Evidence+Mask Credit 隔离惩罚入口；GPU 0--2 训练、GPU 3 运行 DLC judge，cycle/direct 正例 empty penalty 分别为 `1.0/0.0` |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
@@ -2196,22 +2183,3 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 代码：未修改训练算法；修改 `README.md` 与 `code.md` 数据/环境说明。
 - 文档：预检现在使用入口真实变量名 `DIRECT_GROUNDING_ENABLED`、`DIRECT_MASK_CE_ENABLED`、`SUPERVISED_CAPTION_QA_ENABLED`，并检查 OPSD、SECA、routing、EMA teacher、teacher analysis/confidence、caption safety 全部开启；明确合并 40k 文件仅作说明，正式入口使用 30k+10k split。
 - 验证：README 全部 bash block、70k 训练入口和 eval 入口通过 `bash -n`；核心依赖 import smoke 通过；两条监督 parquet source 严格为 30,000 `refcoco_cycle` 与 10,000 `gres_no_target`；`git diff --check` 通过。
-
-### 2026-09-11 - 隔离探索副本的 cycle/direct 正例空 mask 惩罚
-
-- 代码：修改 `experiments/pegc_ablation_20260902/verl/workers/opsd/config.py`、
-  `verl/workers/fsdp_workers.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_pegc_ablation.sh` 与
-  `tests/test_opsd_core.py`；新增
-  `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_pos1_direct_pos0_1of10_3gpu.sh`。
-- 文档：更新第 1、3.4、3.5 节和模块清单；根目录主训练代码及默认配置未修改。
-- 行为：探索副本新增 `direct_positive_empty_mask_penalty` / `DIRECT_POSITIVE_EMPTY_MASK_PENALTY`，仅覆盖
-  `source=supervised_grounding` 的 direct 正例；未设置时继承现有 cycle/default penalty，既有实验保持原行为。
-  新入口基于 `train_evidence_mask_credit_1of10_epoch1.sh`，显式设置 cycle/direct 为 `1.0/0.0`，保留其
-  Evidence Gate、Mask Credit、direct GRPO/CE、DLC-QA 和其余算法配置。资源改为 GPU 0--2 训练、GPU 3
-  运行 Llama；为满足三卡整除约束，三条 parent batch 使用 `108/216/54`，`MAX_STEPS=18` 维持约一轮剂量。
-- 论文边界：该 source-specific reward 是探索性外部监督消融，不属于论文原始 CycleGRPO 公式，也不进入
-  根目录正式 launcher。
-- 验证：探索 launcher 与新脚本通过 `bash -n`，受影响 Python 文件通过 `py_compile`，YAML 字段和
-  source-specific 继承/覆盖逻辑通过无 PyTorch 的 AST 定向检查，`git diff --check` 通过。尝试运行
-  `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest tests.test_opsd_core`，但本机 Python 未安装
-  `torch`，测试在模块导入时失败；未启动 CUDA/Ray/Llama 训练。
