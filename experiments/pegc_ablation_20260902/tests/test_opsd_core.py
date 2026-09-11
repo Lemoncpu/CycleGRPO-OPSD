@@ -116,8 +116,19 @@ class OPSDCoreTest(unittest.TestCase):
         PixelIoUConfig(no_target_reward_mode="pixel_empty").post_init()
         PixelIoUConfig(no_target_reward_mode="official_bbox").post_init()
         PixelIoUConfig(positive_empty_mask_penalty=0.0).post_init()
+        isolated = PixelIoUConfig(
+            positive_empty_mask_penalty=1.0,
+            direct_positive_empty_mask_penalty=0.0,
+        )
+        isolated.post_init()
+        self.assertEqual(isolated.positive_empty_mask_penalty_for_source("refcoco_cycle"), 1.0)
+        self.assertEqual(isolated.positive_empty_mask_penalty_for_source("supervised_grounding"), 0.0)
+        inherited = PixelIoUConfig(positive_empty_mask_penalty=0.25)
+        self.assertEqual(inherited.positive_empty_mask_penalty_for_source("supervised_grounding"), 0.25)
         with self.assertRaisesRegex(ValueError, "positive_empty_mask_penalty"):
             PixelIoUConfig(positive_empty_mask_penalty=-0.01).post_init()
+        with self.assertRaisesRegex(ValueError, "direct_positive_empty_mask_penalty"):
+            PixelIoUConfig(direct_positive_empty_mask_penalty=-0.01).post_init()
         with self.assertRaisesRegex(ValueError, "no_target_reward_mode"):
             PixelIoUConfig(no_target_reward_mode="unknown").post_init()
         with self.assertRaisesRegex(ValueError, "requires opsd.enabled"):

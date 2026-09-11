@@ -118,8 +118,11 @@ worker:
       # fragments; ``official_bbox`` reproduces the public bbox-format proxy.
       no_target_reward_mode: text
       # Deducted from a positive segmentation reward only when the response
-      # refuses or decodes to zero pixels. Set 0.0 to disable.
+      # refuses or decodes to zero pixels. This is the cycle/default value.
       positive_empty_mask_penalty: 1.0
+      # Null inherits positive_empty_mask_penalty for backward compatibility.
+      # Set explicitly to isolate the direct positive rollout penalty.
+      direct_positive_empty_mask_penalty: null
     routing:
       enabled: true
       low_threshold: 0.5

@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 from ..actor.config import FSDPConfig, OffloadConfig
 
@@ -25,8 +26,15 @@ class PixelIoUConfig:
     # non-cycle batch, as in the public CycleGRPO implementation.
     no_target_reward_mode: str = "text"
     # Subtract this score from a positive segmentation rollout that explicitly
-    # refuses or decodes to an empty mask. Zero disables the term.
+    # refuses or decodes to an empty mask. This is the cycle/default value.
     positive_empty_mask_penalty: float = 1.0
+    # Direct positive rollouts inherit the cycle value unless explicitly set.
+    direct_positive_empty_mask_penalty: Optional[float] = None
+
+    def positive_empty_mask_penalty_for_source(self, source: str) -> float:
+        if source == "supervised_grounding" and self.direct_positive_empty_mask_penalty is not None:
+            return self.direct_positive_empty_mask_penalty
+        return self.positive_empty_mask_penalty
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -51,6 +59,11 @@ class PixelIoUConfig:
             )
         if self.positive_empty_mask_penalty < 0.0:
             raise ValueError("pixel_iou.positive_empty_mask_penalty must be non-negative.")
+        if (
+            self.direct_positive_empty_mask_penalty is not None
+            and self.direct_positive_empty_mask_penalty < 0.0
+        ):
+            raise ValueError("pixel_iou.direct_positive_empty_mask_penalty must be non-negative.")
 
 
 @dataclass
