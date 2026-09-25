@@ -337,21 +337,24 @@ print("validated DLC-QA dam_source_id join: 10000 rows")
 PY
 ```
 
-### 5. Run the four routing-threshold ablations
+### 5. Run the routing ablations and the 50% baseline control
 
-The environment and data preparation above are shared by all four experiments. The
-only maintained training commands in this README are the four routing wrappers
-listed in [Training](#training). They all run the same full 70k SECA recipe:
+The environment and data preparation above are shared by the four routing
+experiments and the separate 50% baseline control. The maintained training
+commands in this README are the four routing wrappers plus the baseline wrapper
+listed in [Training](#training). The routing wrappers all run the same full 70k
+SECA recipe:
 20k CycleGRPO + 30k RefCOCO direct positives + 10k gRefCOCO no-target direct
 rows + 10k DLC-QA rows, with seven Ray/FSDP training GPUs and the eighth GPU
 reserved for the local Llama judge. Do not start Ray or the judge manually; each
 wrapper starts and cleans up its own local services.
 
 Complete the path-rewrite step first, then follow [Training](#training) to
-preflight and run the four wrappers. Each wrapper has its own run name, Ray
-ports, judge port and short Ray directory, so the four runs can be kept as
-independent directories. Run them sequentially on one eight-GPU node unless
-the server has four completely isolated eight-GPU allocations.
+preflight and run the four routing wrappers. Then run the 50% baseline control
+as a separate data-volume experiment; it is not a fifth routing threshold. Each
+entry has its own run name, Ray ports, judge port and short Ray directory, so
+the runs can be kept as independent directories. Run them sequentially on one
+eight-GPU node unless the server has isolated allocations.
 
 After each completed run, record the wrapper name, routing pair, git revision,
 data manifest, `run.log`, `training.log` and checkpoint directory together.
@@ -608,10 +611,11 @@ of silently replacing a multi-instance quota with single-instance data.
 
 ## Training
 
-This README intentionally exposes only the four formal routing-threshold ablations.
-Do not use the generic `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` command
-directly for these experiments: the wrapper is responsible for the 70k data streams,
-seven-GPU Ray topology, local judge, fixed SECA configuration and run isolation.
+This README exposes four formal routing-threshold ablations and one separate
+50% baseline data-volume control. Do not use the generic
+`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` command directly: the wrappers
+are responsible for the 70k data streams, seven-GPU Ray topology, local judge,
+fixed algorithm settings and run isolation.
 
 ### Fixed experiment matrix
 
@@ -630,6 +634,43 @@ collide.
 The last row is the requested `high=0.85+0.20` direction clipped to `1.00`,
 because the launcher rejects thresholds outside `[0,1]`. The four values are
 fixed in the wrappers and are not inherited from the shell environment.
+
+### Separate 50% baseline data-volume control
+
+`tools/train_supervised_70k_baseline_50pct_8gpu.sh` is a historical baseline
+control, not a routing-threshold variant. It disables SECA
+(`SECA_ENABLED=false`, `SECA_SELF_SUPERVISED_ENABLED=false`) and keeps the
+baseline model, optimizer, rollout, loss, checkpoint and 7+1 GPU settings.
+Before launching Ray it creates deterministic nested subsets under its run
+directory: 10,000 main-cycle rows, 15,000 direct RefCOCO-positive rows, 5,000
+direct gRefCOCO no-target rows, 5,000 DLC-QA Parquet rows and their matching
+5,000-record JSONL sidecar. It uses `112/224/56` parent batches and defaults to
+90 optimizer steps (the full baseline uses 179 steps).
+
+The wrapper uses Ray ports `29691/29692`, judge port `18010`, Ray temporary
+directory `/dev/shm/cgrpo70k-50`, and run root
+`logs/cyclegrpo70k_historical_baseline_50pct_8gpu`. Run its independent preflight
+after exporting the paths above:
+
+```bash
+bash -n "$REPO_DIR/tools/train_supervised_70k_baseline_50pct_8gpu.sh"
+DRY_RUN=true HOLD_AFTER_EXIT=false \
+  bash "$REPO_DIR/tools/train_supervised_70k_baseline_50pct_8gpu.sh"
+```
+
+The preflight must report the 50% row counts (`10000/15000/5000/5000`) and the
+matching 5,000 JSONL records. After it passes, stop any hold workers and run the
+control separately:
+
+```bash
+GPU_LIST=0,1,2,3,4,5,6,7 PYTHON_BIN="$PYTHON_BIN" \
+  bash "$REPO_DIR/tools/gpu_power_hold.sh" stop || true
+bash "$REPO_DIR/tools/train_supervised_70k_baseline_50pct_8gpu.sh"
+```
+
+Do not pool this run with the four routing rows when interpreting threshold
+effects: its intended independent factor is training-data volume, while routing
+and SECA remain at the baseline setting.
 
 ### Required server layout
 
@@ -790,8 +831,8 @@ server, keep the same 10k-row selection and rewrite only local image paths in
 the Parquet; do not mix rejected QA records into the accepted JSONL.
 
 The DAM converters and QA-generation commands remain in the data-preparation
-sections above. After this contract passes, use only the four wrappers in
-[Training](#training).
+sections above. After this contract passes, use the four routing wrappers or the
+separately documented 50% baseline control in [Training](#training).
 
 ## Exporting and evaluating checkpoints
 

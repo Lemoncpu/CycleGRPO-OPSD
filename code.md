@@ -192,9 +192,11 @@ wrapper 将 `SECA_ENABLED` 与 `SECA_SELF_SUPERVISED_ENABLED` 都关闭；SECA w
 `0.85` 增加 `0.20` 后因阈值合法范围 `[0,1]` 截断到 `1.00`，因此实际增量为 `0.15`。
 主 RefCOCO launcher 对这两个变量执行 `[0,1]` 与 `low<=high` 校验，再传给
 `worker.opsd.routing.low_threshold/high_threshold`，不会再把 routing 阈值硬编码为 `0.5/0.85`。
-跨服务器复现实验时，仓库根目录 `README.md` 的 70k 训练部分只保留上述四个
-routing wrapper；README 明确了另一台服务器需要替换的环境、模型、judge、四路数据和图像路径变量，
-并要求先执行四个 wrapper 的 `DRY_RUN` 预检，再按 `7+1` 拓扑顺序运行，避免误用旧的通用训练示例。
+跨服务器复现实验时，仓库根目录 `README.md` 的 70k 训练部分保留上述四个
+routing wrapper，并单独列出 50% baseline 数据量控制实验；README 明确了另一台服务器需要替换的环境、
+模型、judge、四路数据和图像路径变量，并要求先执行 routing wrapper 与 baseline wrapper 的
+`DRY_RUN` 预检，再按 `7+1` 拓扑顺序运行，避免误用旧的通用训练示例。50% baseline 不属于 routing
+阈值矩阵，保持 SECA 关闭，仅将四个训练流固定抽样到 `10000/15000/5000/5000`，默认 `MAX_STEPS=90`。
 新增 `tools/train_supervised_70k_baseline_25pct_8gpu.sh` 与
 `tools/train_supervised_70k_baseline_50pct_8gpu.sh` 沿用 baseline 的全部模型、算法、batch、
 7+1 GPU、judge 与 checkpoint 配置，仅在启动前对四个 parquet 流做固定种子抽样：
@@ -3812,3 +3814,9 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文件：修改 `README.md`；同步更新本文件第 2.2 节、README 模块说明和本变更日志；未新增、移动或删除模块。
 - 行为：删除 README 中会引导到旧通用 20k/direct/DLC-QA 训练入口的示例，将 70k 训练说明收敛为四个正式 routing wrapper。README 现在明确四组 `(low,high)`、7 张 Ray/FSDP 训练卡 + GPU 7 judge 拓扑、20k/30k/10k/10k 数据契约、disjoint no-target 文件、模型/judge 路径变量、`DRY_RUN` 预检、顺序运行与 GPU hold 生命周期；DLC-QA 段仅保留 sidecar 数据契约。同步修正 7-rank FSDP checkpoint、`global_step_179` 和四组评测路径示例，避免与正式 70k 入口混淆。
 - 验证：逐项核对四个 wrapper、`tools/train_supervised_70k_common_8gpu.sh`、主 RefCOCO launcher 与 README 的环境变量/数据路径/端口/拓扑；检索 README 无旧 `opsd_70k`、`gs25k`、`NUM_GPUS=8` 或其他替代训练命令；执行 README bash block 语法检查、四组 `DRY_RUN=true HOLD_AFTER_EXIT=false` 预检、`bash -n` 和 `git diff --check`。
+
+### 2026-09-25 - README 增加并执行 50% baseline 控制实验
+
+- 文件：修改 `README.md`、`code.md`；未新增、移动或删除模块。
+- 行为：README 在四组 routing 阈值矩阵之外新增独立的 50% baseline 数据量控制实验，明确其关闭 SECA、使用 `10000/15000/5000/5000` 的确定性四流子集、匹配 5,000 条 DLC-QA JSONL、`112/224/56` parent batch、默认 90 step 和 7+1 拓扑；补充 baseline 的预检、启动命令及结果解释边界。
+- 验证：`tools/train_supervised_70k_baseline_50pct_8gpu.sh` 的 `bash -n` 与 `DRY_RUN=true HOLD_AFTER_EXIT=false` 预检均退出 0，确认生成 `10000/15000/5000/5000` 四流子集及匹配的 5,000 条 JSONL sidecar；按用户要求未启动 Ray、judge、FSDP 或正式 GPU 训练，因此尚无 checkpoint、训练日志或 GPU hold 结果可报告。
