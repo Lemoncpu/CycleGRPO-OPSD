@@ -13,6 +13,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-16}
 MASK_PROTOCOL=${MASK_PROTOCOL:-legacy_union}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
+PROMPT_TEMPLATE=${PROMPT_TEMPLATE:-'The referring expression below describes an object that is present in the image. Locate and segment exactly that object. Do not answer "No target", "null", or refuse. Output only one mask group in this format: <|mt_start|><|mt_XXXX|><|mt_XXXX|><|mt_end|>. Expression: {phrase}'}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$(dirname "$SAVE_DIR")/logs"
@@ -26,6 +27,7 @@ for ((task=0; task<NUM_GPUS; task++)); do
         --batch_size "$EVAL_BATCH_SIZE" \
         --mask_protocol "$MASK_PROTOCOL" \
         --max_new_tokens "$MAX_NEW_TOKENS" \
+        --prompt_template "$PROMPT_TEMPLATE" \
         > "$LOG_DIR/refcoco_${SPLIT}_shard${task}.log" 2>&1 &
     pids+=("$!")
 done

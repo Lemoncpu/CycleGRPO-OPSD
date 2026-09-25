@@ -27,6 +27,7 @@ direct_grounding_loss_weight = _CONFIG_MODULE.direct_grounding_loss_weight
 direct_mask_ce_response_fields = _CONFIG_MODULE.direct_mask_ce_response_fields
 direct_mask_ce_source = _CONFIG_MODULE.direct_mask_ce_source
 direct_grounding_source = _CONFIG_MODULE.direct_grounding_source
+direct_source_balance_weights = _CONFIG_MODULE.direct_source_balance_weights
 localization_media_keys = _CONFIG_MODULE.localization_media_keys
 non_tensor_batch_row = _CONFIG_MODULE.non_tensor_batch_row
 
@@ -133,6 +134,21 @@ class SupervisedAnchorsTest(unittest.TestCase):
         self.assertEqual(direct_grounding_loss_weight(30, 0.15, 10, 30), 0.15)
         self.assertEqual(direct_grounding_loss_weight(29, 0.15, 30, 30), 0.0)
         self.assertEqual(direct_grounding_loss_weight(30, 0.15, 30, 30), 0.15)
+
+    def test_direct_source_balance_equalizes_observed_mixture(self):
+        weights, stats = direct_source_balance_weights(
+            ["supervised_grounding"] * 3 + ["supervised_grounding_no_target"] * 2
+        )
+        self.assertEqual(stats["positive_count"], 3.0)
+        self.assertEqual(stats["no_target_count"], 2.0)
+        self.assertAlmostEqual(stats["observed_positive_fraction"], 0.6)
+        self.assertAlmostEqual(weights[0], 5.0 / 6.0)
+        self.assertAlmostEqual(weights[-1], 1.25)
+        self.assertAlmostEqual(sum(weights) / len(weights), 1.0)
+
+    def test_direct_source_balance_rejects_invalid_fraction(self):
+        with self.assertRaisesRegex(ValueError, "strictly between"):
+            direct_source_balance_weights(["supervised_grounding"], positive_fraction=1.0)
 
     def test_direct_mask_ce_source_selection_supports_opt_in_no_target(self):
         self.assertTrue(direct_mask_ce_source("refcoco_cycle"))

@@ -217,6 +217,8 @@ class BatchFunctionRewardManager(FunctionRewardManager):
                     "mask_group_count": data.non_tensor_batch.get("mask_group_count", [None] * len(data))[i] if task == "segmentation" else None,
                     "valid_mask_group_count": data.non_tensor_batch.get("valid_mask_group_count", [None] * len(data))[i] if task == "segmentation" else None,
                     "no_target_pixel_empty": data.non_tensor_batch.get("no_target_pixel_empty", [None] * len(data))[i],
+                    "no_target_area_ratio": data.non_tensor_batch.get("no_target_area_ratio", [None] * len(data))[i],
+                    "no_target_empty_area_tau": data.non_tensor_batch.get("no_target_empty_area_tau", [None] * len(data))[i],
                     "no_target_reward_mode": data.non_tensor_batch.get("no_target_reward_mode", [None] * len(data))[i],
                     # "correct_mask": data.non_tensor_batch["correct_mask"][i], 
                     # "image": images[i]['images'][0] if task == 'segmentation' else None,

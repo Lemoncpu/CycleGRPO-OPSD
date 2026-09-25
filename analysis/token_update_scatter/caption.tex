@@ -1,0 +1,11 @@
+Token-update mechanism diagnostic on a held-out direct RefCOCO sample.  Each point is one of the two legal
+SAMTok mask-code tokens in a ground-truth target sequence.  The horizontal coordinate is teacher alignment,
+$\log p_{\mathrm{direct\ teacher}}(y_t\mid s_t)-\log p_{\mathrm{base}}(y_t\mid s_t)$, and is used only as a
+mechanistic proxy.  The vertical coordinate is the measured checkpoint change,
+$\log p_{\mathrm{checkpoint}}(y_t\mid s_t)-\log p_{\mathrm{base}}(y_t\mid s_t)$, evaluated by a second
+teacher-forced forward pass.  The two panels use identical points, limits, and masks.  The 3-D view adds
+$\exp(\mathrm{mean}_t\log p_{\mathrm{base}}(y_t\mid s_t))$ as a bounded target-sequence reliability proxy.
+The diagnostic uses 16 rows sampled with seed 20260921 from a RefCOCO parquet disjoint from the documented 20k
+cycle parquet; 32 mask-code positions are expected, subject to finite-value filtering.  The GRPO and Pixel-OPSD
+checkpoints were historical one-epoch runs from the same SAMTok base but used different training parquets, so this
+figure is not a controlled paired objective ablation and does not establish causal token credit or benchmark gains.

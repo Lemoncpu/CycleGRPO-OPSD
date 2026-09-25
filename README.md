@@ -28,7 +28,7 @@ The detailed implementation contract and change history live in [code.md](code.m
 - [Datasets and path layout](#datasets-and-path-layout)
 - [Preparing CycleGRPO Parquet data](#preparing-cyclegrpo-parquet-data)
 - [Training](#training)
-- [Optional DAM/DLC-QA supervision](#optional-damdlc-qa-supervision)
+- [DLC-QA data contract](#dlc-qa-data-contract)
 - [Exporting and evaluating checkpoints](#exporting-and-evaluating-checkpoints)
 - [Troubleshooting](#troubleshooting)
 
@@ -250,7 +250,8 @@ cp -a "$TRAIN_OPSD_DIR/datasets/." "$BASE_DIR/datasets/"
 # Exact 70k files (20k cycle + 30k direct + 10k no-target + 10k DLC-QA).
 export TRAIN_DATA="$BASE_DIR/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet"
 export DIRECT_TRAIN_DATA="$BASE_DIR/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet"
-export DIRECT_NO_TARGET_TRAIN_DATA="$BASE_DIR/datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet"
+# Use the disjoint 10k no-target file paired with the 30k RefCOCO direct file.
+export DIRECT_NO_TARGET_TRAIN_DATA="$BASE_DIR/datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet"
 export CAPTION_QA_TRAIN_DATA="$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.parquet"
 export CAPTION_QA_JSONL="$BASE_DIR/datasets/dlc_qa/dam_caption_qa_10000.jsonl"
 ```
@@ -260,7 +261,7 @@ The supervised segmentation stream is **40,000 samples total**, composed as foll
 | Role | Canonical file | Rows | `source` |
 |---|---|---:|---|
 | RefCOCO positive direct supervision | `datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet` | 30,000 | `refcoco_cycle` |
-| gRefCOCO no-target direct supervision | `datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet` | 10,000 | `gres_no_target` |
+| gRefCOCO no-target direct supervision | `datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet` | 10,000 | `gres_no_target` |
 | **Total** | `DIRECT_TRAIN_DATA` + `DIRECT_NO_TARGET_TRAIN_DATA` | **40,000** | — |
 
 `train-opsd` also contains the convenience file
@@ -275,7 +276,10 @@ The uploaded `datasets/dam_data/` contains DAM annotation metadata; use the
 ### 4. Rewrite image paths (mandatory)
 
 Parquet records contain absolute paths from the source server. Rewrite and
-validate every image before training; do not rely on row counts alone.
+validate every image before training; do not rely on row counts alone. The
+snippet assumes the uploaded Parquet still contains the source-server prefix
+`/volume/ybo/xyc`; if the files were rebuilt elsewhere, change `old_ref` and
+`old_coco` to the prefixes actually present in that Parquet.
 
 ```bash
 export PYTHON_BIN="$ENV_DIR/bin/python3"
@@ -291,7 +295,7 @@ base = Path(sys.argv[1])
 files = {
     base / "datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet": 20000,
     base / "datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet": 30000,
-    base / "datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet": 10000,
+    base / "datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet": 10000,
     base / "datasets/dlc_qa/dlc_qa_10000.parquet": 10000,
 }
 old_ref = "/volume/ybo/xyc/refcoco-train2014-assets"
@@ -333,180 +337,26 @@ print("validated DLC-QA dam_source_id join: 10000 rows")
 PY
 ```
 
-### 5. Start 70k training
+### 5. Run the four routing-threshold ablations
 
-[`opsd_70k_positive_empty_penalty_only_8gpu.txt`](opsd_70k_positive_empty_penalty_only_8gpu.txt)
-starts Ray and the local Llama judge itself. Copy it to the new workspace,
-rewrite its source-server prefixes, check syntax, then run it from any
-directory:
+The environment and data preparation above are shared by all four experiments. The
+only maintained training commands in this README are the four routing wrappers
+listed in [Training](#training). They all run the same full 70k SECA recipe:
+20k CycleGRPO + 30k RefCOCO direct positives + 10k gRefCOCO no-target direct
+rows + 10k DLC-QA rows, with seven Ray/FSDP training GPUs and the eighth GPU
+reserved for the local Llama judge. Do not start Ray or the judge manually; each
+wrapper starts and cleans up its own local services.
 
-```bash
-cp "$REPO_DIR/opsd_70k_positive_empty_penalty_only_8gpu.txt" "$BASE_DIR/run_opsd_70k.sh"
-sed -i "s#/volume/ybo/xyc#$BASE_DIR#g" "$BASE_DIR/run_opsd_70k.sh"
-sed -i "s#$BASE_DIR/models/Meta-Llama-3.1-8B-Instruct-hf-v2#$LLAMA_PATH#g" "$BASE_DIR/run_opsd_70k.sh"
-bash -n "$BASE_DIR/run_opsd_70k.sh"
-bash "$BASE_DIR/run_opsd_70k.sh"
-```
+Complete the path-rewrite step first, then follow [Training](#training) to
+preflight and run the four wrappers. Each wrapper has its own run name, Ray
+ports, judge port and short Ray directory, so the four runs can be kept as
+independent directories. Run them sequentially on one eight-GPU node unless
+the server has four completely isolated eight-GPU allocations.
 
-The launcher must report `NUM_GPUS=7`, `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6`,
-`SECA_ENABLED=true`, direct GRPO/CE and DLC-QA enabled,
-`NO_TARGET_REWARD_MODE=pixel_empty`, `POSITIVE_EMPTY_MASK_PENALTY=1.0`, and
-`NO_TARGET_NONEMPTY_MASK_PENALTY=0.0`. One epoch ends at `MAX_STEPS=178`.
-Logs and FSDP checkpoints are written under
-`$REPO_DIR/logs/cyclegrpo70k_opsd_seca_positive_only_8gpu/`.
-
-Before consuming GPUs, run the following preflight. It validates the exact model/data
-artifacts, the four expected row counts, the launcher syntax, and the required
-training switches. The launcher itself starts Ray and the local Llama judge, so no
-separate `ray start` or Llama command is needed.
-
-```bash
-for required in \
-  "$MODEL_PATH/config.json" \
-  "$MODEL_PATH/mask_tokenizer_256x2.pth" \
-  "$MODEL_PATH/sam2.1_hiera_large.pt" \
-  "$TRAIN_DATA" \
-  "$DIRECT_TRAIN_DATA" \
-  "$DIRECT_NO_TARGET_TRAIN_DATA" \
-  "$CAPTION_QA_TRAIN_DATA" \
-  "$CAPTION_QA_JSONL"; do
-  test -f "$required" || { echo "missing: $required" >&2; exit 1; }
-done
-bash -n "$BASE_DIR/run_opsd_70k.sh"
-bash -n "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
-for required_flag in \
-  OPSD_ENABLED=true PIXEL_IOU_ENABLED=true SECA_ENABLED=true \
-  ROUTING_ENABLED=true EMA_TEACHER_ENABLED=true TEACHER_ANALYSIS_ENABLED=true \
-  TEACHER_CONFIDENCE_ENABLED=true CAPTION_SAFETY_ENABLED=true \
-  NO_TARGET_REWARD_MODE=pixel_empty \
-  POSITIVE_EMPTY_MASK_PENALTY=1.0 NO_TARGET_NONEMPTY_MASK_PENALTY=0.0 \
-  DIRECT_GROUNDING_ENABLED=true DIRECT_MASK_CE_ENABLED=true \
-  SUPERVISED_CAPTION_QA_ENABLED=true NUM_GPUS=7 \
-  TRAINER_LOGGERS='["file"]'; do
-  grep -Fq "$required_flag" "$BASE_DIR/run_opsd_70k.sh" || { echo "missing flag: $required_flag" >&2; exit 1; }
-done
-$PYTHON_BIN - "$BASE_DIR" <<'PY'
-import sys
-from pathlib import Path
-import pyarrow.parquet as pq
-base = Path(sys.argv[1])
-expected = {
-  "datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet": 20000,
-  "datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet": 30000,
-  "datasets/grefcoco_no_target_direct_10k/grefcoco_train_0pos_10000notarget_seed20260821_no_target.parquet": 10000,
-  "datasets/dlc_qa/dlc_qa_10000.parquet": 10000,
-}
-for rel, rows in expected.items():
-  got = pq.read_metadata(base / rel).num_rows
-  if got != rows:
-    raise SystemExit(f"{rel}: expected {rows}, got {got}")
-print("preflight passed: model files, 70k parquet row counts, syntax and switches")
-PY
-```
-
-### 6. Export and evaluate all four benches
-
-After `global_step_178` is present, export the FSDP actor shards and run the
-standard RefCOCO, GroundingSuite, GRES and DLC-Bench evaluations. GRES writes
-all four required metrics (`T_acc`, `N_acc`, `gIoU`, `cIoU`). DLC-Bench must be
-scored with the local Llama-3.1-8B service, not an external GPT API.
-
-```bash
-export RUN_ROOT="$REPO_DIR/logs/cyclegrpo70k_opsd_seca_positive_only_8gpu"
-export CKPT="$RUN_ROOT/checkpoints/global_step_178"
-export EVAL_ROOT="$RUN_ROOT/evaluation/step_178"
-export HF_MODEL_PATH="$EVAL_ROOT/hf_global_step_178"
-export DLC_ROOT="$BASE_DIR/third_party/DLC-Bench"
-export GSE_ROOT="$BASE_DIR/third_party/GroundingSuite"
-
-CHECKPOINT_PATH="$CKPT" HF_MODEL_PATH="$HF_MODEL_PATH" EVAL_ROOT="$EVAL_ROOT" \
-TRAIN_MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" NUM_GPUS=7 \
-bash "$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh" export
-
-HF_MODEL_PATH="$HF_MODEL_PATH" EVAL_ROOT="$EVAL_ROOT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-REFCOCO_ROOT="$REFCOCO_ASSET_DIR" REFCOCO_SPLIT=val NUM_GPUS=7 \
-bash "$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh" refcoco
-
-HF_MODEL_PATH="$HF_MODEL_PATH" EVAL_ROOT="$EVAL_ROOT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-GROUNDINGSUITE_ROOT="$GSE_ROOT" GROUNDINGSUITE_DATASET="$GSE_ROOT/GroundingSuite-Eval.jsonl" \
-REFCOCO_ROOT="$REFCOCO_ASSET_DIR" NUM_GPUS=7 \
-bash "$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh" groundingsuite
-
-HF_MODEL_PATH="$HF_MODEL_PATH" EVAL_ROOT="$EVAL_ROOT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-GRES_ROOT="$BASE_DIR/gRefCOCO" GRES_SPLIT=val GRES_IMAGE_ROOT="$REFCOCO_ASSET_DIR/train2014" NUM_GPUS=7 \
-bash "$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh" gres
-
-HF_MODEL_PATH="$HF_MODEL_PATH" EVAL_ROOT="$EVAL_ROOT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-DLC_ROOT="$DLC_ROOT" NUM_GPUS=7 \
-bash "$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh" dlc
-
-# Start the local language judge on the reserved eighth GPU.
-export LLAMA_PORT=18007
-export LLAMA_KEY=sk-cyclegrpo-local
-CUDA_VISIBLE_DEVICES=7 "$ENV_DIR/bin/python3" -m vllm.entrypoints.openai.api_server \
-  --model "$LLAMA_PATH" --served-model-name llama3.1-8b \
-  --host 127.0.0.1 --port "$LLAMA_PORT" --api-key "$LLAMA_KEY" \
-  --tensor-parallel-size 1 --pipeline-parallel-size 1 --trust-remote-code \
-  --dtype bfloat16 --gpu-memory-utilization 0.85 \
-  --chat-template "$REPO_DIR/tools/multinode/llama3_chat_template.jinja" \
-  >"$RUN_ROOT/llama_dlc_eval.log" 2>&1 &
-LLAMA_PID=$!
-trap 'kill "$LLAMA_PID" 2>/dev/null || true' EXIT
-for _ in $(seq 1 180); do
-  curl --silent --fail --max-time 3 -H "Authorization: Bearer $LLAMA_KEY" \
-    "http://127.0.0.1:$LLAMA_PORT/v1/models" | grep -q llama3.1-8b && break
-  sleep 2
-done
-curl --silent --fail --max-time 3 -H "Authorization: Bearer $LLAMA_KEY" \
-  "http://127.0.0.1:$LLAMA_PORT/v1/models" | grep -q llama3.1-8b
-"$ENV_DIR/bin/python3" "$REPO_DIR/evaluation/dlc_bench/eval_llama_without_image.py" \
-  --pred "$EVAL_ROOT/dlc_bench_predictions.json" \
-  --qa "$DLC_ROOT/qa.json" --class-names "$DLC_ROOT/class_names.json" \
-  --model llama3.1-8b --base-url "http://127.0.0.1:$LLAMA_PORT/v1" \
-  --api-key "$LLAMA_KEY" --quiet \
-  > "$EVAL_ROOT/dlc_metrics.log"
-kill "$LLAMA_PID" 2>/dev/null || true
-trap - EXIT
-
-# Print the scalar summaries; GRES intentionally shows every metric.
-"$ENV_DIR/bin/python3" - <<PY
-import json
-from pathlib import Path
-out = Path("$EVAL_ROOT")
-print("RefCOCO", json.load(open(out / "refcoco_metrics.json")))
-print("GroundingSuite gIoU", json.load(open(out / "groundingsuite_metrics.json"))["overall_giou"])
-print("GRES", {k: json.load(open(out / "gres_metrics.json"))[k] for k in ("T_acc", "N_acc", "gIoU", "cIoU")})
-PY
-```
-
-The eval action uses seven GPUs (`0--6`); only the temporary Llama judge uses
-GPU 7. If evaluation is interrupted, rerun the same action: all per-sample
-RefCOCO/GroundingSuite/GRES outputs are resumable. Do not compare GRES without
-checking that its case count equals the prepared dataset count.
-
-### 7. Upload weights
-
-
-
-After `global_step_178` is present, use the `HF_MODEL_PATH` exported by step 6,
-copy the SAMTok files, and upload the resulting Hugging Face model. If step 6 was
-run in a different shell, re-export the three paths first:
-
-```bash
-test -d "$HF_MODEL_PATH"
-test -f "$HF_MODEL_PATH/config.json"
-cp "$MODEL_PATH/mask_tokenizer_256x2.pth" "$HF_MODEL_PATH/"
-cp "$MODEL_PATH/sam2.1_hiera_large.pt" "$HF_MODEL_PATH/"
-
-huggingface-cli login
-export WEIGHT_REPO=Untitled111/opsd-70k-seca
-huggingface-cli upload "$WEIGHT_REPO" "$HF_MODEL_PATH" . --repo-type model \
-  --commit-message "OPSD 70k SECA positive-only pixel-empty model"
-```
-
-The uploaded model is available at `https://huggingface.co/$WEIGHT_REPO`.
-Keep the launcher copy, data manifest, training log and evaluation outputs
-beside the checkpoint for exact reproducibility.
+After each completed run, record the wrapper name, routing pair, git revision,
+data manifest, `run.log`, `training.log` and checkpoint directory together.
+The evaluation section below is generic; substitute the corresponding
+experiment's `RUN_ROOT` rather than reusing one shared output directory.
 
 ## Models and checkpoints
 
@@ -543,7 +393,7 @@ snapshot_download(repo_id="XinNUS/CycleGRPO-4B", local_dir="/path/to/workspace/C
 Training writes FSDP shards under:
 
 ```text
-<RUN_ROOT>/checkpoints/global_step_<N>/actor/model_world_size_8_rank_*.pt
+<RUN_ROOT>/checkpoints/global_step_<N>/actor/model_world_size_7_rank_*.pt
 ```
 
 These files cannot be passed directly to `from_pretrained` or the evaluation
@@ -594,7 +444,7 @@ rebuilt from official gRefCOCO annotations, not from the training parquet.
 ### Optional regeneration-only downloads
 
 
-The authoritative 70k workflow is steps 1--7 above: it downloads RefCOCO from
+The authoritative 70k workflow is steps 1--5 above: it downloads RefCOCO from
 `Untitled111/refcoco-train2014-assets` and all uploaded generated assets from
 `Untitled111/train-opsd`. The commands in this subsection are only for rebuilding
 parquet files from raw annotations, not for the supplied 70k run.
@@ -758,214 +608,190 @@ of silently replacing a multi-instance quota with single-instance data.
 
 ## Training
 
-### Recommended eight-GPU server entry
+This README intentionally exposes only the four formal routing-threshold ablations.
+Do not use the generic `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` command
+directly for these experiments: the wrapper is responsible for the 70k data streams,
+seven-GPU Ray topology, local judge, fixed SECA configuration and run isolation.
 
-`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` is the maintained entry for
-the current architecture. It validates model files and every parquet image
-path, clears an incompatible inherited `RAY_ADDRESS`, creates a short local Ray
-directory, and writes stdout to `<RUN_ROOT>/train_<timestamp>.log`.
+### Fixed experiment matrix
 
-The default controlled setup uses `G=6` caption rollouts and `K=6`
-localization rollouts. With OPSD enabled, localization uses decoded pixel IoU;
-all complete, codebook-valid SAMTok groups in one response are decoded and
-unioned before scoring. The default teacher/routing settings are documented in
-`code.md`.
+All four wrappers use exactly the same model, data, optimizer, rollout, auxiliary
+loss, checkpoint and 7+1 GPU settings. Only the routing thresholds differ; the
+run names, ports and Ray temporary directories are also different so logs cannot
+collide.
 
-For the seven-training-GPU plus one-DLC-judge-GPU setup, the canonical 70k
-recipe above uses `THREE_STREAM_2_4_1_ENABLED=false`, `NUM_GPUS=7`, and parent
-prompt batches `112/224/56` for main/direct/DLC-QA. The older strict 2:4:1
-profile (`28/56/14`) is a separate legacy ablation and is not the current 70k
-run. The launcher starts the judge on the reserved eighth GPU; do not include
-it in the training process's `CUDA_VISIBLE_DEVICES`.
+| Wrapper | `low_threshold` | `high_threshold` | Ray ports | Judge port | Default run root |
+|---|---:|---:|---|---:|---|
+| `train_supervised_70k_seca_routing_l030_h085_8gpu.sh` | 0.30 | 0.85 | 29701 / 29702 | 18013 | `logs/cyclegrpo70k_historical_seca_routing_l030_h085_8gpu` |
+| `train_supervised_70k_seca_routing_l070_h085_8gpu.sh` | 0.70 | 0.85 | 29703 / 29704 | 18014 | `logs/cyclegrpo70k_historical_seca_routing_l070_h085_8gpu` |
+| `train_supervised_70k_seca_routing_l050_h065_8gpu.sh` | 0.50 | 0.65 | 29705 / 29706 | 18015 | `logs/cyclegrpo70k_historical_seca_routing_l050_h065_8gpu` |
+| `train_supervised_70k_seca_routing_l050_h100_8gpu.sh` | 0.50 | 1.00 | 29707 / 29708 | 18016 | `logs/cyclegrpo70k_historical_seca_routing_l050_h100_8gpu` |
 
-```bash
-RUN_NAME=gs25k_cycle
-RUN_ROOT=$REPO_DIR/logs/$RUN_NAME
-TRAIN_DATA=$BASE_DIR/datasets/groundingsuite_25k.parquet
+The last row is the requested `high=0.85+0.20` direction clipped to `1.00`,
+because the launcher rejects thresholds outside `[0,1]`. The four values are
+fixed in the wrappers and are not inherited from the shell environment.
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-MODEL_PATH="$MODEL_PATH" RUN_NAME="$RUN_NAME" RUN_ROOT="$RUN_ROOT" \
-TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$TRAIN_DATA" \
-TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
-OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
-TRAINER_LOGGERS='["file"]' \
-bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
-```
+### Required server layout
 
-`SAVE_LIMIT=2` is important on limited storage. A failed checkpoint write
-usually indicates a full or quota-limited filesystem; check `df -h` and remove
-only checkpoints you no longer need before restarting.
+Use one node with eight visible GPUs. The wrappers reserve physical GPUs 0--6
+for Ray/FSDP training and GPU 7 for the local Llama-3.1-8B judge. Stop any
+old Ray head, judge service or `gpu_power_hold.sh` worker before starting a
+run. Do not manually start Ray or vLLM: the shared launcher starts an isolated
+Ray head and a Ray-managed local judge, then removes only the processes it owns.
 
-### Isolated direct referring supervision
-
-Direct supervision is disabled by default. The production three-stream setup
-keeps its data separate: the main 20k image-mask mix only runs CycleGRPO/OPSD;
-The direct stream can pair 20k RefCOCO positive expressions with 20k gRefCOCO
-no-target expressions. Both receive direct segmentation GRPO; SFT teacher-forces
-GT SAMTok groups for positives and `<answer>No target.</answer>` for negatives.
-DLC-QA remains caption GRPO with the language-judge reward. The two auxiliary
-loaders each consume one batch per main step and never draw from, or change the
-epoch length of, the main loader.
-
-The RefCOCO term is additive to the cycle update:
-
-```text
-L_total = 0.5 L_cycle_caption + 0.5 L_cycle_localization
-        + lambda_direct(step) L_direct_GRPO + 0.02 L_direct_mask_CE
-        + existing regenerate / JSD / KL auxiliary losses
-```
-
-- Direct GRPO samples `K=6` responses from stored human referring expressions in
-  `DIRECT_TRAIN_DATA` and `DIRECT_NO_TARGET_TRAIN_DATA`, with independent GRPO
-  UID groups.
-- The default schedule is zero through step 10, linearly grows until step 30,
-  then reaches `DIRECT_GROUNDING_LOSS_WEIGHT`.
-- Direct SFT teacher-forces one positive mask-token or no-target refusal target
-  per direct parent UID. EOS and padding remain outside the CE loss mask.
-- The launcher accepts only `refcoco_cycle` positives and enabled
-  `gres_no_target` rows, rejecting label/template sources.
-
-#### Export the 20k + 20k direct data
-
-For direct GRPO/SFT, export a 20k RefCOCO positive file and a separate 20k
-gRefCOCO no-target file. The RefCOCO converter validates each image and target
-mask; pure no-target export only validates the gRefCOCO records and images.
+Set these variables after completing the environment installation and data
+path-rewrite steps above. The paths are examples; replace `BASE_DIR` and keep
+the five data variables pointed at the files below.
 
 ```bash
-REF_DIRECT_DIR=$BASE_DIR/datasets/refcoco_direct_20k
-REF_DIRECT_PA=$REF_DIRECT_DIR/refcoco_train_20k_seed20260821.parquet
-GREF_NO_TARGET_DIR=$BASE_DIR/datasets/grefcoco_no_target_direct_20k
-GREF_NO_TARGET_PA=$GREF_NO_TARGET_DIR/grefcoco_train_0pos_20000notarget_seed20260821_no_target.parquet
-mkdir -p "$REF_DIRECT_DIR" "$GREF_NO_TARGET_DIR"
+export BASE_DIR=/mnt/opsd
+export REPO_DIR="$BASE_DIR/CycleGRPO-OPSD"
+export ENV_DIR="$BASE_DIR/envs/cyclegrpo"
+export MODEL_PATH="$BASE_DIR/Qwen3-VL-4B-SAMTok"
+export JUDGE_MODEL_PATH="$BASE_DIR/Meta-Llama-3.1-8B-Instruct"
 
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
-  projects/rl/datasets/prepare_refcoco_rl_dataset.py \
-  --instances "$BASE_DIR/refcoco-train2014-assets/instances.json" \
-  --refs "$BASE_DIR/refcoco-train2014-assets/refs(unc).p" \
-  --images-dir "$BASE_DIR/refcoco-train2014-assets/train2014" \
-  --output "$REF_DIRECT_PA" \
-  --mask-tokenizer-path "$MODEL_PATH/mask_tokenizer_256x2.pth" \
-  --sam2-checkpoint "$MODEL_PATH/sam2.1_hiera_large.pt" \
-  --sam2-config-dir "$REPO_DIR/projects/transformers/vq_sam2/sam2/sam2_configs" \
-  --split train --max-samples 20000 --seed 20260821 --device cuda
-
-PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
-  projects/rl/datasets/prepare_grefcoco_cycle_dataset.py \
-  --instances "$BASE_DIR/gRefCOCO/instances.json" \
-  --grefs "$BASE_DIR/gRefCOCO/grefs(unc).json" \
-  --images-dir "$BASE_DIR/refcoco-train2014-assets/train2014" \
-  --output-dir "$GREF_NO_TARGET_DIR" \
-  --split train --positive-samples 0 --no-target-samples 20000 \
-  --seed 20260821
+export TRAIN_DATA="$BASE_DIR/datasets/cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet"
+export VAL_DATA="$TRAIN_DATA"
+export DIRECT_TRAIN_DATA="$BASE_DIR/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet"
+export DIRECT_NO_TARGET_TRAIN_DATA="$BASE_DIR/datasets/direct_refcoco30k_notarget10k_disjoint_cycle20k/grefcoco_train_0pos_10000notarget_disjoint_cycle20k_and_refcoco_seed20260823.parquet"
+export CAPTION_QA_TRAIN_DATA="$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.parquet"
+export CAPTION_QA_JSONL="$BASE_DIR/datasets/dlc_qa/dam_caption_qa_10000.jsonl"
+export PYTHON_BIN="$ENV_DIR/bin/python3"
+# Do not let stale values from an earlier run override each wrapper's fixed
+# run name, ports or Ray temporary directory.
+unset RUN_NAME RUN_ROOT RAY_PORT RAY_DASHBOARD_PORT JUDGE_PORT RAY_SHORT_ROOT
+cd "$REPO_DIR"
 ```
 
-The converter writes absolute image paths, so rerun it after moving the COCO
-2014 image directory. Keep `TRAIN_DATA` below on the 20k cycle mix; pass the
-two direct files only through the direct variables below.
+The exact training inputs must contain 20,000 main-cycle rows, 30,000 direct
+RefCOCO-positive rows, 10,000 direct gRefCOCO no-target rows, 10,000 DLC-QA
+Parquet rows and 10,000 non-empty DLC-QA JSONL records. The direct files are
+intentionally split: do not replace them with the convenience merged 40k file.
+All Parquet `images` paths must already point to this server's local image
+roots; the launcher validates existence before it starts Ray.
 
-Enable the two direct terms for a controlled experiment:
+The model directory must contain at least `config.json`,
+`model.safetensors.index.json`, `mask_tokenizer_256x2.pth` and
+`sam2.1_hiera_large.pt`. The judge directory must contain `config.json` and
+the Llama tokenizer/model shards. If the model or data lives elsewhere, change
+only the exported path variables; do not edit the four wrapper files.
+
+### Preflight all four experiments
+
+Run this before consuming GPUs. `DRY_RUN=true` performs the same path, row-count,
+JSONL-count and shell configuration checks as a real run, but starts no Ray, judge
+or trainer.
 
 ```bash
-RUN_NAME=gs20k_ref20k_notarget_direct_grpo_sft
-RUN_ROOT=$REPO_DIR/logs/$RUN_NAME
-TRAIN_DATA=$BASE_DIR/datasets/cyclegrpo_20k.parquet
+set -euo pipefail
+test -x "$PYTHON_BIN"
+test -f "$MODEL_PATH/config.json"
+test -f "$MODEL_PATH/model.safetensors.index.json"
+test -f "$MODEL_PATH/mask_tokenizer_256x2.pth"
+test -f "$MODEL_PATH/sam2.1_hiera_large.pt"
+test -f "$JUDGE_MODEL_PATH/config.json"
+for path in "$TRAIN_DATA" "$DIRECT_TRAIN_DATA" "$DIRECT_NO_TARGET_TRAIN_DATA" "$CAPTION_QA_TRAIN_DATA" "$CAPTION_QA_JSONL"; do
+  test -f "$path" || { echo "missing: $path" >&2; exit 1; }
+done
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-MODEL_PATH="$MODEL_PATH" RUN_NAME="$RUN_NAME" RUN_ROOT="$RUN_ROOT" \
-TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$TRAIN_DATA" \
-TOTAL_EPOCHS=1 RESUME=false SAVE_FREQ=25 SAVE_LIMIT=2 \
-OPSD_ENABLED=true PIXEL_IOU_ENABLED=true ROUTING_ENABLED=true \
-TRAINER_LOGGERS='["file"]' \
-DIRECT_GROUNDING_ENABLED=true \
-DIRECT_TRAIN_DATA="$REF_DIRECT_PA" \
-DIRECT_NO_TARGET_TRAIN_DATA="$GREF_NO_TARGET_PA" \
-DIRECT_BATCH_SIZE=128 \
-DIRECT_GROUNDING_ROLLOUTS=6 \
-DIRECT_GROUNDING_LOSS_WEIGHT=0.15 \
-DIRECT_GROUNDING_WARMUP_START_STEP=10 \
-DIRECT_GROUNDING_WARMUP_END_STEP=30 \
-DIRECT_GROUNDING_INCLUDE_POSITIVE_SOURCES=true \
-DIRECT_GROUNDING_INCLUDE_NO_TARGET=true \
-DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES=false \
-DIRECT_MASK_CE_ENABLED=true \
-DIRECT_MASK_CE_LOSS_WEIGHT=0.02 \
-DIRECT_MASK_CE_INCLUDE_NO_TARGET=true \
-bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
+scripts=(
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh"
+)
+for script in "${scripts[@]}"; do
+  bash -n "$script"
+  DRY_RUN=true HOLD_AFTER_EXIT=false bash "$script"
+done
+echo "routing-ablation preflight passed"
 ```
 
-This is a new run; use a distinct `RUN_NAME`/`RUN_ROOT` and change
-`TRAIN_DATA` only after the parquet is prepared. Do not set
-`DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION=true`; the launcher rejects it.
+The preflight must print the four row counts (`20000/30000/10000/10000`), the
+matching 10,000 JSONL lines, and a successful dry-run line for every wrapper.
+The dry-run does not invoke the main trainer's full image scan; that scan runs
+after Ray/judge startup, so the mandatory path-rewrite step above must still
+finish successfully.
+Any missing image, model file, judge file, row-count mismatch or dry-run error
+must be fixed before starting training. Before a real run, also verify that the
+wrapper's listed Ray and judge ports are free.
 
-### Resume versus specialization
+### Run the experiments
 
-Continue an interrupted run only when its checkpoint was saved successfully:
+Run the four experiments sequentially. The formal wrappers default to
+`MAX_STEPS=179`, parent batches `112/224/56` (main/direct/DLC-QA), six caption
+and six localization rollouts, `SAVE_FREQ=5`, `SAVE_LIMIT=2`, file-only logging,
+and `RESUME=false`. They enable OPSD, pixel-IoU, routing, EMA teacher, teacher
+analysis/confidence, caption safety, SECA, direct GRPO, direct mask CE and
+DLC-QA; no other training flags should be changed for this ablation.
+
+For one experiment, stop any hold workers and launch its wrapper:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-RESUME=true RUN_ROOT="$REPO_DIR/logs/gs25k_cycle" \
-MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" VAL_DATA="$TRAIN_DATA" \
-bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
+GPU_LIST=0,1,2,3,4,5,6,7 PYTHON_BIN="$PYTHON_BIN" \
+  bash "$REPO_DIR/tools/gpu_power_hold.sh" stop || true
+bash "$REPO_DIR/tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh"
 ```
 
-To specialize an exported step-195 model on full RefCOCO, set `MODEL_PATH` to
-the exported HF directory (after adding the two VQ-SAM2/SAM2 links), choose a
-new `RUN_ROOT`, and use `RESUME=false`. This intentionally resets optimizer and
-global-step state.
-
-## Isolated DLC-QA description supervision
-
-DLC-QA is a third independent training stream. Its 10k Parquet is used only to
-form caption prompts, and every row must expose a `dam_source_id` with a
-matching accepted entry in the QA JSONL. The reward is only the Llama judge's
-mean QA score: it has no cycle IoU, mask format, or caption-safety,
-teacher regenerate, or JSD term. `CAPTION_QA_LOSS_WEIGHT` controls the actual
-actor-gradient contribution after GRPO normalization.
-
-1. Convert DAM regions with `prepare_dam_cycle_dataset.py`, once per source.
-   Its `--caption-manifest` output records `dam_source_id`, caption and source.
-   For PACO, provide `--paco-annotations` so only verified non-parent part
-   masks are retained.
-2. Generate and validate QA using a running OpenAI-compatible LLM endpoint:
+To run all four in sequence without occupying the GPUs between runs:
 
 ```bash
-PYTHONPATH="$REPO_DIR" "$ENV_DIR/bin/python3" \
-  projects/rl/datasets/generate_dam_caption_qa.py \
-  --input-manifest "$BASE_DIR/datasets/dam/dam_cocostuff_manifest.jsonl" \
-  --input-manifest "$BASE_DIR/datasets/dam/dam_paco_manifest.jsonl" \
-  --output "$BASE_DIR/datasets/dam/dam_caption_qa_5k.jsonl" \
-  --rejected-output "$BASE_DIR/datasets/dam/dam_caption_qa_5k.rejected.jsonl" \
-  --base-url http://127.0.0.1:8007/v1 --api-key sk-abc123 \
-  --model llama3.1-8b --validator-model llama3.1-8b \
-  --max-concurrency 8 --generation-attempts 5 --request-retries 3 --seed 20260815
+set -euo pipefail
+GPU_LIST=0,1,2,3,4,5,6,7 PYTHON_BIN="$PYTHON_BIN" \
+  bash "$REPO_DIR/tools/gpu_power_hold.sh" stop || true
+scripts=(
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh"
+  "$REPO_DIR/tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh"
+)
+for script in "${scripts[@]}"; do
+  echo "===== starting $script"
+  HOLD_AFTER_EXIT=false bash "$script"
+done
+GPU_LIST=0,1,2,3,4,5,6,7 PYTHON_BIN="$PYTHON_BIN" MEMORY_MIB=20000 MATMUL_DIM=4096 \
+  bash "$REPO_DIR/tools/gpu_power_hold.sh" start
 ```
 
-3. Prepare a dedicated QA Parquet containing the selected 10k rows. Do not mix
-it into the main 20k CycleGRPO Parquet. Every `dam_source_id` in this file must
-occur exactly once in the accepted QA sidecar.
+If a run is interrupted or fails, inspect its `run.log` and `training.log`,
+clean up only its own Ray/judge processes, fix the reported issue, and rerun
+that wrapper with a fresh `RUN_NAME`/`RUN_ROOT` if the checkpoint is incomplete.
+Do not launch a second wrapper while the previous run's Ray/judge or GPU-hold
+processes are still alive.
 
-```bash
-QA_TRAIN_DATA=$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.parquet
-CAPTION_QA_JSONL=$BASE_DIR/datasets/dlc_qa/dlc_qa_10000.jsonl
-```
+Each run writes `run.log`, `training.log`, `ray_start.log`, judge logs and
+`checkpoints/` below its own run root. A successful run should contain the
+final `global_step_*` FSDP checkpoint plus `experiment_config.json` and
+trainer logs. The launcher prints the active routing pair; verify that it
+matches the matrix before comparing results.
 
-4. Add these variables to the full three-stream training invocation:
+### What is and is not changed
 
-```bash
-SUPERVISED_CAPTION_QA_ENABLED=true \
-CAPTION_QA_TRAIN_DATA="$QA_TRAIN_DATA" CAPTION_QA_BATCH_SIZE=128 \
-CAPTION_QA_JSONL="$CAPTION_QA_JSONL" \
-CAPTION_QA_JUDGE_BASE_URL=http://127.0.0.1:8007/v1 \
-CAPTION_QA_JUDGE_MODEL=llama3.1-8b \
-CAPTION_QA_JUDGE_API_KEY=sk-abc123 \
-CAPTION_QA_REWARD_WEIGHT=1.0 \
-CAPTION_QA_LOSS_WEIGHT=1.0 \
-bash "$REPO_DIR/projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh"
-```
+The four scripts are a controlled routing ablation, not four different data
+or model recipes. The data files, image-path rewrite, model checkpoint,
+rollout count, parent-batch ratio, optimizer, SECA weights, direct/DLC-QA
+anchors, checkpoint cadence and GPU topology are shared. Only the routing
+`low_threshold`/`high_threshold` pair changes, with run identity and service
+ports changed solely to isolate outputs.
 
-The runner fails before reward scoring if an auxiliary row lacks a matching QA
-entry. Inspect rejected QA JSONL and resume incomplete generation with
-`--resume`; do not add rejected records to the dedicated QA data.
+## DLC-QA data contract
+
+The four routing wrappers consume the already prepared 10k DLC-QA Parquet and
+its accepted 10k-record JSONL sidecar. This section is intentionally a data
+contract, not a fifth training recipe: do not add another launcher or override
+the wrapper's fixed `SUPERVISED_CAPTION_QA_ENABLED`, batch, judge or loss
+settings for the routing comparison.
+
+Every Parquet row must expose a unique `dam_source_id`; the JSONL sidecar must
+contain exactly one accepted QA record for every ID. The shared launcher checks
+the Parquet row count and JSONL line count before starting Ray, and the trainer
+checks the join before scoring. If the sidecar is regenerated on another
+server, keep the same 10k-row selection and rewrite only local image paths in
+the Parquet; do not mix rejected QA records into the accepted JSONL.
+
+The DAM converters and QA-generation commands remain in the data-preparation
+sections above. After this contract passes, use only the four wrappers in
+[Training](#training).
 
 ## Exporting and evaluating checkpoints
 
@@ -975,32 +801,35 @@ first complete valid SAMTok group, so regenerate old checkpoints under the same
 protocol before comparing values.
 
 ```bash
-CKPT=$REPO_DIR/logs/gs25k_cycle/checkpoints/global_step_195
-OUT=$REPO_DIR/logs/gs25k_cycle/evaluation/step_195
-HF_MODEL=$OUT/hf_global_step_195
+# Select one completed routing run; repeat the block with another RUN_ROOT for
+# each of the four ablations.
+export RUN_ROOT="$REPO_DIR/logs/cyclegrpo70k_historical_seca_routing_l030_h085_8gpu"
+export CKPT="$RUN_ROOT/checkpoints/global_step_179"
+export OUT="$RUN_ROOT/evaluation/step_179"
+export HF_MODEL="$OUT/hf_global_step_179"
 EVAL_SCRIPT=$REPO_DIR/projects/eval/qwen3vl_4b_volcengine.sh
 
-# Convert world-size-8 FSDP actor shards to standard HF safetensors.
+# Convert world-size-7 FSDP actor shards to standard HF safetensors.
 CHECKPOINT_PATH="$CKPT" HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" \
-TRAIN_MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" NUM_GPUS=8 \
+TRAIN_MODEL_PATH="$MODEL_PATH" TRAIN_DATA="$TRAIN_DATA" NUM_GPUS=7 \
 bash "$EVAL_SCRIPT" export
 
 # RefCOCO val cIoU/mIoU. The H20 recipe starts at 16 images per GPU; raise to
 # 24 or 32 only after one successful run confirms the available headroom.
 HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" TRAIN_MODEL_PATH="$MODEL_PATH" \
-REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" REFCOCO_SPLIT=val NUM_GPUS=8 EVAL_BATCH_SIZE=16 \
+REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" REFCOCO_SPLIT=val NUM_GPUS=7 EVAL_BATCH_SIZE=16 \
 bash "$EVAL_SCRIPT" refcoco
 
 # GroundingSuite mask GIoU. legacy_union is the historical SAMTok-compatible protocol.
 HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" TRAIN_MODEL_PATH="$MODEL_PATH" MASK_PROTOCOL=legacy_union \
 GROUNDINGSUITE_ROOT="$BASE_DIR/third_party/GroundingSuite" \
 GROUNDINGSUITE_DATASET="$BASE_DIR/third_party/GroundingSuite/GroundingSuite-Eval.jsonl" \
-REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" NUM_GPUS=8 \
+REFCOCO_ROOT="$BASE_DIR/refcoco-train2014-assets" NUM_GPUS=7 \
 bash "$EVAL_SCRIPT" groundingsuite
 
 # gRefCOCO/GRES target and no-target metrics.
 HF_MODEL_PATH="$HF_MODEL" EVAL_ROOT="$OUT" TRAIN_MODEL_PATH="$MODEL_PATH" MASK_PROTOCOL=legacy_union \
-GRES_ROOT="$BASE_DIR/gRefCOCO" GRES_SPLIT=val NUM_GPUS=8 \
+GRES_ROOT="$BASE_DIR/gRefCOCO" GRES_SPLIT=val NUM_GPUS=7 \
 bash "$EVAL_SCRIPT" gres
 
 # DLC-Bench prediction JSON only; score it with a judge separately.
@@ -1012,7 +841,7 @@ bash "$EVAL_SCRIPT" dlc
 Expected outputs include:
 
 ```text
-<OUT>/hf_global_step_195/             # HF safetensors export
+<OUT>/hf_global_step_179/             # HF safetensors export
 <OUT>/refcoco_val/                    # per-sample predictions + aggregate metrics
 <OUT>/groundingsuite/                 # per-sample predictions
 <OUT>/groundingsuite_metrics.json

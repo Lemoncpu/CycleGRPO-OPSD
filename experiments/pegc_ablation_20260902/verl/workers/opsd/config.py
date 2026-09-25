@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Optional
 
 from ..actor.config import FSDPConfig, OffloadConfig
 
@@ -24,9 +25,14 @@ class PixelIoUConfig:
     # SAMTok union while keeping the no-target samples in the caption-only
     # non-cycle batch, as in the public CycleGRPO implementation.
     no_target_reward_mode: str = "text"
+    no_target_empty_area_tau: float = 0.10
     # Subtract this score from a positive segmentation rollout that explicitly
     # refuses or decodes to an empty mask. Zero disables the term.
     positive_empty_mask_penalty: float = 1.0
+    # Optional scope-specific overrides. ``None`` preserves the legacy global
+    # value above, while explicit values isolate cycle and direct grounding.
+    cycle_positive_empty_mask_penalty: Optional[float] = None
+    direct_positive_empty_mask_penalty: Optional[float] = None
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -44,13 +50,23 @@ class PixelIoUConfig:
                 "pixel_iou.localization_prompt_mode must be one of "
                 "{'mixed', 'refcoco', 'groundingsuite', 'legacy'}."
             )
-        if self.no_target_reward_mode not in {"text", "official_bbox", "pixel_empty"}:
+        if self.no_target_reward_mode not in {"text", "official_bbox", "pixel_empty", "pixel_empty_iou"}:
             raise ValueError(
                 "pixel_iou.no_target_reward_mode must be one of "
                 "{'text', 'official_bbox', 'pixel_empty'}."
             )
+        if self.no_target_empty_area_tau <= 0.0:
+            raise ValueError("pixel_iou.no_target_empty_area_tau must be positive.")
         if self.positive_empty_mask_penalty < 0.0:
             raise ValueError("pixel_iou.positive_empty_mask_penalty must be non-negative.")
+        if self.cycle_positive_empty_mask_penalty is None:
+            self.cycle_positive_empty_mask_penalty = self.positive_empty_mask_penalty
+        if self.direct_positive_empty_mask_penalty is None:
+            self.direct_positive_empty_mask_penalty = self.positive_empty_mask_penalty
+        if self.cycle_positive_empty_mask_penalty < 0.0:
+            raise ValueError("pixel_iou.cycle_positive_empty_mask_penalty must be non-negative.")
+        if self.direct_positive_empty_mask_penalty < 0.0:
+            raise ValueError("pixel_iou.direct_positive_empty_mask_penalty must be non-negative.")
 
 
 @dataclass

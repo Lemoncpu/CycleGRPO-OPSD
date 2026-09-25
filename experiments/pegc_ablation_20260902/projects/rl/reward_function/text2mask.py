@@ -212,6 +212,14 @@ def no_target_reward_score(reward_input: dict) -> float:
         return no_target_check(reward_input["response"], "No target.")
     if mode == "official_bbox":
         return no_target_check_bbox(reward_input["response"], "No target.")
+    if mode == "pixel_empty_iou":
+        try:
+            score = float(reward_input.get("no_target_pixel_empty"))
+        except (TypeError, ValueError):
+            raise ValueError("pixel_empty_iou no-target reward requires a numeric score.") from None
+        if not np.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError("pixel_empty_iou no-target reward must be in [0, 1].")
+        return score
     if mode != "pixel_empty":
         raise ValueError(f"Unknown no-target reward mode: {mode!r}")
     pixel_empty = reward_input.get("no_target_pixel_empty")

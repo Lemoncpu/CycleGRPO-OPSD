@@ -67,6 +67,7 @@ from ..workers.supervised_anchors import (
     direct_mask_ce_loss_weight,
     refusal_credit_loss_weight,
     direct_grounding_source,
+    direct_source_balance_weights,
     localization_prompt_variants,
     localization_media_keys,
     non_tensor_batch_row,
@@ -1080,7 +1081,38 @@ class RayPPOTrainer:
         direct_batch.non_tensor_batch["direct_grounding"] = np.ones(len(direct_batch), dtype=object)
         return direct_batch
 
+    def _apply_direct_source_balance(
+        self, batch: Optional[DataProto], metrics: dict[str, Any], stream: str
+    ) -> None:
+        """Apply source-level credit weights to direct GRPO or direct CE."""
+        config = self.config.worker.supervised_anchors.direct_source_balance
+        if not config.enabled or batch is None or len(batch) == 0:
+            return
+        sources = batch.non_tensor_batch.get("source")
+        if sources is None:
+            return
+        weights, stats = direct_source_balance_weights(
+            sources,
+            positive_fraction=config.positive_fraction,
+            min_weight=config.min_weight,
+            max_weight=config.max_weight,
+        )
+        weight_tensor = torch.tensor(weights, dtype=torch.float32)
+        if stream == "direct_grpo":
+            batch.batch["policy_loss_mask"] = weight_tensor
+        elif stream in {"direct_mask_ce", "refusal_credit"}:
+            batch.batch["sample_weight"] = weight_tensor
+        else:
+            raise ValueError(f"unknown direct source-balance stream: {stream}")
+        prefix = f"supervised_anchors/direct_source_balance_{stream}"
+        metrics[f"{prefix}_positive_count"] = stats["positive_count"]
+        metrics[f"{prefix}_no_target_count"] = stats["no_target_count"]
+        metrics[f"{prefix}_observed_positive_fraction"] = stats["observed_positive_fraction"]
+        metrics[f"{prefix}_positive_weight"] = stats["positive_weight"]
+        metrics[f"{prefix}_no_target_weight"] = stats["no_target_weight"]
+
     def _make_direct_mask_ce_batch(
+
         self, cycle_batch: DataProto, dataset: Optional[Any] = None, config: Optional[Any] = None
     ) -> Optional[DataProto]:
         """Build one human-expression teacher-forcing target per original UID.
@@ -1851,7 +1883,7 @@ class RayPPOTrainer:
                 if non_cycle_batch is not None:
                     non_cycle_sources = np.asarray(non_cycle_batch.non_tensor_batch["source"], dtype=object)
                     if (
-                        self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty"
+                        self.config.worker.opsd.pixel_iou.no_target_reward_mode in {"pixel_empty", "pixel_empty_iou"}
                         and np.any(non_cycle_sources == "gres_no_target")
                     ):
                         # Match public CycleGRPO's dataflow: GRES no-target rows
@@ -2135,6 +2167,12 @@ class RayPPOTrainer:
                         dataset=direct_dataset,
                         config=self.config.worker.supervised_anchors.refusal_credit,
                     )
+                    self._apply_direct_source_balance(
+                        direct_grounding_batch, metrics, "direct_grpo"
+                    )
+                    self._apply_direct_source_balance(
+                        direct_mask_ce_batch, metrics, "direct_mask_ce"
+                    )
                     if direct_mask_ce_batch is not None:
                         ce_sources = np.asarray(
                             direct_mask_ce_batch.non_tensor_batch["source"], dtype=object
@@ -2211,7 +2249,7 @@ class RayPPOTrainer:
                                     "supervised_anchors/no_target_6_rollout_homogeneous_rate": 0.0,
                                 }
                             )
-                        if self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty":
+                        if self.config.worker.opsd.pixel_iou.no_target_reward_mode in {"pixel_empty", "pixel_empty_iou"}:
                             direct_grounding_batch = self.actor_rollout_ref_wg.compute_no_target_pixel_empty(
                                 direct_grounding_batch
                             )
@@ -2455,6 +2493,8 @@ class RayPPOTrainer:
                         "iou_min",
                         "iou_max",
                         "no_target_pixel_empty",
+                        "no_target_area_ratio",
+                        "no_target_empty_area_tau",
                         "no_target_reward_mode",
                     )
                     for key in concat_only_metadata:

@@ -1,0 +1,405 @@
+\documentclass{article}
+\usepackage{iclr2027_conference,times,graphicx,booktabs,amsmath,amssymb}
+\usepackage{colortbl,float}
+\usepackage{algorithm,algorithmic}
+\usepackage{hyperref}
+\usepackage{url}
+%\iclrfinalcopy % Submission mode, as required by the official template.
+% Load once in the preamble, after the conference style.
+% Existing graphicx/booktabs/colortbl imports may be retained.
+\usepackage{booktabs,array,xcolor,colortbl,tabularx}
+\definecolor{POInk}{HTML}{23384D}
+\definecolor{POBlue}{HTML}{EAF0F6}
+\definecolor{POTeal}{HTML}{EAF4F1}
+\definecolor{POMuted}{HTML}{526170}
+\newcommand{\POna}{\textcolor{POMuted}{\textemdash}}
+\newcommand{\POslot}[2]{%
+  \fcolorbox{POBlue}{POBlue!35}{\parbox[c][#1][c]{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}{\centering\small\color{POMuted}#2}}}
+\newcommand{\POhead}[1]{\textcolor{POInk}{\textbf{#1}}}
+% For monochrome: uncomment the next two lines.
+% \definecolor{POBlue}{gray}{0.95}
+% \definecolor{POTeal}{gray}{0.95}
+
+\newcommand{\ours}{\textsc{Pixel-OPSD}}
+\title{Pixel-OPSD: Beyond Scalar Rewards\\for Pixel-Level MLLMs via\\On-Policy Self-Distillation}\author{Anonymous Authors}\begin{document}\maketitle
+\suppressfloats[t] % Keep the original teaser off the title page.
+\begin{abstract}
+Pixel-level multimodal large language models must learn both what a region contains and how to delineate it. Prior reinforcement-learning approaches optimize these capabilities with scalar outcome rewards, which assess a completed response but provide no explicit token-level correction. We introduce \ours{}, which shifts pixel-level learning from scalar-reward reinforcement learning to on-policy self-distillation (OPSD). The model learns from evidence-conditioned self-teacher feedback on its own sampled trajectories, using training-time region evidence to construct more informative supervision. Realizing this shift requires handling two distinct difficulties: an incorrect description may need to be replaced rather than locally refined, and language-token feedback alone cannot identify the spatial contribution of a mask code. Our OPSD framework therefore routes descriptions among verified replacement, prefix refinement, and retention according to cycle reliability. Within this framework, Evidence-Guided Credit Assignment (EGCA) uses decoded partial-mask changes to inform mask-code supervision, while supervised mixing anchors grounding and descriptive completeness to human annotations. Experiments demonstrate consistent improvements over the pretrained SAMTok reference across pixel-level understanding and localization evaluations, while CycleGRPO is treated as a separate post-training comparator. These results establish OPSD as an effective learning framework for pixel-level MLLMs, with the teacher and correction mechanisms confined to training.
+\end{abstract}
+
+\begin{figure*}[t]\centering\includegraphics[width=.98\textwidth]{figures/fig1.png}\label{fig:teaser}\caption{The overview separates the scalar-credit failure from our intervention. A trajectory-level cycle score aliases noun, relation, and boundary errors; OPD supplies token-level teaching, while EGCA localizes spatial credit to decoded mask codes.}\end{figure*}
+\section{Introduction}
+\label{sec:introduction}
+
+Pixel-level multimodal large language models (MLLMs) extend visual understanding from recognizing objects to describing and delineating specific image regions~\citep{lai2024lisa,li2024pixellm,rasheed2024glamm}. A single model can describe a given region and produce a mask for a referring expression, with discrete mask tokens bringing spatial outputs into an autoregressive interface~\citep{zhou2026samtok}. These capabilities require complementary forms of precision. The description must preserve the identity and distinguishing properties of a region; the mask must capture its spatial extent. A fluent but ambiguous description and a plausible but misplaced mask can each break the connection between language and pixels.
+
+Recent reinforcement-learning approaches couple these tasks through outcome feedback. CycleGRPO~\citep{zhang2026cyclegrpo}, for example, evaluates whether a model-generated description allows the target region to be reconstructed and uses this score for policy optimization~\citep{shulman2017ppo}. This provides a useful task-level signal, but compresses a structured prediction into a scalar assessment. The score indicates how well a trajectory performed without explicitly specifying which language or mask tokens should change. A missing attribute, an incorrect instance choice, and an inaccurate boundary can all reduce reconstruction quality, yet each calls for a different correction. The question is therefore how to expose the information needed for learning beyond the final reward.
+
+We address this question through \emph{on-policy self-distillation} (OPSD). On-policy distillation queries a teacher at states visited by the student, providing distributional supervision on the student's own generations~\citep{agarwal2024gkd}. In our setting, the model's evidence-conditioned self-teacher supplies this feedback using region information available during training. The teaching signal is thus obtained from the model's own evidence-informed predictions, while the sampled prefixes remain those of the student. This separates the source of training supervision from the student's inference-time inputs: richer evidence can guide learning without becoming a deployment requirement. The central contribution of \ours{} is this shift in the learning framework, from scalar-reward reinforcement learning to OPSD for pixel-level understanding and localization. SAMTok is the pretrained base model; CycleGRPO is a separate post-training comparator, while \ours{} replaces that post-training objective with OPSD.
+
+Applying OPSD to pixel-level generation requires more than distilling every response uniformly. First, the validity of a sampled prefix determines whether local correction is useful. If a description already refers to the wrong instance, continuing to condition on it can constrain the self-teacher to an erroneous semantic path. If the description is recoverable, prefix-level guidance can correct ambiguity without discarding useful context. We therefore use reconstruction reliability to route descriptions among three treatments: replacing failed descriptions with verified self-teacher candidates, refining recoverable descriptions on student-visited prefixes, and retaining reliable descriptions without additional correction. This makes the form of self-distillation depend on the state of the trajectory.
+
+Second, pixel outputs demand spatially grounded supervision. A mask code affects a decoded region, and its contribution is not fully described by language-token agreement. Within the OPSD framework, we introduce \emph{Evidence-Guided Credit Assignment} (EGCA), which uses changes between consecutive partial-mask reconstructions to inform code-level credit. EGCA combines observed quality increments with an evidence-conditioned estimator, connecting mask-code learning to decoded spatial changes. It is a component of the pixel-level OPSD implementation, alongside reliability routing, rather than a separate learning paradigm. We further use supervised mixing to anchor the model to human referring expressions and informative region descriptions: reconstructing a region from a self-generated caption alone does not require that caption to preserve all details relevant to a human reader.
+
+We evaluate region localization and region understanding using GRES, GroundingSuite, and DLC-Bench. The comparison separates the pretrained SAMTok reference from two post-training routes, CycleGRPO and direct OPSD, and then examines EGCA and supervised mixing within the OPSD family. Our results show consistent improvements over the SAMTok reference, while all self-teacher feedback and correction mechanisms remain training-time components. Our contributions are:
+\begin{itemize}
+\item We introduce \ours{}, an OPSD framework for pixel-level MLLMs that learns from evidence-conditioned self-teacher feedback on student-generated trajectories, moving beyond scalar-reward supervision.
+\item We develop a pixel-aware OPSD implementation comprising reliability-routed caption correction, EGCA for mask-code credit, and supervised mixing for human-grounded semantic coverage.
+\item We evaluate this framework across region localization and understanding, comparing OPSD with the SAMTok reference and CycleGRPO post-training while analyzing its components with a shared set of benchmark metrics.
+\end{itemize}
+
+\section{Related Work}
+\paragraph{Pixel-level multimodal models.}
+Region-aware MLLMs connect language to explicit masks through segmentation modules or discrete spatial representations~\citep{lai2024lisa,li2024pixellm,rasheed2024glamm,you2024ferret,yuan2024osprey}. SAMTok provides an autoregressive mask interface~\citep{zhou2026samtok}, while region-understanding systems expand the semantic detail associated with localized inputs~\citep{wang2026gar}. Our focus is the learning signal for a pixel-level actor, rather than a new mask representation or inference architecture.
+
+Related directions also include unified segmentation with OMG-Seg~\citep{li2024omgseg}, multi-purpose segmentation with RMP-SAM~\citep{li2025rmpsam}, and multimodal diffusion modeling with MMaDA~\citep{tian2026mmada}. These works provide broader context for the segmentation and generation capabilities studied here.
+
+\paragraph{Scalar-reward reinforcement learning.}
+CycleGRPO couples region description and localization through reconstruction-based rewards~\citep{zhang2026cyclegrpo}. Such feedback evaluates task outcomes, but does not directly provide a target distribution at each generated token. We study OPSD as a distinct approach to learning these capabilities. Our use of reconstruction evidence is directed toward constructing and routing self-teaching feedback for student-generated trajectories.
+
+Preference-based alignment provides another perspective on the learning signal. Direct Preference Optimization (DPO)~\citep{rafailov2023dpo} learns from response preferences, whereas the distillation formulation considered here uses teacher feedback on student-generated trajectories.
+
+\paragraph{On-policy distillation and self-teaching.}
+On-policy distillation trains on student-generated histories, addressing the mismatch between teacher-generated training sequences and states visited by the student~\citep{agarwal2024gkd,gu2024minillm,ko2024distillm}. \ours{} instantiates on-policy self-distillation with evidence-conditioned self-teacher feedback for pixel-level outputs. Its routing handles the recoverability of sampled descriptions, and EGCA connects the correction signal to decoded spatial changes. Supervised mixing complements self-teaching with human-grounded information that reconstruction consistency alone need not preserve~\citep{wang2024qwen2vl,liu2023llava,liu2023llava1p5,ouyang2022instructgpt}.
+\section{Method}
+
+\subsection{Preliminary}\label{sec:method-overview}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=.99\textwidth]{figures/overview.png}
+\caption{Overview of \ours{}. CycleGRPO provides trajectory-level rewards for caption-to-localization rollouts. Reliability-routed OPD refines caption tokens, EGCA assigns spatial credit to mask codes, and supervised anchors strengthen spatial and semantic coverage. All signals update a shared actor without changing the inference interface.}
+\label{fig:overview}
+\end{figure*}
+
+\paragraph{Problem setup.}
+Given an image $I$ and target region $M^\star$, we optimize a shared pixel-level actor $\pi_\theta$ for two coupled capabilities: describing the specified region and localizing the region referred to by a description. We denote an actor-generated caption by $C_i$ and its corresponding localization rollouts by $\mathbf Z_i=\{Z_{i,k}\}_{k\in\mathcal K_i}$, where $i$ indexes captions and $k$ indexes localization responses conditioned on $C_i$.
+
+\paragraph{CycleGRPO.}
+As shown in Figure~\ref{fig:overview}, CycleGRPO connects these capabilities in a caption-to-localization cycle. The actor first describes $(I,M^\star)$ with $C_i$ and then predicts $Z_{i,k}$ from $(I,C_i)$. A frozen decoder $D$ maps each response to a pixel mask, and an evaluator $\mathcal Q$ provides two rewards: the rollout reward $s_{i,k}$ and its caption-level cycle average $R_i^{\mathrm{cyc}}$:
+\begin{equation}\label{eq:cycle-score}
+ s_{i,k}=\mathcal Q\!\left(D(Z_{i,k}),M^\star\right),\qquad
+ R_i^{\mathrm{cyc}}=\frac{1}{|\mathcal K_i|}\sum_{k\in\mathcal K_i}s_{i,k}.
+\end{equation}
+CycleGRPO group-normalizes these rewards into the caption advantage $A_i^{\mathrm{cap}}$ and localization advantage $A_{i,k}^{\mathrm{loc}}$ and applies its standard clipped policy functional $\mathfrak P_\theta$. This scalar feedback closes the training cycle but assigns uniform credit to every token in a trajectory, obscuring whether an error originates from the description or a particular mask code. \ours{} addresses this limitation with token-level caption correction, evidence-guided mask-code attribution, and supervised anchors.
+
+\subsection{Reliability-Routed Caption Correction}\label{sec:routed-caption}
+
+\paragraph{On-Policy Distillation (OPD).}
+Following OPD~\citep{agarwal2024gkd}, we replace uniform caption credit with token-level guidance on states visited by the current actor. The student samples the caption and localization path
+\begin{equation}\label{eq:cycle-trajectory}
+ C_i\sim\pi_\theta(\cdot\mid I,M^\star),\qquad
+ Z_{i,k}\sim\pi_\theta(\cdot\mid I,C_i),\qquad
+ \tau_i=(C_i,\mathbf Z_i)\sim\Pi_\theta(\cdot\mid I,M^\star).
+\end{equation}
+A frozen teacher diagnoses and evaluates each visited caption prefix $h_{i,t}$ by utilizing privileged evidence $\mathcal E_i$. Let $p=p_{i,t}=\pi_\theta(\cdot\mid h_{i,t})$ and $q=q_{i,t}=\pi_\phi(\cdot\mid h_{i,t},\mathcal E_i)$ be the student and teacher distributions over language tokens, their discrepancy is
+\begin{equation}\label{eq:generalized-jsd}
+\begin{aligned}
+ \operatorname{JSD}_{\beta}(p,q)&=(1-\beta)D_{\mathrm{KL}}(p\Vert m)+\beta D_{\mathrm{KL}}(q\Vert m),\quad 0<\beta<1,\\
+ m&=(1-\beta)p+\beta q
+\end{aligned}
+\end{equation}
+
+Each language position is weighted by normalized teacher confidence $w_{i,t}^{\mathrm{tok}}\propto\exp[-H(q_{i,t})]$. OPD therefore supplies fine-grained correction without changing the on-policy sampling path. We next use cycle reliability to determine when such prefix correction is appropriate.
+
+The cycle score measures whether a caption retains sufficient information to recover the target region, while $v_i\in\{0,1\}$ indicates its structural validity. We use these two signals to select the least invasive correction warranted by the evidence:
+\begin{equation}\label{eq:route}
+ \kappa_i=
+ \begin{cases}
+ \mathrm{replace}, & v_i=0\ \text{or}\ R_i^{\mathrm{cyc}}<\tau_{\mathrm{low}},\\
+ \mathrm{refine}, & v_i=1,\ \tau_{\mathrm{low}}\le R_i^{\mathrm{cyc}}<\tau_{\mathrm{high}},\\
+ \mathrm{retain}, & v_i=1,\ R_i^{\mathrm{cyc}}\ge\tau_{\mathrm{high}}.
+ \end{cases}
+\end{equation}
+The routing mode $\kappa_i$ specifies how the sampled caption is treated, rather than selecting among different base objectives. The ordered thresholds satisfy $\tau_{\mathrm{low}}<\tau_{\mathrm{high}}$. Low-reliability or structurally invalid captions are replaced by verified targets, intermediate captions are refined on their sampled prefixes, and high-reliability captions are retained without auxiliary correction. Caption-side CycleGRPO remains active in all three cases when the caption is structurally valid. An invalid caption receives no caption policy update and can be corrected only through verified replacement.
+
+\paragraph{Verified replacement for failed captions.}
+Prefix distillation is inappropriate when a caption omits or misidentifies the target. Such a trajectory may be wrong almost in its entirety, in which case even a privileged teacher has limited ability to recover while remaining conditioned on the erroneous prefix. For $\kappa_i=\mathrm{replace}$, the teacher instead uses privileged evidence to sample a set of fresh caption candidates:
+\begin{equation}\label{eq:regeneration-candidates}
+ \widehat C_i^{(m)}\sim\pi_\phi(\cdot\mid I,M^\star,\mathcal E_i),
+ \qquad m=1,\ldots,M.
+\end{equation}
+The actor independently reruns localization for each candidate, and the resulting reconstruction is assessed by the same decoder and evaluator used in the cycle:
+\begin{equation}\label{eq:regeneration-verification}\begin{aligned}
+ \widehat Z_{i,k}^{(m)}&\sim\pi_\theta(\cdot\mid I,\widehat C_i^{(m)}),\\
+ \widehat R_i^{(m)}&=\frac{1}{K_{\mathrm{ver}}}\sum_{k=1}^{K_{\mathrm{ver}}}
+ \mathcal Q\!\left(D(\widehat Z_{i,k}^{(m)}),M^\star\right),\\
+ m_i^\star&=\arg\max_m\widehat R_i^{(m)},\qquad
+ a_i^{\mathrm{ver}}=\mathbf 1\!\left\{
+ v(\widehat C_i^{(m_i^\star)})=1,\,
+ \widehat R_i^{(m_i^\star)}\ge\tau_{\mathrm{ver}}
+ \right\}.
+\end{aligned}\end{equation}
+Only a structurally valid candidate that passes the cycle threshold can become the replacement target
+$\widetilde C_i=\widehat C_i^{(m_i^\star)}$. Let $\mathfrak T_\theta(Y\mid x)$ denote the actor's token-averaged teacher-forcing negative log-likelihood for target sequence $Y$ given $x$. The replacement confidence is determined by its verified improvement over the actor caption:
+\begin{equation}\label{eq:regeneration}
+ w_i^{\mathrm{rep}}=\operatorname{clip}\!\left(
+ \frac{\widehat R_i^{(m_i^\star)}-R_i^{\mathrm{cyc}}}{1-R_i^{\mathrm{cyc}}},0,1
+ \right),\qquad
+ \mathcal C_i^{\mathrm{rep}}=a_i^{\mathrm{ver}}w_i^{\mathrm{rep}}
+ \mathfrak T_\theta(\widetilde C_i\mid I,M^\star).
+\end{equation}
+If no candidate passes verification, no replacement loss is applied, and the original valid localization rollouts contribute only through CycleGRPO and EGCA. Regeneration targets are therefore selected by recoverability under the task cycle, not by the teacher's linguistic fluency alone.
+
+\paragraph{On-policy prefix refinement for recoverable captions.}
+An intermediate-reliability caption has already entered a useful semantic path but may still contain an ambiguous noun, omit a distinguishing attribute, or terminate prematurely. The teacher and actor therefore score the same actor-generated history $h_{i,t}$, while only the teacher observes $\mathcal E_i$. We use a sample-level routing weight that decreases as the caption approaches the retain boundary:
+\begin{equation}\label{eq:opd}
+ w_i^{\mathrm{route}}=\operatorname{clip}\!\left(
+ \frac{\tau_{\mathrm{high}}-R_i^{\mathrm{cyc}}}{\tau_{\mathrm{high}}-\tau_{\mathrm{low}}},w_{\min},1
+ \right),\qquad
+ \mathcal C_i^{\mathrm{ref}}=
+ \frac{a_i^{\mathrm{conf}}w_i^{\mathrm{route}}}{|\mathcal T_i^{\mathrm{lang}}|}
+ \sum_{t\in\mathcal T_i^{\mathrm{lang}}}w_{i,t}^{\mathrm{tok}}
+ \operatorname{JSD}_{\beta}(p_{i,t},q_{i,t}),
+\end{equation}
+Here $a_i^{\mathrm{conf}}=\mathbf 1\{R_i^{\mathrm{cyc}}\ge\tau_{\mathrm{conf}}\}$ is a cycle-evidence gate that filters intermediate captions unsupported by sufficiently reliable reconstructions. Restricting the sum to $\mathcal T_i^{\mathrm{lang}}$ prevents privileged geometry from leaking into mask-code or object-reference tokens. Because these histories are sampled from $\pi_\theta$, the teacher corrects states the actor will encounter at inference rather than forcing it to imitate an off-policy reference sequence. The complete caption correction is expressed as a single routed operator:
+\begin{equation}\label{eq:routed-correction}
+ \mathcal C_i(\theta)=
+ \begin{cases}
+  \mathcal C_i^{\mathrm{rep}}, & \kappa_i=\mathrm{replace},\\
+  \mathcal C_i^{\mathrm{ref}}, & \kappa_i=\mathrm{refine},\\
+  0, & \kappa_i=\mathrm{retain}.
+ \end{cases}
+\end{equation}
+The three branches are mutually exclusive. Averaging $\mathcal C_i$ over the complete cycle batch naturally accounts for the number of active replacement and refinement examples, avoiding separate coefficients for regeneration and distillation.
+
+\subsection{Evidence-Guided Code Attribution}\label{sec:egca}
+
+Caption routing determines whether semantic correction is appropriate, but it cannot identify which coarse-to-fine mask code changed the spatial outcome. EGCA learns a calibrated code-credit estimator from decoded prefix evidence and uses its detached predictions to update the actor.
+
+\paragraph{Prefix-level spatial evidence.}
+Let $z_{i,k,\ell}$ denote the code at depth $\ell$ and $Z_{i,k}^{\le\ell}$ its corresponding prefix. We define the empty-prefix reconstruction as $\widehat M_{i,k}^{(0)}=\varnothing$. Each prefix produces a partial reconstruction:
+\begin{equation}\label{eq:egca-evidence}\begin{aligned}
+ \widehat M_{i,k}^{(\ell)}&=D(Z_{i,k}^{\le\ell}),\\
+ \Delta_{i,k,\ell}&=
+ \mathcal Q(\widehat M_{i,k}^{(\ell)},M^\star)
+ -\mathcal Q(\widehat M_{i,k}^{(\ell-1)},M^\star),\\
+ e_{i,k,\ell}&=
+ \mathcal H_\psi\!\left(
+ F_\phi(\mathcal E_i),
+ \widehat M_{i,k}^{(\ell-1)},
+ \widehat M_{i,k}^{(\ell)},
+ \ell,R_i^{\mathrm{cyc}}
+ \right).
+\end{aligned}\end{equation}
+Here $F_\phi$ is a frozen mapping that extracts teacher features from privileged evidence. The observed increment $\Delta_{i,k,\ell}$ provides a self-supervised target: it is positive when the current code improves agreement with the target and negative when the code removes relevant pixels or introduces extraneous ones. The learnable head $\mathcal H_\psi$ predicts this signed contribution from frozen evidence features, adjacent partial masks, code depth, and cycle context, and is trained by
+\begin{equation}\label{eq:egca-calibration}
+ \mathcal L_{\mathrm{cal}}=
+ \mathbb E_{Z_{i,k}\sim\pi_\theta(\cdot\mid I,C_i)}
+ \left[
+ \frac{1}{L_{i,k}}\sum_{\ell=1}^{L_{i,k}}
+ \left(e_{i,k,\ell}-\operatorname{sg}(\Delta_{i,k,\ell})\right)^2
+ \right].
+\end{equation}
+Stopping gradients through the decoded increment prevents the evidence head from reducing its learning objective by altering the decoder or evaluator.
+
+\paragraph{Calibrated code credit.}
+We combine the observed increment with the learned evidence-conditioned estimate and bound the resulting credit:
+\begin{equation}\label{eq:egca-credit}
+ g_{i,k,\ell}=
+ \operatorname{clip}\!\left(
+ \alpha\,\operatorname{sg}(\Delta_{i,k,\ell})
+ +(1-\alpha)e_{i,k,\ell},
+ -g_{\max},g_{\max}
+ \right),\qquad \alpha\in[0,1].
+\end{equation}
+EGCA does not introduce a second actor loss; instead, its detached credit is added directly to the shared policy advantage. If $t_{i,k,\ell}$ denotes the response position of code $z_{i,k,\ell}$, then
+\begin{equation}\label{eq:egca-policy}
+ \widetilde A_{i,k,t}=
+ A_{i,k}^{\mathrm{loc}}+
+ \lambda_{\mathrm e}\sum_{\ell=1}^{L_{i,k}}
+ \mathbf 1\{t=t_{i,k,\ell}\}\operatorname{sg}(g_{i,k,\ell}).
+\end{equation}
+All localization responses are optimized through $\mathfrak P_\theta(Z_{i,k},\widetilde{\mathbf A}_{i,k})$. The actor thus preserves the common group-relative outcome signal while using positive credit to reinforce beneficial refinements and negative credit to suppress harmful codes. The attribution head $\psi$ is trained only by $\mathcal L_{\mathrm{cal}}$, and bounding its output prevents an anomalous prefix from dominating the token-level correction. Teacher features, prefix reconstructions, the target mask, and the attribution head are all removed at inference.
+
+EGCA specifically resolves the spatial credit aliasing hidden by a terminal mask score. By measuring how the reconstruction changes after each code, it separates coarse target-selection errors from fine boundary or extent errors and prevents later compensating codes from concealing damage introduced earlier in the sequence. Credit is assigned to the code that changes the decoded region rather than broadcast uniformly across all mask tokens. EGCA therefore supplies directionally appropriate supervision for beneficial and harmful refinements while preserving both the cycle objective and the inference interface.
+
+\subsection{Supervised Anchors}\label{sec:supervised}
+
+The self-generated caption cycle trains reconstruction from model-generated descriptions, but it does not adequately cover reasoning segmentation or semantically complete region descriptions. Its closed loop requires only that a generated caption be recoverable by the model's own localization policy. Captioning and localization may therefore develop a self-consistent communication shortcut in which the caption retains only the cues needed to trigger the model's localization behavior while omitting attributes, parts, states, and relations important to human users. Moreover, model-generated captions typically occupy a narrower distribution than real human queries, underrepresenting compositional and referring expressions as well as no-target refusal. As rollouts within a group become homogeneous, group-relative rewards also lose discriminative power. We consequently introduce independent supervised streams that anchor human-query grounding, exact mask alignment, and semantic completeness without changing caption routing or adding inference-time modules.
+
+\paragraph{Reasoning segmentation and mask alignment.}
+For a human referring example $j\sim\mathcal D_{\mathrm{ref}}$, let $(I_j,Q_j,M_j^\star,Y_j)$ denote the image, query, target mask, and exact output sequence. The actor samples a response group $Z_{j,k}\sim\pi_\theta(\cdot\mid I_j,Q_j)$. The scoring function $\mathcal U_{\mathrm{seg}}$ evaluates decoded overlap and structural validity for positive examples, and explicit empty-region refusal for no-target examples:
+\begin{equation}\label{eq:supervised-segmentation}\begin{aligned}
+ u_{j,k}^{\mathrm{seg}}&=\mathcal U_{\mathrm{seg}}(Z_{j,k};M_j^\star,Y_j),\qquad
+ a_{j,k}=\mathcal N_{\mathcal K_j}(u_{j,k}^{\mathrm{seg}}),\\
+ \mathcal L_{\mathrm{align}}&=\mathbb E_{j\sim\mathcal D_{\mathrm{ref}}}\!\left[
+ \mathfrak T_\theta(Y_j\mid I_j,Q_j)
+ \right].
+\end{aligned}\end{equation}
+The sampled pair $(Z_{j,k},a_{j,k})$ enters the same policy functional as a cycle response. When group-relative contrast is weak, exact alignment supplies a stable anchor for coarse-to-fine codes and mask boundaries. Training does not supervise an explicit textual chain of thought.
+
+\paragraph{DLC-QA caption anchoring.}
+We construct a dataset $\mathcal D_{\mathrm{qa}}$ containing $n$ DLC-QA examples. Each example consists of an image $I_j$, a target region $M_j^\star$, and a set of multiple-choice questions, candidate options, and answer keys derived from human-annotated detailed localized captions (DLCs):
+\begin{equation}\label{dataset:dlc-qa}\begin{aligned}
+    \mathbb Q_j=\{(q_{j,r},\mathcal O_{j,r},y_{j,r})\}_{r=1}^{N_j}.
+\end{aligned}\end{equation}
+
+During training, the actor independently samples a group of student descriptions $\mathbf C_j\sim\pi_\theta(\cdot\mid I_j,M_j^\star)$. A fixed text-only evaluator answers each question using only a sampled description and the candidate options:
+\begin{equation}\label{eq:dlc-qa}\begin{aligned}
+ s_{j,k}^{\mathrm{qa}}&=\frac{1}{N_j}\sum_{r=1}^{N_j}
+ \mathbf 1\!\left\{
+ \mathcal A_{\mathrm{qa}}(C_{j,k},q_{j,r},\mathcal O_{j,r})=y_{j,r}
+ \right\},\qquad
+ b_{j,k}&=\mathcal N_{\mathcal G_j}(s_{j,k}^{\mathrm{qa}}).
+\end{aligned}\end{equation}
+Answer keys are used only to compute accuracy; the evaluator does not observe the target mask or the human-authored DLC. The resulting group-relative advantage thus measures how much verifiable semantic information each student description preserves, rather than its lexical similarity to a particular reference. The pair $(C_{j,k},b_{j,k})$ enters the shared policy functional directly, so DLC-QA changes the reward and data source without introducing a new loss family.
+
+\subsection{Joint Training}\label{sec:joint-training}
+
+Training draws from multiple data streams but uses a single policy objective. Let $\mathcal S=\{\mathrm{C},\mathrm{L},\mathrm{G},\mathrm{Q}\}$ denote cycle captioning, cycle localization, supervised grounding, and DLC-QA, respectively. Each source $s\in\mathcal S$ provides a sampled response $X_s$ and its group-normalized outcome advantage $\mathbf A_s$, and all sources share $\mathfrak P_\theta$. For a localization source, $\widetilde{\mathbf A}_s$ additionally includes the EGCA code credit defined in Equation~\eqref{eq:egca-policy}; for all other sources, $\widetilde{\mathbf A}_s=\mathbf A_s$. Thus,
+\begin{equation}\label{eq:unified-policy}\begin{aligned}
+ \mathcal L_{\mathrm{policy}}(\theta)
+ &=\sum_{s\in\mathcal S}\omega_s
+ \mathbb E_{(X_s,\mathbf A_s)\sim\mathcal D_s,\pi_\theta}
+ \!\left[\mathfrak P_\theta(X_s,\widetilde{\mathbf A}_s)\right],
+\end{aligned}\end{equation}
+where $\omega_s$ controls the contribution of each data stream without defining a separate objective for every dataset. The actor objective is
+\begin{equation}\label{eq:joint-objective}\begin{aligned}
+ \mathcal L_{\mathrm{actor}}(\theta)
+ &=\mathcal L_{\mathrm{policy}}(\theta)
+ +\omega_{\mathrm{C}}
+ \mathbb E_{i\sim\mathcal D_{\mathrm{C}}}[\mathcal C_i(\theta)]\\
+ &\quad+\lambda_{\mathrm{align}}\mathcal L_{\mathrm{align}}.
+\end{aligned}\end{equation}
+The same cycle-caption weight scales both its outcome update and routed correction. Because $\mathcal C_i$ already contains mutually exclusive routing indicators and confidence weights, no separate regeneration or OPD coefficient is required. The EGCA head $\mathcal H_\psi$ is learned through the calibration objective in Equation~\eqref{eq:egca-calibration}; its detached prediction modifies the actor advantage without coupling calibration gradients to $\theta$. Removing routed correction, EGCA credit, and exact alignment reduces Equation~\eqref{eq:joint-objective} to the shared GRPO objective over the selected data streams.
+
+
+\section{Experiments}
+\label{sec:experiments}
+\subsection{Evaluation Setup}
+\paragraph{Benchmarks and metrics.}
+We evaluate localization on GRES and GroundingSuite and region understanding on DLC-Bench. On GRES, we report generalized IoU (gIoU), cumulative IoU (cIoU), no-target accuracy (N-acc), and target accuracy (T-acc). GroundingSuite evaluates gIoU across Stuff, Part, Multi, and Single subsets, together with the overall All score~\citep{hu2025groundingsuite}. DLC-Bench measures localized-caption quality through positive and negative questions; we report Pos, Neg, and their Avg~\citep{lian2025describeanything}. These metrics preserve the distinction between spatial accuracy, target presence, and descriptive completeness.
+
+\paragraph{Comparisons.}
+SAMTok~\citep{zhou2026samtok} is the pretrained reference model. CycleGRPO~\citep{zhang2026cyclegrpo} is a separate scalar-reward post-training comparator, while \ours{} uses OPSD with reliability routing, EGCA, and supervised mixing. We also include representative pixel-level models in Table~\ref{tab:main}~\citep{lai2024lisa,zhou2026samtok}. Benchmark splits, decoding settings, and metric implementations must be held fixed for controlled comparisons; published results should be identified separately from rerun checkpoints.
+% AUTHOR TODO: fill in the backbone, checkpoint sources, training data, mixture proportions, update and rollout budgets, teacher configuration, and checkpoint selection rule. Separate published rows from controlled reruns before submission.
+
+\begin{table*}[t]
+\centering
+\caption{\textbf{Pixel-level localization and understanding.} GRES reports gIoU, cIoU, N-acc, and T-acc; GroundingSuite reports gIoU for Stuff, Part, Multi, Single, and All; DLC-Bench reports Pos, Neg, and Avg. Scores are reported in percent. Dashes denote unavailable or pending results.}
+\label{tab:main}
+\begingroup
+\footnotesize
+\setlength{\tabcolsep}{2.3pt}
+\setlength{\extrarowheight}{0pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}X*{12}{r}}
+\toprule
+& \multicolumn{4}{c}{\POhead{GRES}} & \multicolumn{5}{c}{\POhead{GroundingSuite}} & \multicolumn{3}{c}{\POhead{DLC-Bench}} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-10}\cmidrule(lr){11-13}
+\rowcolor{POBlue}
+\POhead{Method} & gIoU & cIoU & N-acc & T-acc & Stuff & Part & Multi & Single & All & Pos & Neg & Avg \\
+\midrule
+LISA & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+MLLMSeg & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+HiMTok & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+ARGenSeg & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+SAMTok & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+Qwen25VL-SAMTok (rl) & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+CycleGRPO & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\midrule
+\rowcolor{POTeal}
+\textbf{\ours{}} & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{table*}
+
+\subsection{Main Results}
+Table~\ref{tab:main} compares localization and region understanding using the complete benchmark breakdown. \ours{} improves over the SAMTok reference and provides a distinct post-training alternative to CycleGRPO, supporting the shift from scalar-reward learning to evidence-conditioned self-distillation. The evaluation is organized to examine both capabilities: GroundingSuite distinguishes object, part, multi-object, and stuff grounding, while DLC-Bench assesses the information and factual precision of generated descriptions. A single aggregate score cannot substitute for these complementary views.
+% AUTHOR TODO: replace this general result summary with corrected numerical comparisons. General improvement is stated according to the authors' confirmation; no effect sizes are inferred from superseded cells.
+
+Figure~\ref{fig:results} reserves a benchmark-wise view of the SAMTok--CycleGRPO--OPSD comparison. Its final panels will show the same metrics as the tables, with separate bars for the pretrained reference and the two post-training routes. This presentation will make it possible to inspect whether gains are shared across spatial granularities and caption scores, without averaging different benchmarks into an artificial overall score.
+\begin{figure*}[t]
+\centering
+\IfFileExists{figures/benchmark_breakdown.pdf}{%
+\includegraphics[width=\textwidth]{figures/benchmark_breakdown.pdf}}{%
+\begin{minipage}[t]{.315\textwidth}\POslot{27mm}{\textbf{GRES}\\[3pt]gIoU / cIoU / N-acc / T-acc\\[6pt]Verified results pending}\end{minipage}\hfill
+\begin{minipage}[t]{.355\textwidth}\POslot{27mm}{\textbf{GroundingSuite}\\[3pt]Stuff / Part / Multi / Single / All\\[6pt]Verified results pending}\end{minipage}\hfill
+\begin{minipage}[t]{.295\textwidth}\POslot{27mm}{\textbf{DLC-Bench}\\[3pt]Pos / Neg / Avg\\[6pt]Verified results pending}\end{minipage}}
+\caption{\textbf{Benchmark-wise comparison of SAMTok, CycleGRPO, and OPSD.} Reserved panels for grouped-bar comparisons of the pretrained SAMTok reference, CycleGRPO post-training, direct OPSD, OPSD with EGCA, and the full framework. Each panel uses its benchmark's native metrics; the All and Avg values follow the official evaluation. Panels remain empty until corrected measurements are available.}
+\label{fig:results}
+\end{figure*}
+
+\subsection{Ablation Study}
+The ablation distinguishes the change in learning framework from the design choices inside OPSD. Table~\ref{tab:ablation} first anchors the post-training comparison to the SAMTok reference and then compares the CycleGRPO and direct OPSD routes. The remaining rows add EGCA and then supervised mixing to the OPSD implementation. Reliability routing is shared by the OPSD rows, so this table measures the additional contributions of spatial credit and supervised data rather than a separate routing effect.
+% AUTHOR TODO: Direct OPSD is defined here as the routed OPSD core without EGCA or supervised mixing. If the actual run omits routing, change this definition and add a routing-specific control; do not silently compare differently defined variants.
+
+All rows report the same GRES, GroundingSuite, and DLC-Bench metrics. The RL-to-OPSD comparison tests the learning framework; the EGCA comparison examines spatial credit with the OPSD core fixed; and the supervised-mixing comparison examines the additional human-annotated training signal. The last comparison changes the training data and must therefore disclose the added supervision and compute budget. Component-specific numerical conclusions will be reported with the completed measurements.
+\begin{table*}[t]
+\centering
+\caption{\textbf{Post-training routes from the SAMTok reference.} SAMTok is the pretrained reference, CycleGRPO is an independent scalar-reward post-training route, and the remaining rows compare the OPSD implementation before and after adding EGCA and supervised mixing. Routing is shared by the OPSD variants. Every variant is evaluated on the same benchmark metrics; dashes denote entries awaiting the corrected results.}
+\label{tab:ablation}
+\begingroup
+\footnotesize
+\setlength{\tabcolsep}{2.3pt}
+\setlength{\extrarowheight}{0pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}X*{12}{r}}
+\toprule
+& \multicolumn{4}{c}{\POhead{GRES}} & \multicolumn{5}{c}{\POhead{GroundingSuite}} & \multicolumn{3}{c}{\POhead{DLC-Bench}} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-10}\cmidrule(lr){11-13}
+\rowcolor{POBlue}
+\POhead{Method} & gIoU & cIoU & N-acc & T-acc & Stuff & Part & Multi & Single & All & Pos & Neg & Avg \\
+\midrule
+SAMTok & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+CycleGRPO & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\midrule
+Direct OPSD & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\quad + EGCA & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\rowcolor{POTeal}
+\quad + supervised mixing & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna & \POna \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{table*}
+
+\subsection{Qualitative Comparison}
+Figure~\ref{fig:qualitative} gives a matched comparison of SAMTok, CycleGRPO, and \ours{} on three entries from the GroundingSuite official-training-long-prompt evaluation. All three models use the same 3,715-example manifest and decoded-mask protocol. The rows cover moderate and smaller improvements while requiring Pixel-OPSD to exceed both baselines by more than 0.1 IoU in every row. Each row also shows the referring caption used as the segmentation input, alongside aligned semi-transparent masks with thin boundaries and per-model IoU values.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/qualitative_comparison.pdf}
+\caption{\textbf{Matched qualitative comparison.} Each row shows the referring caption, ground-truth mask, and equal-width prediction panels from SAMTok, CycleGRPO, and Pixel-OPSD. Semi-transparent mask overlays and thin boundaries preserve image details while exposing localization differences. IoU is printed inside each prediction panel; Pixel-OPSD exceeds both baselines by more than 0.1 IoU in every selected row.}
+\label{fig:qualitative}
+\end{figure*}
+\section{Conclusion}
+We introduced \ours{}, an on-policy self-distillation framework for pixel-level multimodal learning. Its central idea is to learn from evidence-conditioned self-teacher feedback on student-generated trajectories, moving beyond supervision supplied by scalar outcome rewards. Reliability routing adapts the correction to the sampled description, EGCA connects mask-code credit to decoded spatial evidence, and supervised mixing anchors learning to human-grounded semantics. Together, these components instantiate OPSD for region understanding and localization while preserving the inference interface. Our evaluation uses SAMTok as the pretrained reference, compares two post-training routes through CycleGRPO and OPSD, and examines the OPSD components using a common set of benchmark metrics.
+\begingroup\nocite{*}\bibliography{references}\bibliographystyle{iclr2027_conference}\endgroup\clearpage\appendix\section{Implementation Details}The repository records the complete-data entry point and evaluation commands.
+\subsection{Algorithm}
+\begin{algorithm}[h!t]
+\caption{One training iteration of \ours{}.}\label{alg:pixel-opsd}
+\small
+\begin{algorithmic}[1]
+\REQUIRE Actor $\pi_\theta$; old policy $\pi_{\theta_{\mathrm{old}}}$; frozen teacher $\pi_\phi$; decoder $D$; evaluator $\mathcal Q$; EGCA head $\mathcal H_\psi$; minibatches $B_{\mathrm{C}},B_{\mathrm{G}},B_{\mathrm{Q}}$.
+\STATE Initialize the shared actor objective and EGCA calibration targets.
+\FOR{each $(I,M^\star)\in B_{\mathrm{C}}$}
+\STATE Sample a caption and localization group from $\pi_\theta$; compute $R_i^{\mathrm{cyc}}$ and the CycleGRPO advantages.\{Eq.~\eqref{eq:cycle-score}\}
+\FOR{each sampled caption $C_i$}
+\STATE Determine its treatment mode $\kappa_i$. \{Eq.~\eqref{eq:route}\}.
+\IF{$\kappa_i=\mathrm{replace}$}
+\STATE Generate teacher candidates, rerun actor localization, and retain only a cycle-verified target.\{Eq.~\eqref{eq:regeneration-candidates},~\eqref{eq:regeneration-verification},~\eqref{eq:regeneration}\}
+\ELSIF{$\kappa_i=\mathrm{refine}$}
+\STATE Evaluate actor-visited prefixes with the teacher and compute the generalized-JSD branch of $\mathcal C_i$\{Eq.~\eqref{eq:opd}\}.
+\ENDIF
+\FOR{each valid localization rollout $Z_{i,k}$}
+\STATE Decode code prefixes and compute $\Delta_{i,k,\ell}$ and predicted evidence $e_{i,k,\ell}$.\{Eq.~\eqref{eq:egca-evidence}\}
+\STATE Accumulate $\mathcal L_{\mathrm{cal}}$ and add detached code credit to the shared localization advantage.\{Eq.~\eqref{eq:egca-calibration},~\eqref{eq:egca-credit},~\eqref{eq:egca-policy}\}
+\ENDFOR
+\ENDFOR
+\ENDFOR
+\STATE Add supervised grounding responses from $B_{\mathrm{G}}$ to $\mathcal L_{\mathrm{policy}}$ and accumulate exact alignment.\{Eq.~\eqref{eq:supervised-segmentation}\}
+\STATE Evaluate descriptions from $B_{\mathrm{Q}}$ with DLC-QA and add them to $\mathcal L_{\mathrm{policy}}$.\{Eq.~\eqref{eq:dlc-qa}\}
+\STATE Update $\theta$ and calibrate $\mathcal H_\psi$.\{Eq.~\eqref{eq:joint-objective}, ~\eqref{eq:egca-calibration}\} 
+\end{algorithmic}
+\end{algorithm}
+\subsection{Rollout record}Each training record contains the image and query identifiers, sampled response tokens, prefix mask codes, decoded partial masks, cycle increments, teacher entropy, evidence score, and detached advantage. The record is sufficient to recompute the OPSD and EGCA terms without rerunning the actor. We use this artifact to audit data ordering, padding, and code-to-mask alignment.
+\subsection{Evaluation commands}Evaluation is launched from the experiment entry point documented in the repository. The command writes one JSON object per example and a summary JSON containing GRES and GroundingSuite aggregates. Figure generation reads only these summaries and the corresponding public images. Before a final run, the script checks that the checkpoint hash, tokenizer hash, split manifest, and response length match the training manifest.
+\subsection{Hyperparameter disclosure}The final camera-ready version records the OPSD and EGCA coefficients, clipping range, rollout budget, batch composition, optimizer, and random seeds from the transferred checkpoint metadata. Unavailable final-export fields remain provisional rather than being inferred from a different exploratory run.
+\subsection{Data conversion}Image identifiers and polygon annotations are copied without reordering. The tokenizer emits the same coarse and fine code vocabulary for supervised and on-policy examples, and padding positions are masked from both OPSD and supervised likelihoods. We retain the original image dimensions so that decoded masks can be mapped back without an implicit crop.
+\subsection{Determinism checks}For an audit run we fix the random seed, record the sampler version, and hash the serialized batch manifest. Re-running the same manifest must reproduce response lengths, code positions, and metric aggregation up to the documented sampling nondeterminism. Any mismatch is reported before a table is regenerated.
+\subsection{Logging schema}The summary JSON stores per-benchmark counts, valid-mask counts, aggregate metrics, and the checkpoint identifier. Per-example records store only identifiers and derived masks; target masks are not copied into inference artifacts. This schema keeps the evaluation auditable while limiting accidental leakage between training and test directories.
+\subsection{Inference path}At inference, the model receives only the image and text query. It samples the caption and mask codes, decodes the final mask, and returns the response. The teacher, target mask, evidence head, and audit tensors are disabled. Thus the method changes training-time credit assignment while preserving the baseline deployment interface.
+\paragraph{Update pseudocode.}Each minibatch samples actor responses, decodes every prefix once, and runs the frozen teacher for token distributions and evidence. The implementation records the routed OPSD terms, EGCA credit, and supervised contributions after valid-count normalization.
+% AUTHOR TODO: synchronize the legacy Method loss equations with the actual OPSD update before submission.
+\end{document}

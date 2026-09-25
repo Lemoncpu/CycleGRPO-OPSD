@@ -1,4 +1,4 @@
-from .config import CaptionSafetyConfig, OPSDConfig, SECAConfig
+from .config import CaptionSafetyConfig, EGCAConfig, OPSDConfig, SECAConfig
 from .distillation import caption_blocked_special_token_ids, chunked_weighted_jsd_loss
 from .mask_iou import (
     MASK_TOKEN_PATTERN,
@@ -8,10 +8,10 @@ from .mask_iou import (
     extract_mask_token,
     extract_mask_tokens,
     mask_group_metadata,
+    prepare_mask_image,
     mask_summary,
     parse_mask_codes,
     pixel_empty_reward,
-    positive_empty_mask_penalty,
 )
 from .routing import (
     GRPO_ROUTE,
@@ -28,7 +28,21 @@ from .routing import (
     teacher_caption_is_safe,
     uses_original_grpo,
 )
-from .seca import hierarchical_mask_token_weights, spatial_evidence_weight
+from .seca import (
+    hierarchical_mask_token_weights,
+    self_supervised_evidence_weight,
+    spatial_evidence_weight,
+)
+from .egca import (
+    combine_evidence_and_shapley,
+    contrastive_token_credit,
+    egca_opd_weight,
+    evidence_weight_from_masks,
+    extract_code_positions,
+    mask_group_text,
+    nonnegative_mask_group_token_weights,
+    shapley_depth_credit,
+)
 
 
 __all__ = [
@@ -36,6 +50,7 @@ __all__ = [
     "MASK_TOKEN_PATTERN",
     "ON_POLICY_DISTILL_ROUTE",
     "CaptionSafetyConfig",
+    "EGCAConfig",
     "OPSDConfig",
     "SECAConfig",
     "REGENERATE_ROUTE",
@@ -54,13 +69,22 @@ __all__ = [
     "extract_mask_token",
     "extract_mask_tokens",
     "mask_group_metadata",
+    "prepare_mask_image",
     "mask_summary",
     "parse_mask_codes",
     "pixel_empty_reward",
-    "positive_empty_mask_penalty",
     "regenerate_weight",
     "hierarchical_mask_token_weights",
+    "self_supervised_evidence_weight",
     "spatial_evidence_weight",
     "teacher_caption_is_safe",
     "uses_original_grpo",
+    "combine_evidence_and_shapley",
+    "contrastive_token_credit",
+    "egca_opd_weight",
+    "evidence_weight_from_masks",
+    "extract_code_positions",
+    "mask_group_text",
+    "nonnegative_mask_group_token_weights",
+    "shapley_depth_credit",
 ]

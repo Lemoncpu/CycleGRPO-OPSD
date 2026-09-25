@@ -403,7 +403,7 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
    UID、`localization_index`、source 等元数据严格按未补齐 prompt 数量构造，并检查输出为
    `prompt_count × K`，避免 padding 后数量残留造成 DataProto 一致性错误。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
-6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，`positive_empty_mask_penalty` 默认在 segmentation reward 额外扣 `1.0`；真实 IoU 本身保持不变，并独立记录该负项。
+6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，惩罚按任务流独立配置：`cycle_positive_empty_mask_penalty` 作用于 cycle localization，`direct_positive_empty_mask_penalty` 作用于 direct grounding；未显式设置时二者回退到兼容的 `positive_empty_mask_penalty`，真实 IoU 本身保持不变，并独立记录该负项。
 7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
@@ -667,6 +667,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/reassemble_fsdp_checkpoint.py` | CPU/Gloo 离线 FSDP checkpoint 重组器；按 checkpoint 文件名发现并启动同等数量 CPU rank，逐参数收集原 world-size shard 后在 rank 0 还原完整 state dict、复制 processor/config 并写出 HF safetensors。用于训练 world size 无法同时获得足量 GPU 时的评测导出 |
 | `tools/run_pegc_suite.sh` / `tools/run_pegc_eval_suite.sh` / `tools/summarize_pegc_results.py` | 隔离 PEGC 四版顺序训练、前四卡 benchmark 编排和统一日志指标汇总；评测脚本以 `NUM_GPUS`/`EVAL_GPU_LIST` 对齐训练 checkpoint 的 FSDP world size（默认 3 卡 0--2） |
 | `tools/train_evidence_mask_credit_1of10_epoch1.sh` / `tools/train_cbba_1of10_epoch1.sh` | 固化 evidence+mask-credit 与 CBBA 两套 1/10、一 epoch（7 卡训练使用 112/224/56，17 steps）训练参数；自动在 GPU7 部署本地 Llama judge，训练使用 GPU0--6（7 卡）并在退出时关闭脚本自身启动的 judge |
+| `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh` | Evidence+Mask Credit 的 1/10、一 epoch cycle-only 正样本 no-target 惩罚对照；cycle penalty=1.0，direct penalty=0.0，其他数据与训练参数保持一致 |
 | `tools/train_supervised_direct_grpo_baseline_1of10_3gpu.sh` / `tools/train_refusal_credit_1of10_3gpu.sh` / `tools/train_mask_refusal_credit_1of10_3gpu.sh` | 四卡可运行对照：GPU0--2 训练、GPU3 启动 Llama；固定 1/10 数据、`108/216/54` parent batch、6 rollout、1 epoch/18 steps；baseline 仅 direct GRPO，第二版增加 no-target Refusal Credit，第三版同时增加 hierarchical Mask Credit；三者均关闭 direct mask CE |
 | `tools/train_direct_grpo_only_baseline_1of10_3gpu.sh` / `tools/train_direct_grpo_only_refusal_credit_1of10_3gpu.sh` | 干净四卡对照：GPU0--2 训练、GPU3 启动 Llama 但不启用 DLC-QA；固定 1/10 数据、direct GRPO 正样本+no-target、`108/216` batch、1 epoch/18 steps，分别关闭或开启 Refusal Credit，Mask Credit 与 direct mask CE 均关闭
 | `tools/eval_direct_grpo_refusal_suite.sh` | 两版干净 direct-GRPO checkpoint 的串行评测编排；等待两个 `global_step_18` 后执行 HF 导出、RefCOCO、GroundingSuite 指标、GRES 全四项指标及 DLC-Bench 本地 Llama-3.1 8B 评分，完成后恢复 GPU0--3 占卡
@@ -2181,3 +2182,39 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 代码：新增 `tools/eval_direct_grpo_refusal_suite.sh`。
 - 行为：等待 baseline 与 Refusal Credit 两个 `global_step_18`，分别导出 HF 模型并执行 RefCOCO、GroundingSuite、GRES、DLC-Bench；GroundingSuite 显式写出 `groundingsuite_metrics.json`，GRES 保留 `T_acc`、`N_acc`、gIoU、cIoU 四项，DLC 评分固定使用本地 Llama-3.1 8B。任一阶段失败立即停止，全部完成后恢复 GPU0--3 占卡。
 - 验证：脚本通过 `bash -n`；未加载模型执行端到端评测。
+
+### 2026-09-13 - 拆分 cycle 与 direct 正样本 no-target 惩罚
+
+- 代码：更新 `verl/workers/opsd/config.py`、`verl/workers/fsdp_workers.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_pegc_ablation.sh`；新增 `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：保留 `positive_empty_mask_penalty` 作为兼容默认值，新增 `cycle_positive_empty_mask_penalty` 与 `direct_positive_empty_mask_penalty`。FSDP worker 按 `supervised_grounding*` source 将 penalty 分别应用到 direct grounding 或 cycle localization；新对照固定 cycle=1.0、direct=0.0，Evidence、Mask Credit、DLC-QA 和 1/10 数据配方不变。
+- 验证：探索分支配置 fallback/显式值断言通过；受影响 Python 文件 `py_compile`、launcher 与新训练脚本 `bash -n` 通过；尚未启动 GPU 训练或评测。
+
+### 2026-09-13 - 固化拆分惩罚实验的本机四卡入口
+
+- 代码：更新 `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：默认拓扑改为当前服务器 GPU0--2 训练、GPU3 启动本地 Llama judge，批大小调整为 `108/216/54`；8 卡服务器仍可通过 `TRAIN_GPU_LIST`、`TRAIN_NUM_GPUS`、`LLAMA_GPU` 覆盖，cycle/direct 惩罚值保持 `1.0/0.0`。
+- 验证：脚本通过 `bash -n`；训练尚未启动。
+
+### 2026-09-13 - 修正拆分惩罚入口启动提示
+
+- 代码：更新 `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：恢复 Llama judge 启动提示中的实际 GPU 编号显示；不改变 CUDA 绑定、惩罚拆分或训练参数。
+- 验证：脚本通过 `bash -n`。
+
+### 2026-09-13 - 恢复 judge GPU 提示变量
+
+- 代码：更新 `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：启动日志显示实际 `LLAMA_GPU` 编号，便于跨服务器确认 GPU 绑定。
+- 验证：`bash -n` 通过。
+
+### 2026-09-13 - 修复 branch launcher 的 conda 激活阻断
+
+- 代码：更新 `projects/rl/qwen3vl_4b_pegc_ablation.sh`。
+- 行为：训练入口跳过易受容器 CONDA_PREFIX/PATH 影响的 `conda activate`，直接使用 `/bin/python3` 与 `/bin/ray`，避免在 judge 健康后阻断 Ray 训练。
+- 验证：launcher 通过 `bash -n`；待重新启动训练验证。
+
+### 2026-09-13 - 缩短拆分惩罚实验 Ray 临时目录
+
+- 代码：更新 tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh。
+- 行为：将默认 RAY_SHORT_ROOT 改为 /dev/shm/pegc-cycle，满足 launcher 的绝对路径和 32 字符限制，避免 judge 加载后训练入口退出。
+- 验证：脚本通过 bash -n。

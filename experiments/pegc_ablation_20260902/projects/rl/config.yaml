@@ -80,6 +80,11 @@ worker:
       include_no_target: true
       warmup_start_step: 0
       warmup_end_step: 0
+    direct_source_balance:
+      enabled: false
+      positive_fraction: 0.5
+      min_weight: 0.5
+      max_weight: 2.0
     gradient_diagnostics:
       enabled: false
   opsd:
@@ -117,9 +122,12 @@ worker:
       # batch, then requires a decoded empty union. ``text`` checks SAMTok
       # fragments; ``official_bbox`` reproduces the public bbox-format proxy.
       no_target_reward_mode: text
+      no_target_empty_area_tau: 0.10
       # Deducted from a positive segmentation reward only when the response
       # refuses or decodes to zero pixels. Set 0.0 to disable.
       positive_empty_mask_penalty: 1.0
+      cycle_positive_empty_mask_penalty: null
+      direct_positive_empty_mask_penalty: null
     routing:
       enabled: true
       low_threshold: 0.5

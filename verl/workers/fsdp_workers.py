@@ -98,7 +98,13 @@ from .opsd import (
     extract_mask_token,
     mask_group_metadata,
     pixel_empty_reward,
-    positive_empty_mask_penalty,
+    combine_evidence_and_shapley,
+    evidence_weight_from_masks,
+    extract_code_positions,
+    mask_group_text,
+    ON_POLICY_DISTILL_ROUTE,
+    prepare_mask_image,
+    shapley_depth_credit,
 )
 
 class DirectResize:
@@ -595,7 +601,7 @@ class FSDPWorker(Worker):
 
         if role == "critic":
             AutoClass = AutoModelForTokenClassification
-        elif type(self.model_config) in AutoModelForImageTextToText._model_mapping.keys():
+        elif AutoModelForImageTextToText._model_mapping.get(type(self.model_config), None) is not None:
             AutoClass = AutoModelForImageTextToText
         else:
             AutoClass = AutoModelForCausalLM
@@ -1598,6 +1604,159 @@ class FSDPWorker(Worker):
             self.vq_sam2.to("cpu")
             torch.cuda.empty_cache()
 
+    def _compute_egca_sample_credit(
+        self,
+        *,
+        image,
+        target_mask: Optional[torch.Tensor],
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        response_text: str,
+        target_text: Optional[str],
+        source: str,
+        config,
+        pixel_config,
+        prepared_image=None,
+    ) -> tuple[dict[int, float], dict[str, object]]:
+        """Compute dynamic coarse/fine Shapley credit for one cycle response.
+
+        The method deliberately operates only on non-supervised cycle sources.
+        It decodes the sampled prefix and two legal counterfactual groups in a
+        single image-embedding batch, then maps separate credits to the actual
+        coarse/fine token positions.  No reward tensor is changed here.
+        """
+        if not config.enabled or source.startswith("supervised_") or target_mask is None:
+            return {}, {"valid": False, "groups": 0}
+        if not isinstance(image, (Image.Image, str, bytes, dict)):
+            return {}, {"valid": False, "groups": 0}
+        positions = extract_code_positions(
+            response_ids.detach().cpu(),
+            response_mask.detach().cpu(),
+            codebook_size=self.config.reward.codebook_size,
+            codebook_depth=self.config.reward.codebook_depth,
+        )
+        text_groups = re.findall(
+            r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>",
+            response_text,
+        )
+        if not positions or len(text_groups) != len(positions):
+            return {}, {"valid": False, "groups": 0}
+        codebook_size = int(self.config.reward.codebook_size)
+        reference_coarse = int(config.reference_coarse_code)
+        reference_fine = int(config.reference_fine_code)
+        if getattr(config, "reference_mode", "target") == "target" and isinstance(target_text, str):
+            target_groups = re.findall(
+                r"<\|mt_start\|><\|mt_(\d{4})\|><\|mt_(\d{4})\|><\|mt_end\|>",
+                target_text,
+            )
+            if target_groups:
+                target_coarse, target_fine = target_groups[0]
+                target_coarse = int(target_coarse)
+                target_fine = int(target_fine) - codebook_size
+                if 0 <= target_coarse < codebook_size and 0 <= target_fine < codebook_size:
+                    reference_coarse = target_coarse
+                    reference_fine = target_fine
+        groups = []
+        group_positions = []
+        for text_index, (coarse_global, fine_global) in enumerate(text_groups[: config.max_groups]):
+            coarse = int(coarse_global) - 0 * codebook_size
+            fine = int(fine_global) - 1 * codebook_size
+            if not (0 <= coarse < codebook_size and 0 <= fine < codebook_size):
+                continue
+            groups.append((coarse, fine))
+            group_positions.append(positions[text_index][1])
+        if not groups:
+            return {}, {"valid": False, "groups": 0}
+
+        # Every non-empty prefix and counterfactual is decoded together so the
+        # VQ-SAM2 image embedding is computed once for this sampled response.
+        requests: list[str] = []
+        request_keys: list[tuple[str, int, int]] = []
+        actual_group_texts = [mask_group_text(c, f, codebook_size=codebook_size) for c, f in groups]
+        for group_index, (coarse, fine) in enumerate(groups):
+            previous = "".join(actual_group_texts[:group_index])
+            current = previous + actual_group_texts[group_index]
+            coarse_cf = previous + mask_group_text(
+                coarse, reference_fine, codebook_size=codebook_size
+            )
+            fine_cf = previous + mask_group_text(
+                reference_coarse, fine, codebook_size=codebook_size
+            )
+            for kind, text in (("previous", previous), ("both", current), ("coarse", coarse_cf), ("fine", fine_cf)):
+                if text and text not in requests:
+                    requests.append(text)
+                request_keys.append((kind, group_index, requests.index(text) if text else -1))
+        if not requests:
+            return {}, {"valid": False, "groups": 0}
+        decoded, _ = decode_mask_tokens(
+            vq_sam2=self.vq_sam2,
+            image=image,
+            token_texts=requests,
+            codebook_size=codebook_size,
+            codebook_depth=self.config.reward.codebook_depth,
+            threshold=pixel_config.mask_threshold,
+            decode_batch_size=pixel_config.decode_batch_size,
+            decode_mode="union",
+            prepared_image=prepared_image,
+        )
+        decoded_by_request = {index: mask for index, mask in enumerate(decoded)}
+
+        def quality(mask: Optional[torch.Tensor]) -> float:
+            if target_mask is None or mask is None:
+                return 0.0
+            value = target_mask
+            if mask.shape != value.shape:
+                mask = torch.nn.functional.interpolate(
+                    mask[None, None].float(), size=value.shape, mode="nearest"
+                )[0, 0].bool()
+            return float(compute_binary_iou(value[None], mask[None])[0].item())
+
+        grouped: dict[int, dict[str, int]] = defaultdict(dict)
+        for kind, group_index, request_index in request_keys:
+            if request_index >= 0:
+                grouped[group_index][kind] = request_index
+        token_credit: dict[int, float] = {}
+        deltas: list[tuple[float, float]] = []
+        evidence_values: list[float] = []
+        for group_index, group_values in grouped.items():
+            previous_mask = decoded_by_request.get(group_values.get("previous", -1))
+            both_mask = decoded_by_request.get(group_values.get("both", -1))
+            coarse_mask = decoded_by_request.get(group_values.get("coarse", -1))
+            fine_mask = decoded_by_request.get(group_values.get("fine", -1))
+            v0 = quality(previous_mask)
+            vc = quality(coarse_mask)
+            vf = quality(fine_mask)
+            vcf = quality(both_mask)
+            coarse_credit, fine_credit = shapley_depth_credit(
+                v0, vc, vf, vcf, credit_clip=None
+            )
+            evidence = evidence_weight_from_masks(
+                target_mask,
+                both_mask,
+                min_weight=config.evidence_min_weight,
+                max_weight=config.evidence_max_weight,
+                false_positive_penalty=config.false_positive_penalty,
+            )
+            coarse_credit, fine_credit = combine_evidence_and_shapley(
+                coarse_credit,
+                fine_credit,
+                evidence,
+                credit_clip=config.credit_clip,
+            )
+            if group_index < len(group_positions):
+                coarse_position, fine_position = group_positions[group_index]
+                token_credit[coarse_position] = coarse_credit
+                token_credit[fine_position] = fine_credit
+            deltas.append((coarse_credit, fine_credit))
+            evidence_values.append(evidence)
+        return token_credit, {
+            "valid": bool(token_credit),
+            "groups": len(deltas),
+            "coarse_credit": [value[0] for value in deltas],
+            "fine_credit": [value[1] for value in deltas],
+            "evidence": evidence_values,
+        }
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_pixel_mask_ious(self, data: DataProto):
         """Decode localization mask tokens and attach candidate-level OPSD metadata."""
@@ -1605,6 +1764,15 @@ class FSDPWorker(Worker):
             raise RuntimeError("VQ-SAM2 mask decoder is not available.")
 
         response_ids = data.batch["responses"]
+        egca_token_credit = torch.zeros_like(response_ids, dtype=torch.float32, device="cpu")
+        egca_token_active = torch.zeros_like(response_ids, dtype=torch.bool, device="cpu")
+        egca_group_counts = np.zeros(len(data), dtype=np.int64)
+        egca_coarse_values = np.empty(len(data), dtype=object)
+        egca_fine_values = np.empty(len(data), dtype=object)
+        egca_evidence_values = np.empty(len(data), dtype=object)
+        egca_coarse_values[:] = None
+        egca_fine_values[:] = None
+        egca_evidence_values[:] = None
         response_lengths = torch.sum(data.batch["response_mask"], dim=-1)
         responses = []
         for index in range(len(data)):
@@ -1640,7 +1808,6 @@ class FSDPWorker(Worker):
         )
         target_tokens = np.array([extract_mask_token(text) for text in targets], dtype=object)
         reference_sources = np.full(len(data), "rollout_score", dtype=object)
-        positive_empty_penalties = np.zeros(len(data), dtype=np.float32)
         decoded_predictions = [None] * len(data)
         decoded_targets = {}
 
@@ -1664,6 +1831,13 @@ class FSDPWorker(Worker):
                 continue
             image = mm_data["images"][0]
             reference_sources[indices] = "decoded_target"
+            egca_prepared_image = None
+            if self.config.opsd.egca.enabled and any(
+                data.non_tensor_batch["source"][index]
+                not in {"supervised_grounding", "supervised_grounding_no_target"}
+                for index in indices
+            ):
+                egca_prepared_image = prepare_mask_image(vq_sam2=self.vq_sam2, image=image)
             # The target and each response may contain multiple legal groups.
             # decode_mask_tokens unions each response's decoded groups before IoU.
             texts = [targets[first], *[responses[index] for index in indices]]
@@ -1676,6 +1850,7 @@ class FSDPWorker(Worker):
                 threshold=pixel_config.mask_threshold,
                 decode_batch_size=pixel_config.decode_batch_size,
                 decode_mode=pixel_config.mask_decode_mode,
+                prepared_image=egca_prepared_image,
             )
             target_mask = decoded[0]
             if raw_gt_masks is not None and raw_gt_masks[first] is not None and pixel_config.prefer_raw_gt:
@@ -1699,12 +1874,30 @@ class FSDPWorker(Worker):
                     pixel_ious[data_index] = float(
                         compute_binary_iou(target_mask[None], prediction[None])[0].item()
                     )
-                positive_empty_penalties[data_index] = positive_empty_mask_penalty(
-                    target_mask,
-                    prediction,
-                    responses[data_index],
-                    pixel_config.positive_empty_mask_penalty,
-                )
+                egca_config = self.config.opsd.egca
+                if egca_config.enabled and data.non_tensor_batch["source"][data_index] not in {
+                    "supervised_grounding",
+                    "supervised_grounding_no_target",
+                }:
+                    credits, egca_meta = self._compute_egca_sample_credit(
+                        image=image,
+                        target_mask=target_mask,
+                        response_ids=response_ids[data_index],
+                        response_mask=data.batch["response_mask"][data_index],
+                        response_text=responses[data_index],
+                        target_text=str(targets[data_index]),
+                        source=str(data.non_tensor_batch["source"][data_index]),
+                        config=egca_config,
+                        pixel_config=pixel_config,
+                        prepared_image=egca_prepared_image,
+                    )
+                    for position, value in credits.items():
+                        egca_token_credit[data_index, position] = float(value)
+                        egca_token_active[data_index, position] = True
+                    egca_group_counts[data_index] = int(egca_meta.get("groups", 0))
+                    egca_coarse_values[data_index] = egca_meta.get("coarse_credit")
+                    egca_fine_values[data_index] = egca_meta.get("fine_credit")
+                    egca_evidence_values[data_index] = egca_meta.get("evidence")
 
         caption_groups = {}
         for index, uid in enumerate(caption_uids):
@@ -1733,6 +1926,12 @@ class FSDPWorker(Worker):
                 context["route"] = "grpo"
             if not routing.enabled:
                 context["route"] = "grpo"
+            elif routing.all_samples_opsd:
+                # Routing ablation: every eligible image cycle sample receives
+                # the OPSD privileged correction; do not classify by R_Ci.
+                # ``preserve_original_grpo`` independently controls whether
+                # the native CycleGRPO caption loss is also retained.
+                context["route"] = ON_POLICY_DISTILL_ROUTE
             for index in indices:
                 r_ci[index] = context["R_Ci"]
                 routes[index] = context["route"]
@@ -1748,12 +1947,17 @@ class FSDPWorker(Worker):
             [metadata["valid_group_count"] for metadata in response_mask_metadata], dtype=object
         )
         data.non_tensor_batch["pixel_iou"] = pixel_ious.astype(object)
-        data.non_tensor_batch["positive_empty_mask_penalty"] = positive_empty_penalties.astype(object)
         data.non_tensor_batch["mask_token_accuracy"] = pixel_ious.astype(object)
         data.non_tensor_batch["R_Ci"] = r_ci.astype(object)
         data.non_tensor_batch["route"] = routes
         data.non_tensor_batch["iou_reference"] = reference_sources
         data.non_tensor_batch["privileged_context"] = privileged_contexts
+        data.batch["egca_token_credit"] = egca_token_credit
+        data.batch["egca_token_active"] = egca_token_active
+        data.non_tensor_batch["egca_group_count"] = egca_group_counts.astype(object)
+        data.non_tensor_batch["egca_coarse_credit"] = egca_coarse_values
+        data.non_tensor_batch["egca_fine_credit"] = egca_fine_values
+        data.non_tensor_batch["egca_evidence_weight"] = egca_evidence_values
         return data
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1801,11 +2005,7 @@ class FSDPWorker(Worker):
                 decode_mode=pixel_config.mask_decode_mode,
             )
             for data_index, prediction in zip(indices, decoded):
-                rewards[data_index] = pixel_empty_reward(
-                    prediction,
-                    responses[data_index],
-                    pixel_config.no_target_nonempty_mask_penalty,
-                )
+                rewards[data_index] = pixel_empty_reward(prediction, responses[data_index])
 
         data.non_tensor_batch["no_target_pixel_empty"] = rewards
         data.non_tensor_batch["no_target_reward_mode"] = np.full(
@@ -2095,6 +2295,32 @@ class FSDPWorker(Worker):
                 data=data,
                 grad_weight=grad_weight,
                 metric_name="supervised_anchors/direct_mask_ce_loss",
+            )
+            output = DataProto(
+                non_tensor_batch={
+                    key: np.array([value] if np.isscalar(value) else value)
+                    for key, value in metrics.items()
+                }
+            )
+        return output.to("cpu")
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def accumulate_egca_weighted_self_distill_gradients(self, data: DataProto):
+        """Accumulate rollout-weighted GT CE on the independent EGCA path."""
+        assert self._has_actor
+        grad_weight = data.meta_info.get("grad_weight", 1.0)
+        self._process_multi_modal_inputs(data)
+        data = data.to(torch.cuda.current_device())
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+        if self._use_optimizer_offload:
+            load_fsdp_optimizer(optimizer=self.optimizer)
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            metrics = self.actor.update_supervised(
+                data=data,
+                grad_weight=grad_weight,
+                metric_name="opsd/egca_weighted_self_distill_loss",
             )
             output = DataProto(
                 non_tensor_batch={

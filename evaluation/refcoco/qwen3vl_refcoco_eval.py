@@ -36,6 +36,12 @@ class DirectResize:
 
 CYCLEGRPO_LEGACY_PROTOCOL = "cyclegrpo_legacy"
 REFCOCO_MASK_PROTOCOLS = (*MASK_PROTOCOLS, CYCLEGRPO_LEGACY_PROTOCOL)
+DEFAULT_REFCOCO_PROMPT_TEMPLATE = (
+    "The referring expression below describes an object that is present in the image. "
+    "Locate and segment exactly that object. Do not answer \"No target\", \"null\", or refuse. "
+    "Output only one mask group in this format: "
+    "<|mt_start|><|mt_XXXX|><|mt_XXXX|><|mt_end|>. Expression: {phrase}"
+)
 
 
 def parse_args():
@@ -57,6 +63,11 @@ def parse_args():
         type=int,
         default=256,
         help="Maximum generated RefCOCO response tokens (default: 256).",
+    )
+    parser.add_argument(
+        "--prompt_template",
+        default=DEFAULT_REFCOCO_PROMPT_TEMPLATE,
+        help="User prompt template; must contain the {phrase} placeholder.",
     )
     parser.add_argument("--metric_only", action="store_true")
     return parser.parse_args()
@@ -124,12 +135,16 @@ def parse_mask_codes(text: str, mask_protocol: str) -> list[list[int]]:
     return parse_mask_groups(text, codebook_size=256, protocol=mask_protocol)
 
 
-def has_matching_protocol(path: str, mask_protocol: str) -> bool:
+def has_matching_protocol(path: str, mask_protocol: str, prompt_template: str) -> bool:
     if not os.path.exists(path):
         return False
     try:
         with open(path, "r") as file:
-            return json.load(file).get("mask_protocol") == mask_protocol
+            record = json.load(file)
+            return (
+                record.get("mask_protocol") == mask_protocol
+                and record.get("prompt_template") == prompt_template
+            )
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -179,6 +194,8 @@ def main():
         raise ValueError("batch_size must be positive.")
     if args.max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive.")
+    if "{phrase}" not in args.prompt_template:
+        raise ValueError("prompt_template must contain the {phrase} placeholder.")
 
     gpu_id = args.task_id if args.gpu_id < 0 else args.gpu_id
     torch.cuda.set_device(gpu_id)
@@ -218,7 +235,9 @@ def main():
         sample
         for sample in samples
         if not has_matching_protocol(
-            os.path.join(args.save_dir, f"{sample['case_id']}.json"), args.mask_protocol
+            os.path.join(args.save_dir, f"{sample['case_id']}.json"),
+            args.mask_protocol,
+            args.prompt_template,
         )
     ]
     eos_token_id = None if cyclegrpo_legacy else generation_eos_token_id(model, processor, args.mask_protocol)
@@ -230,7 +249,10 @@ def main():
                     "role": "user",
                     "content": [
                         {"type": "image", "image": sample["image_path"]},
-                        {"type": "text", "text": f"Please segment {sample['phrase']} in this image."},
+                        {
+                            "type": "text",
+                            "text": args.prompt_template.format(phrase=sample["phrase"]),
+                        },
                     ],
                 }
             ]
@@ -279,6 +301,7 @@ def main():
                         "prediction": encode_rle(prediction),
                         "response": response,
                         "mask_protocol": args.mask_protocol,
+                        "prompt_template": args.prompt_template,
                         "mask_group_count": complete_mask_group_count(response),
                         "raw_mask_token_count": cyclegrpo_legacy_raw_mask_token_count(response),
                         "decoded_mask_group_count": len(codes),

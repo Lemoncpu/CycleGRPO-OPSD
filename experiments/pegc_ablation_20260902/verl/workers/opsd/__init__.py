@@ -12,6 +12,7 @@ from .mask_iou import (
     mask_summary,
     parse_mask_codes,
     pixel_empty_reward,
+    pixel_empty_iou_reward,
     positive_empty_mask_penalty,
     hierarchical_mask_token_weights,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "mask_summary",
     "parse_mask_codes",
     "pixel_empty_reward",
+    "pixel_empty_iou_reward",
     "positive_empty_mask_penalty",
     "hierarchical_mask_token_weights",
     "regenerate_weight",

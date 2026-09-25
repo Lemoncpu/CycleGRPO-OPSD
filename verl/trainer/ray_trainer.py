@@ -50,17 +50,20 @@ from ..workers.reward import FunctionRewardManager
 from ..workers.opsd import (
     caption_safety_reason,
     build_privileged_teacher_images,
+    contrastive_token_credit,
     distillation_weight,
+    egca_opd_weight,
     format_privileged_prompt,
     hierarchical_mask_token_weights,
+    nonnegative_mask_group_token_weights,
     regenerate_weight,
+    self_supervised_evidence_weight,
     spatial_evidence_weight,
     teacher_caption_is_safe,
     uses_original_grpo,
 )
 from ..workers.supervised_anchors import (
     aligned_direct_prompt_count,
-    allowed_direct_supervision_sources,
     direct_grounding_loss_weight,
     direct_mask_ce_response_fields,
     direct_mask_ce_source,
@@ -1079,6 +1082,69 @@ class RayPPOTrainer:
         direct_batch.non_tensor_batch["direct_grounding"] = np.ones(len(direct_batch), dtype=object)
         return direct_batch
 
+    def _make_main_no_target_segmentation_batch(
+        self, parent_batch: DataProto, dataset: Optional[Any] = None
+    ) -> Optional[DataProto]:
+        """Roll out main-parquet no-target queries as segmentation groups.
+
+        ``pixel_empty`` is a mask-space refusal signal, so these rows must not
+        be trained through the caption policy.  Keep one parent row per UID,
+        then use the normal localization prompt and segmentation GRPO path.
+        """
+        if parent_batch is None or len(parent_batch) == 0:
+            return None
+        queries = parent_batch.non_tensor_batch.get("grounding_query")
+        if queries is None:
+            raise ValueError("pixel_empty no-target rows require grounding_query metadata.")
+        seen_uids: set[str] = set()
+        indices: list[int] = []
+        query_values: list[str] = []
+        for index, (uid, source, query) in enumerate(
+            zip(parent_batch.non_tensor_batch["uid"], parent_batch.non_tensor_batch["source"], queries)
+        ):
+            if source != "gres_no_target" or str(uid) in seen_uids:
+                continue
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("pixel_empty no-target rows require non-empty grounding_query values.")
+            seen_uids.add(str(uid))
+            indices.append(index)
+            query_values.append(query.strip())
+        if not indices:
+            return None
+        rollout_count = self.config.worker.opsd.localization_rollouts
+        group_align = self.actor_rollout_ref_wg.world_size // math.gcd(
+            rollout_count, self.actor_rollout_ref_wg.world_size
+        )
+        aligned_count = (len(indices) // group_align) * group_align
+        if aligned_count == 0:
+            print(
+                "[main_no_target_segmentation] skip "
+                f"{len(indices)} prompts; none align to world_size={self.actor_rollout_ref_wg.world_size}."
+            )
+            return None
+        if aligned_count != len(indices):
+            print(
+                f"[main_no_target_segmentation] trim prompts {len(indices)}->{aligned_count} "
+                f"(world_size={self.actor_rollout_ref_wg.world_size})"
+            )
+            indices = indices[:aligned_count]
+            query_values = query_values[:aligned_count]
+        parent = parent_batch[indices]
+        _, segmentation_batch = self._make_seg_batch_data_for_caption(
+            parent,
+            rollout_count=rollout_count,
+            seg_problem_overrides=query_values,
+            source_overrides=["supervised_grounding_no_target"] * len(query_values),
+            localization_prompt_variant_overrides=localization_prompt_variants(
+                len(query_values), self.config.worker.opsd.pixel_iou.localization_prompt_mode
+            ),
+            dataset=dataset,
+        )
+        segmentation_batch.non_tensor_batch["main_no_target_segmentation"] = np.ones(
+            len(segmentation_batch), dtype=object
+        )
+        return segmentation_batch
+
     def _make_direct_mask_ce_batch(
         self, cycle_batch: DataProto, dataset: Optional[Any] = None
     ) -> Optional[DataProto]:
@@ -1241,6 +1307,216 @@ class RayPPOTrainer:
             meta_info=dict(cycle_batch.meta_info),
         )
 
+    def _make_egca_weighted_self_distill_batch(
+        self, cycle_seg_batch: DataProto, dataset: Optional[Any] = None
+    ) -> Optional[DataProto]:
+        """Build a detached, rollout-weighted GT mask self-distillation batch.
+
+        EGCA evidence is measured on the sampled localization trajectories, but
+        the update target is the validated ``seg_ground_truth`` sequence from
+        the same self-supervised prompt.  This keeps exploration/reward and
+        teacher-forcing in separate gradient paths: a bad rollout lowers its
+        non-negative weight, while it can never inject a signed refusal
+        advantage.  No-target and externally supervised rows are excluded.
+        """
+        config = self.config.worker.opsd.egca
+        if (
+            not config.enabled
+            or config.update_mode != "weighted_ce"
+            or cycle_seg_batch is None
+            or len(cycle_seg_batch) == 0
+            or "sample_uid" not in cycle_seg_batch.non_tensor_batch
+            or "seg_ground_truth" not in cycle_seg_batch.non_tensor_batch
+            or not any(
+                key in cycle_seg_batch.non_tensor_batch
+                for key in ("seg_multi_modal_data", "multi_modal_data")
+            )
+        ):
+            return None
+
+        grouped: dict[str, list[int]] = defaultdict(list)
+        for index, uid in enumerate(cycle_seg_batch.non_tensor_batch["sample_uid"]):
+            source = str(cycle_seg_batch.non_tensor_batch["source"][index])
+            if source == "gres_no_target" or source.startswith("supervised_"):
+                continue
+            grouped[str(uid)].append(index)
+        if not grouped:
+            return None
+        media_key = (
+            "seg_multi_modal_data"
+            if "seg_multi_modal_data" in cycle_seg_batch.non_tensor_batch
+            else "multi_modal_data"
+        )
+
+        selected = []
+        egca_group_count_values = cycle_seg_batch.non_tensor_batch.get(
+            "egca_group_count", np.zeros(len(cycle_seg_batch), dtype=np.float32)
+        )
+        for uid, indices in grouped.items():
+            group_counts = np.asarray(
+                [float(egca_group_count_values[i]) for i in indices]
+            )
+            if not np.any(group_counts > 0):
+                # A no-mask rollout has no valid token-level evidence and must
+                # not become a teacher target merely because GT is available.
+                continue
+            pixel_values = np.asarray(
+                [float(cycle_seg_batch.non_tensor_batch["pixel_iou"][i]) for i in indices],
+                dtype=np.float32,
+            )
+            evidence_values = []
+            coarse_values = []
+            fine_values = []
+            for i in indices:
+                evidence = cycle_seg_batch.non_tensor_batch.get("egca_evidence_weight", [None])[i]
+                coarse = cycle_seg_batch.non_tensor_batch.get("egca_coarse_credit", [None])[i]
+                fine = cycle_seg_batch.non_tensor_batch.get("egca_fine_credit", [None])[i]
+                evidence_values.extend(float(value) for value in (evidence or []))
+                coarse_values.extend(max(0.0, float(value)) for value in (coarse or []))
+                fine_values.extend(max(0.0, float(value)) for value in (fine or []))
+            mean_iou = float(np.clip(np.mean(pixel_values), 0.0, 1.0))
+            mean_evidence = float(
+                np.clip(np.mean(evidence_values) if evidence_values else config.ce_min_weight, 0.0, 1.0)
+            )
+            quality = mean_iou * mean_evidence
+            sample_weight = config.ce_min_weight + (
+                config.ce_max_weight - config.ce_min_weight
+            ) * quality
+            parent_index = indices[int(np.argmax(pixel_values))]
+            selected.append(
+                {
+                    "uid": uid,
+                    "index": parent_index,
+                    "sample_weight": float(np.clip(sample_weight, 0.0, config.ce_max_weight)),
+                    "coarse": float(np.mean(coarse_values) if coarse_values else 0.0),
+                    "fine": float(np.mean(fine_values) if fine_values else 0.0),
+                }
+            )
+
+        aligned_count = aligned_direct_prompt_count(
+            len(selected), self.actor_rollout_ref_wg.world_size
+        )
+        if aligned_count == 0:
+            return None
+        selected = selected[:aligned_count]
+        dataset = dataset or self.train_dataloader.dataset
+        prompt_records = []
+        target_ids = []
+        selected_uids = []
+        sample_weights = []
+        coarse_scores = []
+        fine_scores = []
+        for item in selected:
+            index = int(item["index"])
+            seg_media = non_tensor_batch_row(
+                cycle_seg_batch.non_tensor_batch[media_key], index
+            )
+            target = non_tensor_batch_row(
+                cycle_seg_batch.non_tensor_batch["seg_ground_truth"], index
+            )
+            caption_values = cycle_seg_batch.non_tensor_batch.get("caption_text")
+            if caption_values is not None and isinstance(caption_values[index], str):
+                seg_problem = caption_values[index]
+            else:
+                response_len = int(cycle_seg_batch.batch["response_mask"][index].sum().item())
+                seg_problem = self.tokenizer.decode(
+                    cycle_seg_batch.batch["responses"][index][:response_len],
+                    skip_special_tokens=True,
+                )
+            example = {
+                "seg_problem": seg_problem.strip(),
+                "localization_prompt_variant": localization_prompt_variants(
+                    1, self.config.worker.opsd.pixel_iou.localization_prompt_mode
+                )[0],
+                "seg_ground_truth": target,
+                "source": str(cycle_seg_batch.non_tensor_batch["source"][index]),
+                "masks": non_tensor_batch_row(
+                    cycle_seg_batch.non_tensor_batch.get("raw_gt_mask", np.array([None] * len(cycle_seg_batch))),
+                    index,
+                ),
+                "cap_ground_truth": non_tensor_batch_row(
+                    cycle_seg_batch.non_tensor_batch.get("cap_ground_truth", np.array([None] * len(cycle_seg_batch))),
+                    index,
+                ),
+            }
+            if "images" in seg_media:
+                example["images"] = seg_media["images"]
+                example["cap_images"] = seg_media["images"]
+            elif "videos" in seg_media:
+                example["videos"] = seg_media["videos"]
+                example["nframes"] = seg_media.get("nframes")
+                example["cap_videos"] = seg_media["videos"]
+            else:
+                continue
+            record = dataset._gen_seg_preprocess(example)
+            prompt_records.append(record)
+            target_ids.append(
+                self.tokenizer.encode(record["seg_ground_truth"], add_special_tokens=False)
+            )
+            selected_uids.append(str(item["uid"]))
+            sample_weights.append(float(item["sample_weight"]))
+            coarse_scores.append(float(item["coarse"]))
+            fine_scores.append(float(item["fine"]))
+        if not prompt_records:
+            return None
+
+        eos_token_id = self.tokenizer.eos_token_id
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0]
+        if eos_token_id is None:
+            raise ValueError("EGCA weighted self-distillation requires tokenizer.eos_token_id.")
+        response_rows, response_mask_rows, response_attention_rows = direct_mask_ce_response_fields(
+            target_ids, int(eos_token_id), int(self.tokenizer.pad_token_id)
+        )
+        target_length = len(response_rows[0])
+        responses = torch.tensor(response_rows, dtype=torch.long)
+        response_masks = torch.tensor(response_mask_rows, dtype=torch.long)
+        response_attention_mask = torch.tensor(response_attention_rows, dtype=torch.long)
+        prompts = torch.stack([record["seg_input_ids"] for record in prompt_records])
+        prompt_attention_mask = torch.stack([record["seg_attention_mask"] for record in prompt_records])
+        prompt_position_ids = torch.stack([record["seg_position_ids"] for record in prompt_records])
+        input_ids = torch.cat([prompts, responses], dim=-1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=-1)
+        delta = torch.arange(1, target_length + 1).view(1, -1).expand(len(prompt_records), -1)
+        if prompt_position_ids.ndim == 3:
+            delta = delta.view(len(prompt_records), 1, -1).expand(
+                len(prompt_records), prompt_position_ids.size(1), -1
+            )
+        position_ids = torch.cat([prompt_position_ids, prompt_position_ids[..., -1:] + delta], dim=-1)
+        token_weights = nonnegative_mask_group_token_weights(
+            responses,
+            response_masks,
+            sample_weights=sample_weights,
+            coarse_scores=coarse_scores,
+            fine_scores=fine_scores,
+            codebook_size=self.config.worker.reward.codebook_size,
+            codebook_depth=self.config.worker.reward.codebook_depth,
+            token_credit_scale=config.ce_token_credit_scale,
+            token_weight_max=config.ce_token_weight_max,
+        )
+        return DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "response_mask": response_masks,
+                "position_ids": position_ids,
+                "sample_weight": torch.tensor(sample_weights, dtype=torch.float32),
+                "token_weight": token_weights,
+            },
+            non_tensors={
+                "multi_modal_data": np.array(
+                    [record["seg_multi_modal_data"] for record in prompt_records], dtype=object
+                ),
+                "uid": np.array(selected_uids, dtype=object),
+                "source": np.array(
+                    ["egca_weighted_self_distill"] * len(prompt_records), dtype=object
+                ),
+            },
+            meta_info=dict(cycle_seg_batch.meta_info),
+        )
+
     def _merge_pixel_iou_metadata(self, caption_batch: DataProto, segmentation_batch: DataProto) -> None:
         caption_uids = segmentation_batch.non_tensor_batch["caption_uid"]
         contexts = segmentation_batch.non_tensor_batch["privileged_context"]
@@ -1303,6 +1579,7 @@ class RayPPOTrainer:
         caption_batch.non_tensor_batch["caption_forced_regenerate"] = np.array(
             caption_forced_regenerate, dtype=object
         )
+
         for key in (
             "representative_mask",
             "best_mask",
@@ -1322,6 +1599,61 @@ class RayPPOTrainer:
         segmentation_batch.non_tensor_batch["route"] = np.array(
             [final_route_by_uid.get(str(uid), route) for uid, route in zip(caption_uids, segmentation_batch.non_tensor_batch["route"])],
             dtype=object,
+        )
+
+    def _apply_egca_advantage(self, batch: DataProto, metrics: dict[str, Any]) -> None:
+        """Route EGCA credit to cycle mask tokens without changing trajectory reward.
+
+        The raw Shapley values contain a common-mode trajectory component.  That
+        component is already represented by the GRPO advantage and, when added
+        a second time, can turn negative mask credit into a global refusal bias.
+        The default ``contrastive`` mode removes that component per response;
+        ``raw`` remains available only for explicit historical ablations.
+        """
+        config = self.config.worker.opsd.egca
+        credits = batch.batch.get("egca_token_credit")
+        if not config.enabled or credits is None:
+            return
+        valid_groups = np.asarray(
+            batch.non_tensor_batch.get("egca_group_count", np.zeros(len(batch))), dtype=float
+        )
+        active = int(np.sum(valid_groups > 0))
+        step = int(self.global_step)
+        if step < config.warmup_steps:
+            scale = 0.0
+        elif config.ramp_steps > 0:
+            scale = min(1.0, (step - config.warmup_steps + 1) / float(config.ramp_steps))
+        else:
+            scale = 1.0
+        effective_coef = float(config.actor_coef) * float(scale)
+        if effective_coef > 0.0 and active > 0:
+            credits_device = credits.to(
+                device=batch.batch["advantages"].device,
+                dtype=batch.batch["advantages"].dtype,
+            )
+            if config.credit_mode == "contrastive":
+                active_tokens = batch.batch.get("egca_token_active")
+                if active_tokens is None:
+                    # Checkpoint compatibility for batches produced before the
+                    # explicit active-position tensor was introduced.
+                    active_tokens = credits.abs() > 0
+                contrastive = contrastive_token_credit(
+                    credits_device,
+                    active_tokens.to(device=credits_device.device),
+                    batch.batch.get("response_mask", None),
+                )
+                credits_device = contrastive
+            batch.batch["advantages"] = batch.batch["advantages"] + credits_device * effective_coef
+        credit_values = credits.detach().abs()
+        metrics.update(
+            {
+                "opsd/egca_active_rollouts": active,
+                "opsd/egca_valid_group_count": int(np.sum(valid_groups)),
+                "opsd/egca_actor_coef_effective": effective_coef,
+                "opsd/egca_credit_mode_contrastive": float(config.credit_mode == "contrastive"),
+                "opsd/egca_credit_abs_mean": float(credit_values.mean().item()),
+                "opsd/egca_credit_nonzero_rate": float((credit_values > 0).float().mean().item()),
+            }
         )
 
     def _prepare_standalone_segmentation_advantage(
@@ -1374,6 +1706,14 @@ class RayPPOTrainer:
         """Score direct query-to-mask grounding without entering OPSD routing."""
         return self._prepare_standalone_segmentation_advantage(
             batch, metrics, timing_raw, name="direct_grounding"
+        )
+
+    def _prepare_main_no_target_segmentation_advantage(
+        self, batch: DataProto, metrics: dict[str, Any], timing_raw: dict[str, Any]
+    ) -> DataProto:
+        """Score main-parquet pixel-empty no-target localization rollouts."""
+        return self._prepare_standalone_segmentation_advantage(
+            batch, metrics, timing_raw, name="main_no_target_segmentation"
         )
 
     def _build_opsd_prompt_batch(
@@ -1650,7 +1990,7 @@ class RayPPOTrainer:
         if not mid_indices:
             return None, distill_metrics
         confidence_config = self.config.worker.opsd.teacher_confidence
-        if confidence_config.enabled:
+        if confidence_config.enabled and not self.config.worker.opsd.routing.all_samples_opsd:
             mid_indices = [
                 index
                 for index in mid_indices
@@ -1698,11 +2038,31 @@ class RayPPOTrainer:
             ],
             dtype=torch.float32,
         )
+        egca_config = self.config.worker.opsd.egca
         seca_config = self.config.worker.opsd.seca
-        if seca_config.enabled:
+        if egca_config.enabled and egca_config.opd_enabled:
             gates = torch.tensor(
                 [
-                    spatial_evidence_weight(
+                    egca_opd_weight(
+                        caption_batch.non_tensor_batch["privileged_context"][index],
+                        min_weight=egca_config.evidence_min_weight,
+                        max_weight=egca_config.evidence_max_weight,
+                        false_positive_penalty=egca_config.false_positive_penalty,
+                    )
+                    for index in mid_indices
+                ],
+                dtype=torch.float32,
+            )
+            weights = weights * gates
+            distill_metrics["opsd/egca_opd_evidence_weight_mean"] = float(gates.mean())
+            distill_metrics["opsd/egca_opd_evidence_active_count"] = int(gates.numel())
+        elif seca_config.enabled and (
+            seca_config.self_supervised_enabled
+            or self.config.worker.supervised_anchors.direct_mask_ce.enabled
+        ):
+            gates = torch.tensor(
+                [
+                    self_supervised_evidence_weight(
                         caption_batch.non_tensor_batch["privileged_context"][index],
                         min_weight=seca_config.min_weight,
                         max_weight=seca_config.max_weight,
@@ -1844,6 +2204,36 @@ class RayPPOTrainer:
                     cycle_batch, non_cycle_batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
 
+                main_no_target_parent = None
+                main_no_target_seg_batch = None
+                if (
+                    non_cycle_batch is not None
+                    and self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty"
+                ):
+                    sources = np.asarray(non_cycle_batch.non_tensor_batch["source"], dtype=object)
+                    if np.any(sources == "gres_no_target") and not self.config.worker.actor.optimize_segmenter:
+                        raise ValueError(
+                            "pixel_empty no-target training requires optimize_segmenter=true; "
+                            "no-target rows are segmentation rollouts, not caption rollouts."
+                        )
+                    no_target_indices = []
+                    remaining_indices = []
+                    seen_uids: set[str] = set()
+                    for index, (uid, source) in enumerate(
+                        zip(non_cycle_batch.non_tensor_batch["uid"], sources)
+                    ):
+                        if source == "gres_no_target":
+                            if str(uid) not in seen_uids:
+                                seen_uids.add(str(uid))
+                                no_target_indices.append(index)
+                        else:
+                            remaining_indices.append(index)
+                    if no_target_indices:
+                        main_no_target_parent = non_cycle_batch[no_target_indices]
+                        non_cycle_batch = (
+                            non_cycle_batch[remaining_indices] if remaining_indices else None
+                        )
+
                 # balance the number of valid tokens on each dp rank.
                 # NOTE: this breaks the order of data inside the batch.
                 # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -1859,24 +2249,6 @@ class RayPPOTrainer:
                     cycle_batch.meta_info["global_token_num"] = torch.sum(cycle_batch.batch["attention_mask"], dim=-1).tolist()
 
                 if non_cycle_batch is not None:
-                    non_cycle_sources = np.asarray(non_cycle_batch.non_tensor_batch["source"], dtype=object)
-                    if (
-                        self.config.worker.opsd.pixel_iou.no_target_reward_mode == "pixel_empty"
-                        and np.any(non_cycle_sources == "gres_no_target")
-                    ):
-                        # Match public CycleGRPO's dataflow: GRES no-target rows
-                        # remain caption-only non-cycle rollouts. Pixel decoding
-                        # only supplies their strict reward metadata.
-                        with timer("main_no_target_pixel_empty", timing_raw):
-                            self.actor_rollout_ref_wg.prepare_mask_decoder()
-                            non_cycle_batch = self.actor_rollout_ref_wg.compute_no_target_pixel_empty(
-                                non_cycle_batch
-                            )
-                            self.actor_rollout_ref_wg.release_mask_decoder()
-                        metrics["opsd/main_no_target_non_cycle_rollouts"] = int(
-                            np.sum(non_cycle_sources == "gres_no_target")
-                        )
-
                     if "token_level_scores" not in non_cycle_batch.batch:
                         with timer("reward", timing_raw):
                             reward_ref = self.reward_fn.compute_reward.remote(self.global_step, non_cycle_batch, task='caption')
@@ -1940,6 +2312,7 @@ class RayPPOTrainer:
                 regenerate_batch = None
                 distillation_batch = None
                 seg_batch = None
+                egca_self_distill_batch = None
                 direct_grounding_batch = None
                 direct_mask_ce_batch = None
                 caption_qa_batch = None
@@ -1953,31 +2326,33 @@ class RayPPOTrainer:
                     direct_sources = set(map(str, direct_parent_batch.non_tensor_batch["source"]))
                     direct_grounding_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_mask_ce_config = self.config.worker.supervised_anchors.direct_mask_ce
-                    allowed_direct_sources = allowed_direct_supervision_sources(
-                        include_positive_sources=(
+                    allowed_direct_sources = set()
+                    if (
+                        (
                             direct_grounding_config.enabled
                             and direct_grounding_config.include_positive_sources
                         )
                         or (
                             direct_mask_ce_config.enabled
                             and direct_mask_ce_config.include_positive_sources
-                        ),
-                        include_no_target=(
+                        )
+                    ):
+                        allowed_direct_sources.add("refcoco_cycle")
+                    if (
+                        (
                             direct_grounding_config.enabled
                             and direct_grounding_config.include_no_target
                         )
                         or (
                             direct_mask_ce_config.enabled
                             and direct_mask_ce_config.include_no_target
-                        ),
-                        include_label_sources=(
-                            direct_grounding_config.enabled
-                            and direct_grounding_config.include_label_sources
-                        ),
-                    )
+                        )
+                    ):
+                        allowed_direct_sources.add("gres_no_target")
                     if not direct_sources or not direct_sources.issubset(allowed_direct_sources):
                         raise ValueError(
-                            "Direct supervision data may contain only enabled direct source families; "
+                            "Direct supervision data may contain only enabled human-expression sources "
+                            "refcoco_cycle and gres_no_target; "
                             f"allowed={sorted(allowed_direct_sources)}, got={sorted(direct_sources)}."
                         )
                 if cycle_batch is not None and (
@@ -2004,6 +2379,15 @@ class RayPPOTrainer:
                                 )
                             self.actor_rollout_ref_wg.release_mask_decoder()
                             self._merge_pixel_iou_metadata(cycle_cap_batch, cycle_seg_batch)
+                            if self.config.worker.opsd.egca.enabled:
+                                egca_self_distill_batch = self._make_egca_weighted_self_distill_batch(
+                                    cycle_seg_batch
+                                )
+                                metrics["opsd/egca_weighted_self_distill_samples"] = int(
+                                    len(egca_self_distill_batch)
+                                    if egca_self_distill_batch is not None
+                                    else 0
+                                )
                             route_values = list(cycle_cap_batch.non_tensor_batch["route"])
                             for route_name in ("regenerate", "on_policy_distill", "grpo"):
                                 metrics[f"opsd/route_{route_name}_count"] = route_values.count(route_name)
@@ -2092,6 +2476,30 @@ class RayPPOTrainer:
                                 cycle_cap_batch
                             )
                             metrics.update(regenerate_metrics)
+
+                if main_no_target_parent is not None:
+                    with timer("main_no_target_segmentation_gen", timing_raw):
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        main_no_target_seg_batch = self._make_main_no_target_segmentation_batch(
+                            main_no_target_parent
+                        )
+                        self.actor_rollout_ref_wg.release_rollout_engine()
+                    if main_no_target_seg_batch is not None:
+                        metrics["opsd/main_no_target_segmentation_prompts"] = (
+                            len(main_no_target_seg_batch)
+                            // self.config.worker.opsd.localization_rollouts
+                        )
+                        if self.config.worker.opsd.enabled and self.config.worker.opsd.pixel_iou.enabled:
+                            with timer("main_no_target_pixel_empty", timing_raw):
+                                self.actor_rollout_ref_wg.prepare_mask_decoder()
+                                main_no_target_seg_batch = self.actor_rollout_ref_wg.compute_no_target_pixel_empty(
+                                    main_no_target_seg_batch
+                                )
+                                self.actor_rollout_ref_wg.release_mask_decoder()
+                        else:
+                            raise RuntimeError(
+                                "pixel_empty main no-target segmentation requires OPSD pixel-IoU decoding."
+                            )
 
                 # External grounding supervision is intentionally sourced only
                 # from its own RefCOCO loader, never from the 20k CycleGRPO mix.
@@ -2298,6 +2706,10 @@ class RayPPOTrainer:
                                 gamma=self.config.algorithm.gamma,
                                 lam=self.config.algorithm.lam,
                             )
+                            if self.config.worker.opsd.egca.update_mode == "legacy_advantage":
+                                self._apply_egca_advantage(cycle_seg_batch, metrics)
+                            elif self.config.worker.opsd.egca.enabled:
+                                metrics["opsd/egca_actor_advantage_injection"] = 0.0
                             if (
                                 self.config.worker.opsd.segmentation_anchor_kl_coef > 0
                                 and self.use_reference_policy
@@ -2326,6 +2738,12 @@ class RayPPOTrainer:
                     self.actor_rollout_ref_wg.clear_multi_modal_cache()
 
                     seg_batch = cycle_seg_batch
+
+                if main_no_target_seg_batch is not None:
+                    main_no_target_seg_batch = self._prepare_main_no_target_segmentation_advantage(
+                        main_no_target_seg_batch, metrics, timing_raw
+                    )
+                    metrics["opsd/main_no_target_segmentation_rollouts"] = len(main_no_target_seg_batch)
 
                 if direct_grounding_batch is not None and self.config.worker.actor.optimize_segmenter:
                     direct_grounding_batch = self._prepare_direct_grounding_advantage(
@@ -2380,8 +2798,6 @@ class RayPPOTrainer:
                         "iou_std",
                         "iou_min",
                         "iou_max",
-                        "no_target_pixel_empty",
-                        "no_target_reward_mode",
                     )
                     for key in concat_only_metadata:
                         non_cycle_batch.non_tensor_batch.pop(key, None)
@@ -2398,13 +2814,41 @@ class RayPPOTrainer:
                     # Case 1: Both tasks - Use gradient accumulation for cap_batch and seg_batch
                     cap_batch_size = len(cap_batch) if cap_batch is not None else 0
                     seg_batch_size = len(seg_batch) if seg_batch is not None else 0
+                    main_no_target_seg_size = (
+                        len(main_no_target_seg_batch) if main_no_target_seg_batch is not None else 0
+                    )
                     direct_grounding_size = len(direct_grounding_batch) if direct_grounding_batch is not None else 0
                     direct_mask_ce_size = len(direct_mask_ce_batch) if direct_mask_ce_batch is not None else 0
+                    egca_self_distill_size = (
+                        len(egca_self_distill_batch) if egca_self_distill_batch is not None else 0
+                    )
                     caption_qa_size = len(caption_qa_batch) if caption_qa_batch is not None else 0
+                    total_size = (
+                        cap_batch_size
+                        + seg_batch_size
+                        + main_no_target_seg_size
+                        + direct_grounding_size
+                        + direct_mask_ce_size
+                        + caption_qa_size
+                    )
                     
                     cap_grad_weight = self.config.worker.opsd.caption_loss_weight
                     seg_grad_weight = self.config.worker.opsd.localization_loss_weight
-                    cycle_seg_grad_weight = seg_grad_weight if seg_batch_size > 0 else 0.0
+                    total_segmentation_size = seg_batch_size + main_no_target_seg_size
+                    cycle_seg_grad_weight = (
+                        seg_grad_weight * seg_batch_size / total_segmentation_size
+                        if total_segmentation_size > 0
+                        else 0.0
+                    )
+                    main_no_target_seg_grad_weight = (
+                        seg_grad_weight * main_no_target_seg_size / total_segmentation_size
+                        if total_segmentation_size > 0
+                        else 0.0
+                    )
+                    main_no_target_seg_base_grad_weight = main_no_target_seg_grad_weight
+                    main_no_target_seg_grad_weight *= (
+                        self.config.worker.opsd.no_target_segmentation_loss_weight
+                    )
                     direct_config = self.config.worker.supervised_anchors.direct_grounding
                     direct_target_weight = direct_config.loss_weight if direct_config.enabled else 0.0
                     direct_grad_weight = direct_grounding_loss_weight(
@@ -2424,8 +2868,28 @@ class RayPPOTrainer:
                         if direct_mask_ce_config.enabled
                         else 0.0
                     )
+                    egca_config = self.config.worker.opsd.egca
+                    if self.global_step < egca_config.warmup_steps:
+                        egca_ce_weight = 0.0
+                    elif egca_config.ramp_steps > 0:
+                        egca_ce_weight = egca_config.ce_loss_weight * min(
+                            1.0,
+                            (self.global_step - egca_config.warmup_steps + 1)
+                            / float(egca_config.ramp_steps),
+                        )
+                    else:
+                        egca_ce_weight = egca_config.ce_loss_weight
                     metrics.update(
                         {
+                            "opsd/main_no_target_segmentation_loss_weight_target": (
+                                self.config.worker.opsd.no_target_segmentation_loss_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_base": (
+                                main_no_target_seg_base_grad_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_effective": (
+                                main_no_target_seg_grad_weight
+                            ),
                             "opsd/cycle_segmentation_loss_weight_effective": cycle_seg_grad_weight,
                             "supervised_anchors/direct_loss_weight_effective": direct_grad_weight,
                             "supervised_anchors/direct_loss_weight_target": direct_target_weight,
@@ -2436,6 +2900,8 @@ class RayPPOTrainer:
                             ),
                             "supervised_anchors/direct_mask_ce_weight_effective": direct_ce_weight,
                             "supervised_anchors/direct_mask_ce_samples": direct_mask_ce_size,
+                            "opsd/egca_weighted_self_distill_weight": egca_ce_weight,
+                            "opsd/egca_weighted_self_distill_samples": egca_self_distill_size,
                             "supervised_anchors/caption_qa_loss_weight": (
                                 self.config.worker.supervised_anchors.caption_qa.loss_weight
                                 if self.config.worker.supervised_anchors.caption_qa.enabled
@@ -2582,6 +3048,26 @@ class RayPPOTrainer:
                                 actor_metrics.update({f"seg_{k}": v for k, v in reduce_metrics(seg_output.non_tensor_batch).items()})
                                 capture_multitask_gradient_component("cycle_segmentation")
 
+                            if main_no_target_seg_batch is not None and main_no_target_seg_size > 0:
+                                main_no_target_seg_batch.meta_info["grad_weight"] = (
+                                    main_no_target_seg_grad_weight
+                                )
+                                main_no_target_seg_batch.meta_info["global_batch_size_per_device"] = (
+                                    len(main_no_target_seg_batch) // self.actor_rollout_ref_wg.world_size
+                                )
+                                main_no_target_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(
+                                    main_no_target_seg_batch
+                                )
+                                actor_metrics.update(
+                                    {
+                                        f"main_no_target_seg_{key}": value
+                                        for key, value in reduce_metrics(
+                                            main_no_target_output.non_tensor_batch
+                                        ).items()
+                                    }
+                                )
+                                capture_multitask_gradient_component("main_no_target_segmentation")
+
                             if direct_grounding_batch is not None and direct_grounding_size > 0:
                                 direct_grounding_batch.meta_info["grad_weight"] = direct_grad_weight
                                 direct_grounding_batch.meta_info["global_batch_size_per_device"] = (
@@ -2597,6 +3083,39 @@ class RayPPOTrainer:
                                     }
                                 )
                                 capture_multitask_gradient_component("direct_grpo")
+
+                            if egca_self_distill_batch is not None and egca_self_distill_size > 0:
+                                egca_batch, egca_pad = pad_dataproto_to_divisor(
+                                    egca_self_distill_batch,
+                                    self.actor_rollout_ref_wg.world_size
+                                    * self.config.worker.actor.micro_batch_size_per_device_for_update,
+                                )
+                                if egca_pad:
+                                    egca_batch.batch["sample_weight"][-egca_pad:] = 0.0
+                                self._balance_batch(
+                                    egca_batch,
+                                    metrics=metrics,
+                                    logging_prefix="egca_weighted_self_distill_seqlen",
+                                )
+                                egca_batch.meta_info["global_token_num"] = torch.sum(
+                                    egca_batch.batch["attention_mask"], dim=-1
+                                ).tolist()
+                                egca_batch.meta_info["grad_weight"] = egca_ce_weight
+                                egca_batch.meta_info["global_batch_size_per_device"] = (
+                                    len(egca_batch) // self.actor_rollout_ref_wg.world_size
+                                )
+                                egca_output = self.actor_rollout_ref_wg.accumulate_egca_weighted_self_distill_gradients(
+                                    egca_batch
+                                )
+                                actor_metrics.update(
+                                    {
+                                        f"egca_{key}": value
+                                        for key, value in reduce_metrics(
+                                            egca_output.non_tensor_batch
+                                        ).items()
+                                    }
+                                )
+                                capture_multitask_gradient_component("egca_weighted_self_distill")
 
                             if direct_ce_cosine_enabled:
                                 # Include DLC-QA and other caption auxiliaries in the measured non-CE base.
@@ -2672,13 +3191,35 @@ class RayPPOTrainer:
                 elif self.config.worker.actor.optimize_segmenter and not self.config.worker.actor.optimize_captioner:
                     segmenter_loss_weight = self.config.worker.opsd.localization_loss_weight
                     current_seg_size = len(seg_batch) if seg_batch is not None else 0
+                    current_no_target_size = (
+                        len(main_no_target_seg_batch) if main_no_target_seg_batch is not None else 0
+                    )
+                    current_total_seg_size = current_seg_size + current_no_target_size
                     cycle_seg_grad_weight = (
-                        segmenter_loss_weight
-                        if current_seg_size > 0
+                        segmenter_loss_weight * current_seg_size / current_total_seg_size
+                        if current_total_seg_size > 0
                         else 0.0
+                    )
+                    main_no_target_seg_grad_weight = (
+                        segmenter_loss_weight * current_no_target_size / current_total_seg_size
+                        if current_total_seg_size > 0
+                        else 0.0
+                    )
+                    main_no_target_seg_base_grad_weight = main_no_target_seg_grad_weight
+                    main_no_target_seg_grad_weight *= (
+                        self.config.worker.opsd.no_target_segmentation_loss_weight
                     )
                     metrics.update(
                         {
+                            "opsd/main_no_target_segmentation_loss_weight_target": (
+                                self.config.worker.opsd.no_target_segmentation_loss_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_base": (
+                                main_no_target_seg_base_grad_weight
+                            ),
+                            "opsd/main_no_target_segmentation_loss_weight_effective": (
+                                main_no_target_seg_grad_weight
+                            ),
                             "opsd/cycle_segmentation_loss_weight_effective": cycle_seg_grad_weight,
                         }
                     )
@@ -2695,6 +3236,20 @@ class RayPPOTrainer:
                                 actor_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(seg_batch)
                                 actor_metrics.update(
                                     {f"seg_{k}": v for k, v in reduce_metrics(actor_output.non_tensor_batch).items()}
+                                )
+                            if main_no_target_seg_batch is not None and len(main_no_target_seg_batch) > 0:
+                                main_no_target_seg_batch.meta_info["grad_weight"] = main_no_target_seg_grad_weight
+                                main_no_target_seg_batch.meta_info["global_batch_size_per_device"] = (
+                                    len(main_no_target_seg_batch) // self.actor_rollout_ref_wg.world_size
+                                )
+                                main_output = self.actor_rollout_ref_wg.accumulate_actor_gradients(
+                                    main_no_target_seg_batch
+                                )
+                                actor_metrics.update(
+                                    {
+                                        f"main_no_target_seg_{k}": v
+                                        for k, v in reduce_metrics(main_output.non_tensor_batch).items()
+                                    }
                                 )
                             opt_output = self.actor_rollout_ref_wg.step_actor_optimizer()
                             if opt_output and hasattr(opt_output[0], "non_tensor_batch"):

@@ -80,6 +80,8 @@ worker:
     localization_rollouts: 6
     caption_loss_weight: 0.5
     localization_loss_weight: 0.5
+    # Historical main-parquet pixel-empty no-target segmentation actor scale.
+    no_target_segmentation_loss_weight: 1.0
     caption_anchor_kl_coef: 0.0
     caption_anchor_kl_all_safe_routes: false
     segmentation_anchor_kl_coef: 0.0
@@ -106,20 +108,17 @@ worker:
       # ``mixed`` alternates RefCOCO/GroundingSuite wording; ``refcoco`` makes
       # every image localization prompt use the RefCOCO instruction.
       localization_prompt_mode: mixed
-      # ``pixel_empty`` keeps no-target rows in the caption-only non-cycle
-      # batch, then requires a decoded empty union. ``text`` checks SAMTok
+      # ``pixel_empty`` decodes all legal groups and rewards an empty union,
+      # matching the historical gRefCOCO N_acc signal. ``text`` checks SAMTok
       # fragments; ``official_bbox`` reproduces the public bbox-format proxy.
       no_target_reward_mode: text
-      # Deducted from a positive segmentation reward only when the response
-      # refuses or decodes to zero pixels. Set 0.0 to disable.
-      positive_empty_mask_penalty: 1.0
-      # In pixel_empty mode, decoded nonempty no-target masks receive this
-      # negative reward. Set 0.0 to retain the pre-penalty zero reward.
-      no_target_nonempty_mask_penalty: 1.0
     routing:
       enabled: true
       low_threshold: 0.5
       high_threshold: 0.85
+      # Routing ablation: when true, bypass R_Ci route classification and
+      # attach privileged OPSD correction to every eligible image cycle sample.
+      all_samples_opsd: false
       # The Volcengine B experiment overrides this to true. Keep generic YAML
       # compatible with the original route-replacement ablation by default.
       preserve_original_grpo: false
@@ -160,11 +159,43 @@ worker:
     # Unified Spatial-Evidence Credit Assignment; disabled preserves baseline.
     seca:
       enabled: false
+      # Explicit cycle-only evidence gate for pure self-supervised 20k runs.
+      # Direct mask CE token credit remains controlled by enabled.
+      self_supervised_enabled: false
       min_weight: 0.5
       max_weight: 1.0
       false_positive_penalty: 2.0
       coarse_token_weight: 1.5
       fine_token_weight: 1.0
+    # Dynamic self-supervised EGCA: Shapley coarse/fine mask credit plus
+    # evidence-gated privileged OPD/JSD. It does not touch direct CE/DLC-QA.
+    egca:
+      enabled: false
+      opd_enabled: true
+      actor_coef: 0.2
+      # Remove the per-response common-mode Shapley component before adding
+      # token credit to GRPO advantages; use raw only for legacy ablations.
+      credit_mode: contrastive
+      # New default update path: rollout evidence is detached from GRPO
+      # advantage and used as non-negative weights for GT self-distillation.
+      update_mode: weighted_ce
+      # Per-sample GT SAMTok codes are the counterfactual reference in the new
+      # path; fixed code-0 is retained only for legacy ablations.
+      reference_mode: target
+      ce_loss_weight: 0.05
+      ce_min_weight: 0.25
+      ce_max_weight: 1.0
+      ce_token_credit_scale: 0.5
+      ce_token_weight_max: 2.0
+      evidence_min_weight: 0.5
+      evidence_max_weight: 1.0
+      false_positive_penalty: 2.0
+      reference_coarse_code: 0
+      reference_fine_code: 0
+      credit_clip: 1.0
+      warmup_steps: 0
+      ramp_steps: 0
+      max_groups: 8
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu

@@ -1,7 +1,7 @@
 """Configuration for external rewards that do not alter CycleGRPO routing."""
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 
 def direct_grounding_source(
@@ -101,6 +101,59 @@ def direct_mask_ce_source(
         (include_positive_sources and source in {"refcoco_cycle", "grefcoco_cycle"})
         or (include_no_target and source == "gres_no_target")
     )
+
+
+def direct_source_balance_weights(
+    sources: Sequence[object],
+    positive_fraction: float = 0.5,
+    min_weight: float = 0.5,
+    max_weight: float = 2.0,
+) -> tuple[list[float], dict[str, float]]:
+    """Balance effective direct-credit mass between positive and no-target rows.
+
+    The loader intentionally keeps its natural mixture and ordering. This helper
+    only derives per-sample factors for direct GRPO/CE, so no-target examples
+    cannot be drowned out by denser positive mask-token targets.
+    """
+    if not 0.0 < positive_fraction < 1.0:
+        raise ValueError("positive_fraction must lie strictly between 0 and 1.")
+    if min_weight <= 0.0 or max_weight < min_weight:
+        raise ValueError("source-balance weights must satisfy 0 < min <= max.")
+    normalized = [str(source) for source in sources]
+    positive = {"supervised_grounding", "refcoco_cycle", "grefcoco_cycle"}
+    no_target = {"supervised_grounding_no_target", "gres_no_target"}
+    positive_count = sum(source in positive for source in normalized)
+    no_target_count = sum(source in no_target for source in normalized)
+    known_count = positive_count + no_target_count
+    if known_count == 0 or positive_count == 0 or no_target_count == 0:
+        return [1.0] * len(normalized), {
+            "positive_count": float(positive_count),
+            "no_target_count": float(no_target_count),
+            "observed_positive_fraction": positive_count / known_count if known_count else 0.0,
+            "positive_weight": 1.0,
+            "no_target_weight": 1.0,
+        }
+    observed_positive_fraction = positive_count / known_count
+    raw_positive = positive_fraction / observed_positive_fraction
+    raw_no_target = (1.0 - positive_fraction) / (1.0 - observed_positive_fraction)
+    raw_positive = min(max(raw_positive, min_weight), max_weight)
+    raw_no_target = min(max(raw_no_target, min_weight), max_weight)
+    raw_mean = (positive_count * raw_positive + no_target_count * raw_no_target) / known_count
+    positive_weight = min(max(raw_positive / raw_mean, min_weight), max_weight)
+    no_target_weight = min(max(raw_no_target / raw_mean, min_weight), max_weight)
+    weights = [
+        positive_weight if source in positive else no_target_weight if source in no_target else 1.0
+        for source in normalized
+    ]
+    return weights, {
+        "positive_count": float(positive_count),
+        "no_target_count": float(no_target_count),
+        "observed_positive_fraction": observed_positive_fraction,
+        "positive_weight": positive_weight,
+        "no_target_weight": no_target_weight,
+    }
+
+
 
 
 def non_tensor_batch_row(values: Any, index: int) -> Any:
@@ -252,6 +305,26 @@ class RefusalCreditConfig:
 
 
 @dataclass
+
+class DirectSourceBalanceConfig:
+    """Balance positive and no-target direct credit without resampling data."""
+
+    enabled: bool = False
+    positive_fraction: float = 0.5
+    min_weight: float = 0.5
+    max_weight: float = 2.0
+
+    def post_init(self):
+        if not 0.0 < self.positive_fraction < 1.0:
+            raise ValueError("direct_source_balance.positive_fraction must lie strictly between 0 and 1.")
+        if self.min_weight <= 0.0 or self.max_weight < self.min_weight:
+            raise ValueError("direct_source_balance weights must satisfy 0 < min <= max.")
+
+
+
+
+
+@dataclass
 class GradientDiagnosticsConfig:
     """Opt-in, observation-only pairwise gradients for the active task streams."""
 
@@ -264,9 +337,12 @@ class SupervisedAnchorsConfig:
     direct_grounding: DirectGroundingConfig = field(default_factory=DirectGroundingConfig)
     direct_mask_ce: DirectMaskCEConfig = field(default_factory=DirectMaskCEConfig)
     refusal_credit: RefusalCreditConfig = field(default_factory=RefusalCreditConfig)
+    direct_source_balance: DirectSourceBalanceConfig = field(default_factory=DirectSourceBalanceConfig)
     gradient_diagnostics: GradientDiagnosticsConfig = field(default_factory=GradientDiagnosticsConfig)
 
     def post_init(self):
         self.caption_qa.post_init()
         self.direct_grounding.post_init()
         self.direct_mask_ce.post_init()
+        self.refusal_credit.post_init()
+        self.direct_source_balance.post_init()

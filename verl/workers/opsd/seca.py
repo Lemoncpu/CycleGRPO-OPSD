@@ -1,8 +1,10 @@
 """Spatial-Evidence Credit Assignment (SECA) for OPSD auxiliary updates.
 
 SECA keeps the pixel-IoU reward unchanged while reusing spatial evidence at
-the two places where auxiliary supervision is applied: privileged JSD samples
-and direct teacher-forcing mask tokens.
+the two places where auxiliary supervision is applied: cycle privileged JSD
+samples and direct teacher-forcing mask tokens.  The cycle path is explicitly
+enabled by ``SECAConfig.self_supervised_enabled`` for 20k self-supervised
+training; it never changes the sampled GRPO reward or advantage.
 """
 
 from __future__ import annotations
@@ -29,6 +31,29 @@ def spatial_evidence_weight(
     fp_ratio = false_positive_area / max(target_area, 1.0)
     quality = max(0.0, min(1.0, iou * (1.0 - false_positive_penalty * fp_ratio)))
     return float(min_weight + (max_weight - min_weight) * quality)
+
+
+def self_supervised_evidence_weight(
+    context: Optional[Mapping[str, object]],
+    *,
+    min_weight: float = 0.5,
+    max_weight: float = 1.0,
+    false_positive_penalty: float = 2.0,
+) -> float:
+    """Return a finite detached gate for a cycle mid-route auxiliary update.
+
+    Missing privileged metadata is treated as the configured floor instead of
+    silently turning a self-supervised sample into an unweighted update.
+    """
+    if not isinstance(context, Mapping):
+        return float(min_weight)
+    value = spatial_evidence_weight(
+        context,
+        min_weight=min_weight,
+        max_weight=max_weight,
+        false_positive_penalty=false_positive_penalty,
+    )
+    return float(value) if torch.isfinite(torch.tensor(value)) else float(min_weight)
 
 
 def hierarchical_mask_token_weights(

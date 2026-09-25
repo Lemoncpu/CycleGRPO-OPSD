@@ -20,16 +20,9 @@ class PixelIoUConfig:
     # the RefCOCO instruction for every image localization prompt.
     localization_prompt_mode: str = "mixed"
     # ``text`` preserves the SAMTok refusal proxy. ``official_bbox`` matches
-    # public CycleGRPO's bbox-format proxy. ``pixel_empty`` uses the decoded
-    # SAMTok union while keeping the no-target samples in the caption-only
-    # non-cycle batch, as in the public CycleGRPO implementation.
+    # the public CycleGRPO bbox-format proxy. ``pixel_empty`` uses the decoded
+    # SAMTok union, matching the historical GRES-compatible signal.
     no_target_reward_mode: str = "text"
-    # Subtract this score from a positive segmentation rollout that explicitly
-    # refuses or decodes to an empty mask. Zero disables the term.
-    positive_empty_mask_penalty: float = 1.0
-    # In pixel_empty mode, subtract this score when a no-target response
-    # decodes to a nonempty union. Zero restores the pre-penalty 0 reward.
-    no_target_nonempty_mask_penalty: float = 1.0
 
     def post_init(self):
         if self.decode_batch_size <= 0:
@@ -52,10 +45,6 @@ class PixelIoUConfig:
                 "pixel_iou.no_target_reward_mode must be one of "
                 "{'text', 'official_bbox', 'pixel_empty'}."
             )
-        if self.positive_empty_mask_penalty < 0.0:
-            raise ValueError("pixel_iou.positive_empty_mask_penalty must be non-negative.")
-        if self.no_target_nonempty_mask_penalty < 0.0:
-            raise ValueError("pixel_iou.no_target_nonempty_mask_penalty must be non-negative.")
 
 
 @dataclass
@@ -64,6 +53,11 @@ class RoutingConfig:
     low_threshold: float = 0.5
     high_threshold: float = 0.85
     preserve_original_grpo: bool = False
+    # Routing ablation: bypass the R_Ci low/mid/high classifier and attach the
+    # privileged OPSD correction to every eligible image cycle sample.  The
+    # native GRPO path can still be retained independently via
+    # preserve_original_grpo.
+    all_samples_opsd: bool = False
 
     def post_init(self):
         if not 0.0 <= self.low_threshold <= self.high_threshold <= 1.0:
@@ -177,9 +171,16 @@ class TeacherAnalysisConfig:
 
 @dataclass
 class SECAConfig:
-    """Spatial-Evidence Credit Assignment for OPSD auxiliary supervision."""
+    """Spatial-Evidence Credit Assignment for cycle and direct supervision.
+
+    ``self_supervised_enabled`` explicitly enables the cycle-only evidence
+    gate used by 20k self-supervised training.  The historical direct-mask CE
+    token credit remains controlled by ``enabled`` and is unaffected by this
+    flag.
+    """
 
     enabled: bool = False
+    self_supervised_enabled: bool = False
     min_weight: float = 0.5
     max_weight: float = 1.0
     false_positive_penalty: float = 2.0
@@ -196,11 +197,70 @@ class SECAConfig:
 
 
 @dataclass
+class EGCAConfig:
+    """Dynamic self-supervised Shapley credit plus evidence-gated OPD.
+
+    In ``weighted_ce`` mode, sampled cycle-localization trajectories only
+    produce non-negative weights for a separate GT teacher-forcing update.
+    ``legacy_advantage`` is retained solely for historical ablations.
+    """
+
+    enabled: bool = False
+    opd_enabled: bool = True
+    actor_coef: float = 0.2
+    credit_mode: str = "contrastive"
+    update_mode: str = "weighted_ce"
+    reference_mode: str = "target"
+    ce_loss_weight: float = 0.05
+    ce_min_weight: float = 0.25
+    ce_max_weight: float = 1.0
+    ce_token_credit_scale: float = 0.5
+    ce_token_weight_max: float = 2.0
+    evidence_min_weight: float = 0.5
+    evidence_max_weight: float = 1.0
+    false_positive_penalty: float = 2.0
+    reference_coarse_code: int = 0
+    reference_fine_code: int = 0
+    credit_clip: float = 1.0
+    warmup_steps: int = 0
+    ramp_steps: int = 0
+    max_groups: int = 8
+
+    def post_init(self):
+        if self.actor_coef < 0.0:
+            raise ValueError("egca.actor_coef must be non-negative.")
+        if self.credit_mode not in {"contrastive", "raw"}:
+            raise ValueError("egca.credit_mode must be 'contrastive' or 'raw'.")
+        if self.update_mode not in {"weighted_ce", "legacy_advantage"}:
+            raise ValueError("egca.update_mode must be 'weighted_ce' or 'legacy_advantage'.")
+        if self.reference_mode not in {"target", "fixed"}:
+            raise ValueError("egca.reference_mode must be 'target' or 'fixed'.")
+        if self.ce_loss_weight < 0.0:
+            raise ValueError("egca.ce_loss_weight must be non-negative.")
+        if not 0.0 <= self.ce_min_weight <= self.ce_max_weight:
+            raise ValueError("egca CE weights must satisfy 0 <= min <= max.")
+        if self.ce_token_credit_scale < 0.0 or self.ce_token_weight_max <= 0.0:
+            raise ValueError("egca CE token weight parameters are invalid.")
+        if not 0.0 <= self.evidence_min_weight <= self.evidence_max_weight <= 1.0:
+            raise ValueError("egca evidence weights must satisfy 0 <= min <= max <= 1.")
+        if self.false_positive_penalty < 0.0:
+            raise ValueError("egca.false_positive_penalty must be non-negative.")
+        if not 0 <= self.reference_coarse_code < 256 or not 0 <= self.reference_fine_code < 256:
+            raise ValueError("egca reference codes must be in [0, 256).")
+        if self.credit_clip <= 0.0:
+            raise ValueError("egca.credit_clip must be positive.")
+        if self.warmup_steps < 0 or self.ramp_steps < 0 or self.max_groups <= 0:
+            raise ValueError("egca warmup/ramp/max_groups values are invalid.")
+
+
+@dataclass
 class OPSDConfig:
     enabled: bool = False
     localization_rollouts: int = 6
     caption_loss_weight: float = 0.5
     localization_loss_weight: float = 0.5
+    # Historical main-parquet pixel-empty no-target segmentation actor scale.
+    no_target_segmentation_loss_weight: float = 1.0
     caption_anchor_kl_coef: float = 0.0
     caption_anchor_kl_all_safe_routes: bool = False
     segmentation_anchor_kl_coef: float = 0.0
@@ -214,6 +274,7 @@ class OPSDConfig:
     teacher_confidence: TeacherConfidenceConfig = field(default_factory=TeacherConfidenceConfig)
     teacher_analysis: TeacherAnalysisConfig = field(default_factory=TeacherAnalysisConfig)
     seca: SECAConfig = field(default_factory=SECAConfig)
+    egca: EGCAConfig = field(default_factory=EGCAConfig)
 
     def post_init(self):
         if self.localization_rollouts <= 0:
@@ -222,13 +283,18 @@ class OPSDConfig:
             raise ValueError("OPSD task loss weights must be non-negative.")
         if self.caption_loss_weight + self.localization_loss_weight <= 0:
             raise ValueError("At least one OPSD task loss weight must be positive.")
+        if self.no_target_segmentation_loss_weight < 0.0:
+            raise ValueError("no_target_segmentation_loss_weight must be non-negative.")
         if self.caption_anchor_kl_coef < 0:
             raise ValueError("caption_anchor_kl_coef must be non-negative.")
         if self.segmentation_anchor_kl_coef < 0:
             raise ValueError("segmentation_anchor_kl_coef must be non-negative.")
         self.teacher_confidence.post_init()
         self.seca.post_init()
+        self.egca.post_init()
         if self.enabled and self.routing.enabled and not self.pixel_iou.enabled:
             raise ValueError("OPSD three-route training requires pixel_iou.enabled=true.")
+        if self.enabled and self.egca.enabled and not self.pixel_iou.enabled:
+            raise ValueError("EGCA requires pixel_iou.enabled=true.")
         if self.enabled and self.routing.enabled and not self.ema_teacher.enabled:
             raise ValueError("OPSD three-route training requires ema_teacher.enabled=true.")

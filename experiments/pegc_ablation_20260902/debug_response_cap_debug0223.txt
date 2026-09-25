@@ -1,38 +1,84 @@
 Sample 0:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 1:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 2:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 3:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 4:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 5:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 6:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0075|><|mt_0292|><|mt_end|>", "label": "Woman"}]
+```<|im_end|>
 
 Sample 7:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0044|><|mt_0353|><|mt_end|>", "label": "Woman"}]
+```<|im_end|>
 
 Sample 8:
-<answer>No target.</answer><|im_end|>
+承认, 对的, 一个小编辑 input :- you.<|im_end|>
 
 Sample 9:
-<answer>No target.</answer><|im_end|>
+<|mt_start|><|mt_0044|><|mt_0278|><|mt_end|><|im_end|>
 
 Sample 10:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0075|><|mt_0292|><|mt_end|>", "label": "Woman"}]
+```<|im_end|>
 
 Sample 11:
-<answer>No target.</answer><|im_end|>
+Observing the bowl<|mt_start|><|mt_0096|><|mt_0388|><|mt_end|>in the image:
+- The bowl of food are visible.
+- A mixed vegetable dish is present in the bowl thing.
+
+**Conclusion**: The object described as a bowl in the image is <|mt_start|><|mt_0096|><|mt_0388|><|mt_end|>.<|im_end|>
 
 Sample 12:
 <think>
@@ -40,7 +86,7 @@ Sample 12:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0003|><|mt_0363|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 13:
@@ -49,7 +95,7 @@ Sample 13:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0213|><|mt_0338|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0198|><|mt_0322|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 14:
@@ -58,7 +104,7 @@ Sample 14:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0270|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0003|><|mt_0475|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 15:
@@ -67,7 +113,7 @@ Sample 15:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0198|><|mt_0322|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 16:
@@ -76,7 +122,7 @@ Sample 16:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0213|><|mt_0313|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0003|><|mt_0475|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 17:
@@ -85,79 +131,159 @@ Sample 17:
 </think>
 
 ```json
-[{"mask_2d": "<|mt_start|><|mt_0011|><|mt_0432|><|mt_end|>", "label": "top left white"}]
+[{"mask_2d": "<|mt_start|><|mt_0198|><|mt_0414|><|mt_end|>", "label": "player"}]
 ```<|im_end|>
 
 Sample 18:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0163|><|mt_0338|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 19:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0163|><|mt_0338|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 20:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0163|><|mt_0292|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 21:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0163|><|mt_0338|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 22:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0125|><|mt_0300|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 23:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0163|><|mt_0338|><|mt_end|>", "label": "right cat"}]
+```<|im_end|>
 
 Sample 24:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0211|><|mt_0379|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 25:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0232|><|mt_0443|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 26:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0232|><|mt_0270|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 27:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0211|><|mt_0379|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 28:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0211|><|mt_0379|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 29:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+```json
+[{"mask_2d": "<|mt_start|><|mt_0227|><|mt_0414|><|mt_end|>", "label": "bottom in front of officer"}]
+```<|im_end|>
 
 Sample 30:
-<answer>No target.</answer><|im_end|>
+<think>
+
+</think>
+
+No target.<|im_end|>
 
 Sample 31:
-<answer>No target.</answer><|im_end|>
-left toilet
-left toilet
-left toilet
-left toilet
-left toilet
-left toilet
-middle white sheep
-middle white sheep
-middle white sheep
-middle white sheep
-middle white sheep
-middle white sheep
-top left white
-top left white
-top left white
-top left white
-top left white
-top left white
-front laptop
-front laptop
-front laptop
-front laptop
-front laptop
-front laptop
-second orange tree from left under the pizza
-second orange tree from left under the pizza
-second orange tree from left under the pizza
-second orange tree from left under the pizza
-second orange tree from left under the pizza
-second orange tree from left under the pizza
-left surfer
-left surfer
+<think>
+
+</think>
+
+No target.<|im_end|>
+third suitcase from bottom
+third suitcase from bottom
+third suitcase from bottom
+third suitcase from bottom
+third suitcase from bottom
+third suitcase from bottom
+Woman
+Woman
+Woman
+Woman
+Woman
+Woman
+player
+player
+player
+player
+player
+player
+right cat
+right cat
+right cat
+right cat
+right cat
+right cat
+bottom in front of officer
+bottom in front of officer
+bottom in front of officer
+bottom in front of officer
+bottom in front of officer
+bottom in front of officer
+left fridge
+left fridge

@@ -30,6 +30,7 @@ MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
 LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
 CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
+NO_TARGET_EMPTY_AREA_TAU="${NO_TARGET_EMPTY_AREA_TAU:-0.10}"
 POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
@@ -187,8 +188,8 @@ if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
     exit 1
 fi
 
-if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
-    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
+if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty_iou" ]]; then
+    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, pixel_empty, or pixel_empty_iou: ${NO_TARGET_REWARD_MODE}" >&2
     exit 1
 fi
 
@@ -213,7 +214,7 @@ case "${CYCLE_PROMPT_MODE}" in
         ;;
 esac
 
-if [[ "${NO_TARGET_REWARD_MODE}" == "pixel_empty" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
+if [[ ( "${NO_TARGET_REWARD_MODE}" == "pixel_empty" || "${NO_TARGET_REWARD_MODE}" == "pixel_empty_iou" ) && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
     echo "NO_TARGET_REWARD_MODE=pixel_empty requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
     exit 1
 fi
@@ -743,6 +744,7 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
     worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.no_target_empty_area_tau="${NO_TARGET_EMPTY_AREA_TAU}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \

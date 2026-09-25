@@ -1,0 +1,12 @@
+data: /volume/ybo/xyc/datasets/direct_refcoco30k_disjoint_cycle20k/refcoco_train_30k_disjoint_cycle20k_seed20260823.parquet
+seed: 20260921
+n_rows: 16
+token_type: SAMTok depth-2 mask-code tokens
+axis_x: teacher_alignment
+axis_y: actual checkpoint delta log probability
+base_checkpoint: /volume/ybo/xyc/Qwen3-VL-4B-SAMTok
+grpo_checkpoint: /volume/ybo/xyc/CycleGRPO/logs/cyclegrpo_official_20k_g6k6/evaluation/step_156_response256/hf_global_step_156
+opsd_checkpoint: /volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo20k_pixel_empty_bs128_response256/evaluation/step_156_response256/hf_global_step_156
+teacher_checkpoint: /volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k_nodirectsft/evaluation/step_714/hf_global_step_714
+training_scope: post-hoc checkpoint comparison; no new optimizer step
+paired_update_samples: false

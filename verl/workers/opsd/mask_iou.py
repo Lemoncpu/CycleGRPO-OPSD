@@ -73,26 +73,11 @@ def compute_binary_iou(target: torch.Tensor, prediction: torch.Tensor) -> torch.
     return torch.where(union > 0, intersection / union, torch.zeros_like(union))
 
 
-def pixel_empty_reward(
-    prediction: Optional[torch.Tensor], response: Optional[str], nonempty_mask_penalty: float = 1.0
-) -> float:
-    """Score decoded no-target responses with an optional nonempty-mask penalty."""
+def pixel_empty_reward(prediction: Optional[torch.Tensor], response: Optional[str]) -> float:
+    """Score no-target only when an explicit refusal has an empty decoded union."""
     has_explicit_refusal = isinstance(response, str) and NO_TARGET_REFUSAL_PATTERN.search(response) is not None
     has_empty_union = prediction is None or not bool(prediction.any())
-    if not has_empty_union:
-        return -float(nonempty_mask_penalty)
-    return 1.0 if has_explicit_refusal else 0.0
-
-
-def positive_empty_mask_penalty(
-    target: Optional[torch.Tensor], prediction: Optional[torch.Tensor], response: Optional[str], amount: float
-) -> float:
-    """Return a negative reward when a nonempty target is refused or decoded as empty."""
-    if amount <= 0.0 or target is None or not bool(target.any()):
-        return 0.0
-    has_explicit_refusal = isinstance(response, str) and NO_TARGET_REFUSAL_PATTERN.search(response) is not None
-    has_empty_union = prediction is None or not bool(prediction.any())
-    return -float(amount) if has_explicit_refusal or has_empty_union else 0.0
+    return 1.0 if has_explicit_refusal and has_empty_union else 0.0
 
 
 def coerce_raw_mask(value, image_size: tuple[int, int]) -> Optional[torch.Tensor]:
@@ -152,6 +137,19 @@ def _load_rgb_image(value) -> Image.Image:
 
 
 @torch.inference_mode()
+def prepare_mask_image(*, vq_sam2, image):
+    """Prepare one image embedding/pixel tensor for repeated mask decodes."""
+    pil_image = _load_rgb_image(image)
+    width, height = pil_image.size
+    resized = pil_image.resize((1024, 1024))
+    pixel_values = torch.from_numpy(np.asarray(resized).copy()).permute(2, 0, 1).contiguous()
+    pixel_values = pixel_values.unsqueeze(0).to(device=vq_sam2.device, dtype=vq_sam2.dtype)
+    image_state = None
+    if hasattr(vq_sam2, "encode_single_image") and hasattr(vq_sam2, "decode_codes_from_single_image"):
+        image_state = vq_sam2.encode_single_image(pixel_values)
+    return pixel_values, image_state, (height, width)
+
+
 def decode_mask_tokens(
     *,
     vq_sam2,
@@ -162,6 +160,7 @@ def decode_mask_tokens(
     threshold: float = 0.5,
     decode_batch_size: int = 32,
     decode_mode: str = "union",
+    prepared_image=None,
 ) -> tuple[list[Optional[torch.Tensor]], tuple[int, int]]:
     """Decode legal groups and return either the first mask or their pixel union.
 
@@ -173,11 +172,10 @@ def decode_mask_tokens(
         raise ValueError("decode_batch_size must be positive.")
     if decode_mode not in {"union", "first_mask"}:
         raise ValueError("decode_mode must be 'union' or 'first_mask'.")
-    pil_image = _load_rgb_image(image)
-    width, height = pil_image.size
-    resized = pil_image.resize((1024, 1024))
-    pixel_values = torch.from_numpy(np.asarray(resized).copy()).permute(2, 0, 1).contiguous()
-    pixel_values = pixel_values.unsqueeze(0).to(device=vq_sam2.device, dtype=vq_sam2.dtype)
+    if prepared_image is None:
+        pixel_values, image_state, (height, width) = prepare_mask_image(vq_sam2=vq_sam2, image=image)
+    else:
+        pixel_values, image_state, (height, width) = prepared_image
 
     parsed_groups: list[list[list[int]]] = []
     for text in token_texts:
@@ -198,10 +196,6 @@ def decode_mask_tokens(
     output: list[Optional[torch.Tensor]] = [None] * len(token_texts)
     if not decode_items:
         return output, (height, width)
-
-    image_state = None
-    if hasattr(vq_sam2, "encode_single_image") and hasattr(vq_sam2, "decode_codes_from_single_image"):
-        image_state = vq_sam2.encode_single_image(pixel_values)
 
     # Decode in bounded chunks while retaining one shared image embedding.
     for start in range(0, len(decode_items), decode_batch_size):

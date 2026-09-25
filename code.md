@@ -30,7 +30,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 
 论文正文用 IoU 解释空间一致性；原始公开代码为降低高分辨率 mask 解码开销，采用 **Hierarchical Token Grading**。当前 OPSD 扩展已把图像 cycle source 改为训练时完整解码 SAMTok token 并计算真实像素 IoU；`worker.opsd.enabled=false` 时仍可回到原始 token-domain CycleGRPO。
 
-当前扩展在每条 caption 的 `K` 次真实 IoU 均值 `R_Ci` 上执行候选级三路由：`R_Ci<0.5` 进入 EMA teacher regenerate，`0.5<=R_Ci<=0.85` 进入 privileged on-policy distillation，`R_Ci>0.85` 保留 CycleGRPO caption GRPO。通用配置默认维持三路由替换 caption 更新；火山引擎 B 实验显式启用 `routing.preserve_original_grpo=true`，使所有安全 caption 都保留原始 CycleGRPO GRPO，再把 regenerate CE 或 privileged JSD 作为附加梯度。高置信 teacher 消融进一步只让满足 cycle 证据阈值的 regenerate/JSD 样本提供辅助梯度，不会关闭任一安全 caption 的原始 GRPO。所有 localization rollout 始终参与 CycleGRPO 更新。
+当前扩展在每条 caption 的 `K` 次真实 IoU 均值 `R_Ci` 上执行候选级三路由：`R_Ci<0.5` 进入 EMA teacher regenerate，`0.5<=R_Ci<=0.85` 进入 privileged on-policy distillation，`R_Ci>0.85` 保留 CycleGRPO caption GRPO。通用配置默认维持三路由替换 caption 更新；火山引擎 B 实验显式启用 `routing.preserve_original_grpo=true`，使所有安全 caption 都保留原始 CycleGRPO GRPO，再把 regenerate CE 或 privileged JSD 作为附加梯度。新增 `routing.all_samples_opsd=true` 的 routing 消融会跳过 `R_Ci` 分类，将所有可用 image-cycle caption 统一送入 privileged on-policy distillation，同时仍按 `preserve_original_grpo` 独立保留原始 GRPO；高置信 gate 在该模式下不再按 `R_Ci` 丢弃样本。所有 localization rollout 始终参与 CycleGRPO 更新。
 
 ## 2. 论文结论与实现边界
 
@@ -58,7 +58,7 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | localization prompt 模式 | `mixed` | 默认 1:1 交替 RefCOCO/GroundingSuite 模板；设 `LOCALIZATION_PROMPT_MODE=refcoco` 可让所有图像 localization 使用 RefCOCO prompt |
 | 两阶段 prompt 模式 | `current` | 设 `CYCLE_PROMPT_MODE=official_source_aware` 可按 RefCOCO/gRefCOCO/PACO/Stuff source 重建官方 caption prompt，并让图像 localization 使用官方长模板；默认不改变当前行为 |
 | 内层 rollout `K` | `worker.opsd.localization_rollouts=6` | 已从 trainer 硬编码迁入配置 |
-| 路由阈值 | `0.5 / 0.85` | 边界分别为 low: `<0.5`、mid: `[0.5,0.85]`、high: `>0.85` |
+| 路由阈值 | baseline `0.5 / 0.85` | 边界分别为 low: `<low_threshold`、mid: `[low_threshold,high_threshold]`、high: `>high_threshold`；主入口通过 `ROUTING_LOW_THRESHOLD`/`ROUTING_HIGH_THRESHOLD` 覆盖，默认保持 baseline |
 | caption 原始 GRPO | B 入口默认保留 | 所有安全 rollout 都计算原始 CycleGRPO policy loss；low/mid 的 teacher 更新改为附加梯度 |
 | C: caption anchor KL | `0.05`、全部安全 route | 火山引擎入口的稳定化值；独立于 `algorithm.kl_coef=0.01`，只锚定 cycle caption |
 | C2: segmentation anchor KL | `0.05`、全部 cycle localization response | 与通用 KL 分开记录；以 frozen reference 约束 mask-token policy，避免共享 actor 的 caption/teacher 更新快速破坏 text-to-mask |
@@ -69,8 +69,8 @@ SAMTok 完整解码后的像素 IoU / 空间一致性分数 s_i,k
 | regenerate | `T=6`、`temperature=0.8`、`top_p=0.95` | 每候选一次 greedy localization 验证，提升至少 `0.05` 才接收 |
 | teacher diagnosis | 每 step 最多 2 条、96 tokens、temperature 0 | 仅写入本地 privileged diagnostics 日志，不参与 student 更新 |
 | rollout/global batch | `128` | 与论文一致 |
-| 三流 parent batch 默认值 | `main=128, direct=256, DLC-QA=64` | 火山引擎 70k 入口中 20k/40k/10k 三条流各约消费一遍 |
-| 火山引擎默认最大步数 | `156` | 与主 20k 流 `20000/128` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
+| 三流 parent batch 默认值 | 正式 7+1 70k 入口为 `main=112, direct=224, DLC-QA=56` | 三条 batch 均可被 7 个训练 rank 等分，保持 `2:4:1` 配额；179 step 近似完整消费 20k/40k/10k 三条流 |
+| 火山引擎默认最大步数 | `156`（20k 主入口）；`179`（正式 70k 三流入口） | 分别与 `20000/128` 和 `20000/112` 对齐；可用 `MAX_STEPS` 覆盖，显式设空可恢复完整 epoch |
 | epoch | `1` | 与论文一致 |
 | GPU | 默认 1 node x 8 GPU；显式 Ray attach 按试验族区分 | 单机仍由 Ray + FSDP + vLLM SPMD 运行；正式 70k 有监督 trial 使用物理 GPU 0--6 的 7 张 Ray 训练卡与 GPU 7 本机 Llama judge。attach 模式也允许 1--7 张 Ray 训练卡作开发 smoke，但必须在 `CUDA_VISIBLE_DEVICES` 外保留一张卡给外部 judge，且所有实际 parent-prompt batch 必须能被训练卡数整除。 |
 | vision tower | frozen | shell 覆盖为 `true` |
@@ -116,7 +116,7 @@ anchor KL 设为 `0`、关闭 caption safety，以免保留 C/C2 的额外策略
 `trainer.val_freq` 保持关闭，因为其仅生成 caption 并调用通用 reward，既不运行 CycleGRPO 的 localization
 rollout，也不能计算标准 RefCOCO cIoU/mIoU。每 5 step 保存的 checkpoint 应在训练进程退出、释放 8 卡后通过
 离线评测入口执行 RefCOCO val。入口默认 `MAX_STEPS=156`，用于使 20k/40k/10k 三条流在同一轮内对齐；设置 `MAX_STEPS=5,10,...` 可将训练分段停在这些 checkpoint，
-再以 `RESUME=true` 继续同一固定-teacher 实验。平台会注入
+再以 `RESUME=true` 继续同一固定-teacher 实验。100k scaling runner `tools/run_100k_scaling_opsd_8gpu.sh` 使用约 69 GiB 的单个 FSDP actor checkpoint；由于 trainer 在写入新 checkpoint 前清理旧目录，runner 固定 `SAVE_LIMIT=1` 并将周期保存设为 `SAVE_FREQ=25`，避免双 checkpoint 峰值触发容器的 `Errno 28 No space left on device`，同时保留断点续训能力。该 runner 的本地 Llama judge 首次 vLLM 编译可能超过 180 秒，`JUDGE_TIMEOUT_SECONDS` 默认设为 600 秒并传入启动与停止命令。平台会注入
 指向 Python 3.12 / Ray 2.53 集群的 `RAY_ADDRESS`，但项目环境是 Python 3.10 / Ray
 2.56；独立 70k 命令文件必须用 `$ENV_DIR/bin/ray` 启动和停止本地 head，并先清理旧 head，确保 ray CLI 与 trainer 使用同一解释器环境；默认单机入口会清除继承的 Ray 地址，让 `verl.trainer.main` 创建版本一致的本地单节点
 Ray。显式连接平台 Ray 时设置 `MULTINODE_ENABLED=true`、`NNODES=1|2` 和由项目 `$ENV_DIR/bin/ray`
@@ -130,6 +130,99 @@ controller 使用 `NNODES=2`、`NUM_GPUS=8`、GPU 0--7 全训练的拓扑（16 R
 符号链接的 Ray 临时目录及使用率不低于 95% 的临时文件系统，并在创建 GPU/Ray worker
 前扫描 parquet 的 `images` 列，验证所有图像路径均存在。除本节记录的 70k 三流 batch/step
 对齐默认值外，它不修改论文算法；其他训练超参数和数据路径仍可由环境变量覆盖。
+
+新增的 scaling 纯自监督入口 `tools/train_selfsupervised_40k_teacher_8gpu.sh` 和
+`tools/train_selfsupervised_80k_teacher_8gpu.sh` 使用当前服务器
+`datasets/cyclegrpo100k_scaling_20260911` 下的 parquet，均为单节点 8 GPU、主 rollout/global
+batch `128`、1 个完整 epoch、无 direct/DLC-QA 辅助 loader。两者显式开启 OPSD pixel-IoU、三路由、
+caption safety、EMA teacher、teacher confidence 和 teacher analysis，并固定
+`TEACHER_EMA_DECAY=1.0` 复现当前 frozen-teacher 配置。no-target 采用严格的
+`NO_TARGET_REWARD_MODE=pixel_empty` 二值判定：解码 mask union 为空才记为正确，非空即记为错误，
+不额外叠加 `NO_TARGET_NONEMPTY_MASK_PENALTY`（设为 `0.0`）。该模式不使用面积比例，
+`NO_TARGET_EMPTY_AREA_TAU=0.0` 明确关闭连续分数；只有显式选择 `pixel_empty_iou` 时才要求正的 tau。
+正例拒识或空 mask 则通过
+`POSITIVE_EMPTY_MASK_PENALTY=1.0` 单独扣分。40k 入口直接读取
+`cyclegrpo_selfsupervised_40k.parquet`；80k 入口首次运行时将该文件与
+`direct_supervised_40k.parquet` 按统一 Arrow schema 合并为 80,000 行
+`cyclegrpo_selfsupervised_plus_direct_supervised_80k.parquet`，再交给同一主入口训练。合并写入临时
+文件后原子改名，重复运行直接复用并校验行数。
+
+这两个入口现在显式使用项目环境的 `${ENV_DIR}/bin/ray start --head`：40k 默认绑定
+`127.0.0.1:29679`，80k 默认绑定 `127.0.0.1:29680`，均注册 8 张 GPU，并以
+`MULTINODE_ENABLED=true`、`NNODES=1` 和 `RAY_CLUSTER_EXPECTED_GPUS=8` attach 到该本地 head。
+训练退出、失败或收到中断信号时，入口执行同一环境的 `ray stop --force` 清理 head；这两个脚本不再依赖
+`verl.trainer.main` 隐式创建 Ray，也不连接平台注入的外部 Ray 地址。
+
+四卡 EGCA 实验入口 `tools/train_selfsupervised_20k_egca_4gpu.sh` 使用当前服务器的
+`cyclegrpo_20k_raw_seed20260820/cyclegrpo_20k_40_20_25_10_5_seed20260820.parquet`，该文件固定为
+20,000 行（19,000 个正样本与 1,000 个 `gres_no_target`）。它默认由主 launcher 创建项目环境的本地 Ray 单节点，显式设置 `MULTINODE_ENABLED=true` 时才由入口预先启动 Ray head；使用
+CUDA 0--3、`ROLLOUT_BATCH_SIZE=128`/`ACTOR_GLOBAL_BATCH_SIZE=128` 完整训练 1 epoch，并开启
+`OPSD_ENABLED`、`PIXEL_IOU_ENABLED`、动态 `EGCA`、routing、EMA teacher、teacher confidence 与
+teacher analysis；direct GRPO、direct mask CE、DLC-QA 均关闭。no-target 使用严格的
+`NO_TARGET_REWARD_MODE=pixel_empty` 二值 decoded-union 判定，正样本空 mask/拒识的
+`POSITIVE_EMPTY_MASK_PENALTY=1.0` 开启，而独立 no-target 非空 mask 负项保持 `0.0`。该入口
+固定 `SAVE_FREQ=5`、`SAVE_LIMIT=2`，训练正常退出后停止 Ray head 并启动 `cuda_keepalive.py`；训练
+失败则保留原退出码，不会把失败伪装成完成。主火山入口的 attach 校验允许无 judge 的 1--8 卡本地
+Ray 开发/消融运行，正式 8 卡与 7+1 judge 拓扑约束保持不变。
+当调用方已经传入可执行的 `PYTHON_BIN` 时，主入口跳过 Conda re-activate，避免某些
+外层 `base` shell 的 Conda PATH 栈触发激活器异常；Python/Ray 仍通过显式环境路径校验。
+
+新增的独立 70k 混合训练入口为
+`tools/train_supervised_70k_baseline_8gpu.sh` 和
+`tools/train_supervised_70k_seca_8gpu.sh`。两者均使用历史 70k 配方：20k raw CycleGRPO
+主流、30k RefCOCO direct positive、10k gRefCOCO no-target direct 数据和 10k DLC-QA，
+正式 7+1 拓扑下分别以 `112/224/56` 的 main/direct/QA parent batch、179 个 optimizer step 运行：
+三条 batch 均可被 7 个 Ray/FSDP 训练 rank 等分，同时保持历史 `2:4:1` 配额比例并近似完整消费
+20k/40k/10k 三条 loader；开启
+pixel-IoU、pixel-empty 二值 no-target reward、direct GRPO、direct mask CE 和 DLC-QA，
+并使用物理 GPU 0--6 作为 Ray/FSDP 训练卡、GPU 7 运行本地 Llama-3.1-8B judge。baseline
+wrapper 将 `SECA_ENABLED` 与 `SECA_SELF_SUPERVISED_ENABLED` 都关闭；SECA wrapper 将两者都
+开启，使 20k cycle 的 mid-route JSD 和 direct mask CE 同时获得 SECA evidence/token credit，
+但不改变 reward 或原始 GRPO。每个 wrapper 都通过
+`tools/train_supervised_70k_common_8gpu.sh` 启动独立端口的项目 Ray head、健康检查本地 judge，
+并在退出时只清理自己发现的 Ray session；数据路径、模型路径、端口和输出目录可用环境变量覆盖。
+基于 SECA wrapper 的四个 routing 阈值入口分别为
+`tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh`、
+`tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh`、
+`tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh` 和
+`tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh`；它们只额外覆盖
+`ROUTING_LOW_THRESHOLD`/`ROUTING_HIGH_THRESHOLD`，其余 SECA、70k 数据流、112/224/56 batch、
+179 step、7+1 Ray/judge 拓扑和 checkpoint 配置均继承参考 wrapper。四组值依次为
+`(0.30,0.85)`、`(0.70,0.85)`、`(0.50,0.65)`、`(0.50,1.00)`；最后一组是 high 基线
+`0.85` 增加 `0.20` 后因阈值合法范围 `[0,1]` 截断到 `1.00`，因此实际增量为 `0.15`。
+主 RefCOCO launcher 对这两个变量执行 `[0,1]` 与 `low<=high` 校验，再传给
+`worker.opsd.routing.low_threshold/high_threshold`，不会再把 routing 阈值硬编码为 `0.5/0.85`。
+跨服务器复现实验时，仓库根目录 `README.md` 的 70k 训练部分只保留上述四个
+routing wrapper；README 明确了另一台服务器需要替换的环境、模型、judge、四路数据和图像路径变量，
+并要求先执行四个 wrapper 的 `DRY_RUN` 预检，再按 `7+1` 拓扑顺序运行，避免误用旧的通用训练示例。
+新增 `tools/train_supervised_70k_baseline_25pct_8gpu.sh` 与
+`tools/train_supervised_70k_baseline_50pct_8gpu.sh` 沿用 baseline 的全部模型、算法、batch、
+7+1 GPU、judge 与 checkpoint 配置，仅在启动前对四个 parquet 流做固定种子抽样：
+cycle 20k 按 `source` 分层取 5k/10k，direct RefCOCO 正例 30k 取 7.5k/15k，
+direct gRefCOCO no-target 10k 取 2.5k/5k，DLC-QA 10k 取 2.5k/5k。
+DLC-QA JSONL 按 `dam_source_id` 与所选 parquet 行重新配对，25% 子集嵌套于 50% 子集；
+缩量文件写到各自 `RUN_ROOT/data`。保留 `112/224/56` 的每步 parent batch，
+默认 `MAX_STEPS` 分别按约一轮数据设为 45/90（原 baseline 为 179），因此 warmup、
+save cadence 等以 step 计的配置数值不变，但占训练总步数的比例会变化。
+这两档是历史 70k 配方的数据量消融，不是论文原始 20k DenseWorld 训练配方。
+`tools/train_supervised_70k_baseline_25pct_4gpu_tmp.sh` 是 25% 配方的一步本机 smoke：
+GPU 0--2 训练、GPU 3 运行 judge，parent batch 改为可被 3 整除的 `114/228/57`，
+`MAX_STEPS=1`、`SAVE_FREQ=1`、`SAVE_LIMIT=1`，结束后不启动 GPU hold。
+它只用于验证缩量数据、Ray/judge 和训练链路能否启动及完成一步，不能替代正式 7+1
+拓扑的显存与吞吐验证。
+新增的 `tools/train_supervised_70k_seca_routing_l030_h085_4gpu_tmp.sh` 复用完整 70k
+SECA 数据流、模型、算法和 routing 配置，仅把 routing 固定为 `low=0.30/high=0.85`，
+并采用同样的 GPU 0--2 训练、GPU 3 judge、`114/228/57` parent batch、1 step 和不启动
+结束占卡设置；它只用于本机验证该 routing 变体能进入真实 Ray/FSDP/vLLM 训练链路，不能
+替代四个正式脚本的 7+1 拓扑或完整训练。
+该 smoke 首次运行发现，当前 Transformers 4.57.0 枚举整个
+`AutoModelForImageTextToText._model_mapping.keys()` 会导入无关的 Gemma3n 配置，
+而服务器的 timm 0.4.12 不提供其所需的 `ImageNetInfo`。FSDP worker 现仅查询实际
+`model_config` 对应的映射项，避免无关模型导入；Qwen3-VL 的 AutoModel 选择不变。
+正式 25% 与 50% 八卡 wrapper 也在启动 Ray 前检查当前环境是否能解析 Qwen3-VL 的图文
+AutoModel 映射，失败时直接返回原始 Python 错误；实际训练仍调用同一个已修复的 FSDP worker。
+训练成功或失败后都会请求八卡 GPU hold，避免服务器因显存释放而回收节点；设置
+`DRY_RUN=true` 只执行路径、行数和配置预检，不启动 Ray、Llama 或训练。
 
 两套四组 H20 控制器都依赖平台预先创建 Ray cluster，不需要手工 SSH 启动 trainer 或配置 NCCL 网卡。纯自监督使用 `tools/multinode/launch_four_cycle_trials.sh`（其底层为
 `launch_four_trials.sh`）：复制 `clusters.tsv.example`，每个非注释 TSV 行填写 `trial_id`、`ray_address`、
@@ -148,17 +241,18 @@ official-bbox no-target 20k 和 official source-aware prompt 的 pixel-empty 20k
 | env | 主要目的 | main/direct/QA batch，step | direct CE | direct GRPO / DLC-QA |
 |---|---|---|---|---|
 | `supervised_trial_01` | pixel-empty 20k 自监督 | `128/128`，156 | — | 无 direct/CE/DLC-QA |
-| `supervised_trial_02` | pixel-empty 70k 有监督 | `112/224/56`，178 | `0.005`，warmup `10--30`，含 no-target | `0.15 / 1.0` |
+| `supervised_trial_02` | pixel-empty 70k 有监督 | `112/224/56`，179 | `0.005`，warmup `10--30`，含 no-target | `0.15 / 1.0` |
 | `supervised_trial_03` | official-bbox no-target 20k | `128/128`，156 | — | 无 direct/CE/DLC-QA |
 | `supervised_trial_04` | official source-aware prompt 20k | `128/128`，156 | — | 无 direct/CE/DLC-QA |
 
-7 个 rank 上，70k batch `112/224/56` 对应 `16/32/8` 个 main/direct/QA parent prompt；20k 任务没有辅助流。
+7 个 rank 上，70k batch `112/224/56` 对应每步每 rank `16/32/8` 个 main/direct/QA parent prompt；四卡 smoke 使用
+3 个训练 rank 的可整除覆盖 `114/228/57`。20k 任务没有辅助流。
 虽然环境中 `THREE_STREAM_2_4_1_ENABLED=false`，这是为了绕过该旧严格模式对 routing/EMA/teacher diagnosis 的互斥检查；
 70k parent batch 仍保持 `2:4:1`，并由 mixed controller 显式校验，不代表关闭 v1/v2 诊断监督。两个控制器都以 `set -a` source env，使 trial 数据、运行名和开关传给
 `nohup` 的训练子进程；PID 记录实际 training launcher。两者均有 `launch`、`status`、`stop` 和
 `--dry-run`；stop 仅停止控制器所启动的 trainer，supervised stop 还关闭其管理的 detached judge actor。
 
-入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用默认值 `156`；显式设置为空字符串时不会向 Hydra
+入口以 `set -u` 运行时，未设置 `MAX_STEPS` 会采用正式 70k 默认值 `179`；显式设置为空字符串时不会向 Hydra
 传入空位置参数并恢复完整 epoch，设置正整数时附加 `trainer.max_steps=<value>`。
 
 火山引擎离线评测入口是 `projects/eval/qwen3vl_4b_volcengine.sh`。当前服务器默认将
@@ -172,7 +266,14 @@ processor；因此必须先执行 `export` action，并以与 shard 文件名相
 进程，不连接训练 Ray cluster。标准 RefCOCO 读取服务器的 `instances.json`、`refs(unc).p`
 及 `train2014`，输出 cIoU/mIoU；批量生成固定使用 decoder-only 模型要求的 tokenizer left padding，避免
 right-padding 导致不同长度多模态 prompt 的生成位置错位；生成默认最多 256 个新 token，可通过
-`REFCOCO_MAX_NEW_TOKENS` 覆盖（例如设为 `128` 可复现旧评测上限）；它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 与 GRES/gRefCOCO
+`REFCOCO_MAX_NEW_TOKENS` 覆盖（例如设为 `128` 可复现旧评测上限）。RefCOCO prompt 可通过
+`PROMPT_TEMPLATE` 覆盖，模板必须包含 `{phrase}`；逐样本 JSON 会保存实际模板，resume 只有在 prompt
+模板与 `mask_protocol` 同时匹配时才跳过旧结果，避免 prompt ablation 混算。未设置时仍使用历史
+RefCOCO 正例约束 prompt：
+`The referring expression below describes an object that is present in the image. Locate and segment exactly that object. Do not answer "No target", "null", or refuse. Output only one mask group in this format: <|mt_start|><|mt_XXXX|><|mt_XXXX|><|mt_end|>. Expression: {phrase}`。
+该 prompt 在全量 `step_156` RefCOCO val 上得到 cIoU `74.0443` / mIoU `76.0541`，而旧短 prompt 为
+`29.4460` / `22.1497`；全量 response 审计中 literal no-target 从 `8027/10834` 降至 `111/10834`，新 prompt
+的 10,834 条 JSON 均记录一致 prompt metadata，且无 malformed mask-token group。它不能由 GRES/gRefCOCO 脚本替代。GroundingSuite 与 GRES/gRefCOCO
 也默认生成最多 256 个新 token，分别可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 和 `GRES_MAX_NEW_TOKENS` 覆盖。GroundingSuite 接收其
 数据根和可选 COCO 图像根，并在推理后保留逐样本 JSON 与合并 JSONL；仓库 metric 使用逐样本 JSON
 目录计算 mask GIoU。当前服务器的默认 GroundingSuite 根目录是
@@ -337,11 +438,13 @@ direct GRPO/SFT，
 `batch_size`，每个主 step 只各读取一批，并循环遍历自身数据；它们绝不消费、重排或缩短主
 CycleGRPO iterator。resume 时三个 loader 的 state 都保存到 checkpoint。
 
-火山引擎 70k 三流入口默认使用 `ROLLOUT_BATCH_SIZE=128`、`DIRECT_BATCH_SIZE=256` 和
-`CAPTION_QA_BATCH_SIZE=64`，并设置 `MAX_STEPS=156`。这使 20k 主 CycleGRPO、40k
-direct supervision 和 10k DLC-QA 分别在约 156 个 optimizer step 内各消费一遍（parent-prompt
+火山引擎 70k 三流入口默认使用 `ROLLOUT_BATCH_SIZE=112`、`DIRECT_BATCH_SIZE=224` 和
+`CAPTION_QA_BATCH_SIZE=56`，并设置 `MAX_STEPS=179`。这使 20k 主 CycleGRPO、40k
+direct supervision 和 10k DLC-QA 分别在约 179 个 optimizer step 内各消费一遍（parent-prompt
 配额比例 `2:4:1`）。这些 batch 只决定各 loader 每步读取的 parent prompt 数，不改变 rollout 数、
 loss weight 或三流在同一 optimizer step 中的梯度累积顺序；同名环境变量仍可覆盖默认值。
+25%/50% baseline wrappers 复用该 batch 与训练链，仅把三流输入同时缩至原来的 25%/50%，
+并将默认步数设为 45/90；common 启动器对各缩量行数及 DLC-QA sidecar 行数进行预检。
 
 服务器入口的 `THREE_STREAM_2_4_1_ENABLED=true` 是固定配额模式：要求 `NUM_GPUS=7`，并要求
 main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
@@ -355,8 +458,8 @@ main/direct/DLC-QA 三个 parent-prompt batch 均能整除 7，且满足
 caption anchor KL 与 segmentation anchor KL 均关闭。这样 regenerate CE、privileged JSD、KL anchor
 或 verifier 不会向 20k 流添加描述/分割辅助监督；唯一的描述 reward 来自独立 DLC-QA 流，唯一的
 人工 referring/GT-mask 或 no-target refusal 监督来自独立 direct 流。
-单节点 `7+1` 有监督 controller 的 world size 为 7：`112:224:56` 对应每 rank `16:32:8` 个
-main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。正式 controller 仍使用
+单节点 `7+1` 有监督 controller 的 world size 为 7：正式历史配置使用 `128:256:64`，而本机四卡
+smoke 使用 `114:228:57` 以便被 3 个训练 rank 整除；`28:56:14` 是旧严格三流模式的配额。正式 controller 仍使用
 `NUM_GPUS=7` 并在提交前检查三个 batch 都能被 7 整除。入口 attach 校验另允许 1--7 卡的外部-judge
 开发 smoke；例如三卡可使用 `120:240:60`，但不得将其结果视为正式 7+1 实验。
 
@@ -368,7 +471,7 @@ main/direct/DLC-QA parent prompt，`28:56:14` 对应每 rank `4:8:2`。正式 co
 2. `FSDPWorker.generate_sequences` 通过 `FSDPVLLMShardingManager` 把当前 actor 权重同步到 vLLM，再采样配置的 `G=6` 个回答。
 3. 原样本按 `n` 重复并与 rollout 输出合并。
 4. 对 image OPSD，像素 IoU 回写后 driver 用未跳过 special token 的实际 caption rollout 检查：非终止的 `<|...|>` special token、`mask_2d` JSON 和超过 `caption_safety.max_response_tokens` 的输出都标为不安全。默认强制将其 route 改为 `regenerate`；不安全 caption 不进入原始 caption GRPO 或 mid-route JSD，但 localization rollout/奖励仍保留。
-5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。所有 `text`、`official_bbox` 与 `pixel_empty` 模式都让该 source 保持 caption-only non-cycle batch，与公开 CycleGRPO 一致；`pixel_empty` 只在 reward 前解码 caption response 的合法 group，提供严格空 union metadata，不生成 `grounding_query` 的 segmentation rollout。只有显式开启 direct grounding 后才会额外构造独立 segmentation batch；`consume_no_target_caption` 已废弃并强制为 `false`，防止任何 direct 配置删除主 caption PPO。
+5. 按 `source` 分流：`denseworld_single`、`denseworld_multiple`、`refcoco_cycle`、`grefcoco_cycle`、`cocostuff_cycle`、`paco_part_cycle`、`tg_multi_merged`、`dam_cyclegrpo` 和 `None` 进入 cycle batch；其他 source 进入 non-cycle batch。`grefcoco_cycle` 将 gRefCOCO 正样本的一个或多个 COCO instance mask 合并为 cycle target；`cocostuff_cycle` 是单类语义 Stuff 区域，`paco_part_cycle` 是真 object-part 区域；三者均走相同的 caption-to-localization rollout、真实 pixel IoU 与 CycleGRPO reward。其 `ann_id=[-1]` no-target 表达保留为 `gres_no_target`。`text` 与 `official_bbox` 保持 caption-only non-cycle；历史参考实验使用的 `pixel_empty` 则先从主 non-cycle batch 分离 `gres_no_target`，为其构造专用 `grounding_query` segmentation rollout，并由 `no_target_segmentation_loss_weight` 控制该 actor 的梯度权重。只有显式 direct grounding 才会再构造独立 direct segmentation batch；`consume_no_target_caption` 仍为 `false`，避免 direct 配置删除主 caption PPO。
 6. cycle/non-cycle 分别裁成能被 world size 整除的完整 GRPO groups，并按 token 数重排，降低各 rank 负载不均。
 
 `vllm_rollout_spmd.py` 负责：
@@ -400,22 +503,18 @@ reward 和 segmentation reward 使用；遗漏该 source 会使 `text2mask.compu
    UID、`localization_index`、source 等元数据严格按未补齐 prompt 数量构造，并检查输出为
    `prompt_count × K`，避免 padding 后数量残留造成 DataProto 一致性错误。
 5. vLLM offload 后再把 VQ-SAM2 移入 GPU；按原图分组，仅计算一次 SAM2 image embedding，并分 chunk 解码目标 token 与 `G*K` 个预测 response 中的合法 group。默认 `mask_decode_mode=union`，在每条 response 内取全部解码 mask 的像素 union；设置为 `first_mask` 时只保留 response 中第一个合法 group，用于复现原始训练语义。该开关同样作用于 no-target 的 `pixel_empty` 判定。
-6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。对非空正例 GT，若 response 明确包含 `No target.` 或 decoded union 为空，`positive_empty_mask_penalty` 默认在 segmentation reward 额外扣 `1.0`；真实 IoU 本身保持不变，并独立记录该负项。
-7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再严格按 `0.5/0.85` 分路由。
+6. 非法、缺失或空 mask 记为 IoU `0`。优先使用可转换的 dense/PIL/COCO RLE/polygon 原始 GT；缺失时解码 `seg_answer` 的目标 token，并记录 `raw_gt` 或 `decoded_target` reference 来源。上一版基线不含正样本空 mask 或 no-target 非空 mask 的额外 penalty；其 no-target 正确性只由严格二值 `pixel_empty_reward`（显式 `No target.` 且 decoded union 为空）提供。
+7. mask logits 双线性恢复原图尺寸并以 `0.5` 二值化；每条 caption 的 `K` 个 IoU 求均值得 `R_Ci`，再按当前入口的 `low_threshold/high_threshold` 严格分路由；未覆盖时仍为 `0.5/0.85`。
 8. 视频 cycle 保留原 tIoU 与 GRPO 路径，不进入 image-only OPSD teacher 路由。
 9. 恢复外层 rollout `n`，返回 `cycle_cap_batch` 和 `cycle_seg_batch`。
 
-主 20k 的 `pixel_empty` no-target 行与公开 CycleGRPO 一样保留为 caption-only non-cycle rollout，不读取
-`grounding_query`，也不构造 `supervised_grounding_no_target` 的 K 次 segmentation rollout。FSDP worker 在
-caption response 上按当前 decoder 模式解码合法 group；大小写不敏感的精确 `No target.` 拒识和零像素
-union 同时成立时，写回 `no_target_pixel_empty=1.0`；decoded union 非空时默认写回 `-1.0`，但
-`pixel_iou.no_target_nonempty_mask_penalty=0.0` 时写回历史兼容的 `0.0`；空 union 但拒识格式无效时始终写回
-`0.0`。随后该 batch 仍由常规 caption reward、log-prob、KL 和 GRPO advantage 路径更新 captioner。独立 direct no-target segmentation rollout
-仅在外部 direct grounding 配置明确启用时运行。
-`no_target_pixel_empty` 与 `no_target_reward_mode` 仅是上述 reward 阶段的临时 metadata：优势计算完成后、
-non-cycle caption batch 与 cycle caption batch 拼接为 actor PPO batch 前，trainer 会从两侧移除它们。
-这是 `DataProto.concat` 的必要约束，因为该字段只由 no-target 子 batch 生成；它不改变已经写入
-`token_level_scores`/advantage 的 no-target 奖励或 PPO 更新。
+主 20k 的 `pixel_empty` no-target 行沿用上一版的专用 segmentation actor：trainer 先从 non-cycle
+batch 分离每个唯一 `gres_no_target` UID，再复制为 `K=6` 个 localization rollout，并通过
+`compute_no_target_pixel_empty` 计算严格二值 reward。只有显式 `No target.` 且 decoded union 为空时
+得到 `1.0`，其他情况为 `0.0`；该批次与 cycle segmentation 一起进入 actor 更新，梯度乘以
+`worker.opsd.no_target_segmentation_loss_weight`（默认 `1.0`）。因此这些行不会进入 caption batch
+concat，也不需要 `no_target_pixel_empty`/`no_target_reward_mode` 的临时 metadata 清理。独立 direct
+no-target segmentation rollout 仍按外部 direct supervision 配置运行。
 
 启用 `worker.supervised_anchors.direct_grounding` 或 `direct_mask_ce` 时，trainer **只**从
 `direct_grounding.train_files` 读取 standalone direct parent batch，不再从 cycle/non-cycle 主子批抽取。
@@ -547,7 +646,7 @@ direct no-target segmentation rollout 仍按其自己的外部监督配置运行
 `POSITIVE_EMPTY_MASK_PENALTY`）默认是 `1.0`。对有非空 GT 的正例 segmentation rollout，若 response
 包含大小写不敏感的 `No target.`，或其 decoded union 没有像素，则 `seg_overall` 额外加 `-1.0`；设为 `0.0`
 可关闭。它不改变 `pixel_iou`、`R_Ci` 或离线 cIoU 指标，只通过独立的
-`seg_positive_empty_mask_penalty` 奖励字段提供相对 GRPO 信号，也绝不作用于正确的 no-target 拒识。
+`seg_positive_empty_mask_penalty` 奖励字段提供相对 GRPO 信号，也绝不作用于正确的 no-target 拒识。探索分支额外支持 `cycle_positive_empty_mask_penalty` 与 `direct_positive_empty_mask_penalty`，分别约束 cycle localization 和 direct grounding；未设置时回退到全局 `positive_empty_mask_penalty`。
 
 当 `worker.supervised_anchors.caption_qa.enabled=true` 时，trainer 从独立
 `caption_qa.train_files`（DLC-QA 10k parquet）采样 caption rollout，并将 source 改为
@@ -568,6 +667,12 @@ teacher regenerate 或 JSD。服务超时、请求失败或无唯一选项时该
 
 `tg_reward.py` 是可配置的 temporal grounding 奖励库，支持 tIoU、format、precision/recall/F1、C-Acc、caption judge 和长度惩罚；当前 `text2mask.py` 的主要视频路径只直接复用其中少量逻辑或保留了注释调用。
 
+当前主训练入口的非模块基线已重新对齐上一版实验 Git 快照 `06bf2bf`：主
+`pixel_empty` no-target segmentation actor、`worker.opsd.no_target_segmentation_loss_weight=1.0`
+和严格二值 `pixel_empty_reward` 均恢复；后续加入的正例空 mask penalty、no-target 非空 mask penalty、面积
+比例/tau 以及 caption-only no-target 分流不属于该基线。EGCA 与 SECA 是此快照之上的唯一新增空间信用模块，
+均由独立开关控制，默认关闭，不改变上述 no-target actor 或 reward 契约。
+
 ### 3.6 GRPO 与策略更新
 
 `verl/trainer/core_algos.py::compute_grpo_outcome_advantage`：
@@ -585,7 +690,42 @@ mid route 不重采样 caption。EMA teacher 使用三张 teacher-only 图像：
 
 C 还新增独立 caption anchor KL：PPO 继续使用 `policy_loss_mask`，但当 `caption_anchor_kl_all_safe_routes=true` 时，cycle caption 的 KL 使用原始 response mask 与全部 `caption_safe` route，不复用 PPO route mask。它以 `caption_anchor_kl_coef=0.05` 加入自己的 token-weighted loss numerator；non-cycle caption 和 segmentation batch 不接收该额外项，原有 `algorithm.kl_coef` 保持不变。C2 同时增加独立 segmentation anchor KL：所有 cycle localization response 都以完整 response mask 对 frozen reference 计算 `segmentation_anchor_kl_coef=0.05` 的附加 KL；它与通用 `algorithm.kl_coef=0.01` 相加，但不会施加到 caption 或 non-cycle batch。非对称梯度投影仍保留为可选诊断：`asymmetric_gradient_projection=true` 时每个 FSDP rank 先暂存 caption GRPO、regenerate CE、JSD 和 caption-anchor 的梯度，再计算 localization GRPO/segmentation-anchor 梯度；若全局内积为负，仅从 caption gradient 中减去其沿 localization gradient 的反向分量，最后仍执行原有的单次 optimizer step。当前服务器日志的 cosine 仅约 `-0.004` 到 `-0.018`，故入口默认关闭它。高置信 gate 新增 `opsd/regenerate_validated_candidate_count`、`opsd/regenerate_confident_candidate_{count,rate}`、`opsd/regenerate_confident_target_acceptance_rate`、`opsd/distillation_route_count`、`opsd/distillation_confident_{count,rate}` 与 `opsd/distillation_confident_R_Ci_mean`，必须同时检查这些项，避免阈值过严而使辅助 loss 静默为空。原有 anchor、projection、JSD finite 检查行为不变。
 
-主代码将已验证的 Evidence Gate 与 Mask Credit 统一封装为 `verl/workers/opsd/seca.py` 的 **SECA (Spatial-Evidence Credit Assignment)** 模块。`worker.opsd.seca.enabled`（入口环境变量 `SECA_ENABLED`）默认关闭；开启后不改动 pixel-IoU、`R_Ci`、reward 或原始 GRPO：`spatial_evidence_weight` 用 IoU 与 reconstruction-only 面积比计算 `[min_weight,max_weight]` 门控，只乘到 mid-route privileged JSD 的 sample weight；`hierarchical_mask_token_weights` 在 direct mask CE 的有效 response mask token 中识别 SAMTok depth-2 code，将首个 coarse code 乘 `coarse_token_weight`、第二个 fine code 乘 `fine_token_weight`，其余 token 保持 1。没有 direct mask CE batch 时，SECA 的 token-credit 子路径自然不产生更新；没有 mid-route 时，evidence 子路径自然不产生更新。`projects/rl/config.yaml` 保留默认关闭，`qwen3vl_4b_refcoco10k_volcengine.sh` 暴露开关和五个参数，因而可在同一主训练入口复现实验分支的 Evidence+Mask Credit 行为。
+主代码将已验证的 Evidence Gate 与 Mask Credit 统一封装为 `verl/workers/opsd/seca.py` 的 **SECA (Spatial-Evidence Credit Assignment)** 模块。`worker.opsd.seca.enabled`（入口环境变量 `SECA_ENABLED`）默认关闭；开启后不改动 pixel-IoU、`R_Ci`、reward 或原始 GRPO：`spatial_evidence_weight` 用 IoU 与 reconstruction-only 面积比计算 `[min_weight,max_weight]` 门控，只乘到 mid-route privileged JSD 的 sample weight；`hierarchical_mask_token_weights` 在 direct mask CE 的有效 response mask token 中识别 SAMTok depth-2 code，将首个 coarse code 乘 `coarse_token_weight`、第二个 fine code 乘 `fine_token_weight`，其余 token 保持 1。新增 `worker.opsd.seca.self_supervised_enabled`（入口环境变量 `SECA_SELF_SUPERVISED_ENABLED`）明确打开 cycle-only evidence gate，供纯自监督 20k 使用；该路径仍是 detached 的 JSD sample weighting，不把 evidence 写入 reward 或 GRPO advantage。没有 direct mask CE batch 时，SECA 的 token-credit 子路径自然不产生更新；没有 mid-route 时，evidence 子路径自然不产生更新。`projects/rl/config.yaml` 保留两个开关默认关闭，`qwen3vl_4b_refcoco10k_volcengine.sh` 与 `qwen3vl_4b_mt.sh` 均暴露它们和五个参数，因而可在自监督或混合训练中复现实验分支的 Evidence+Mask Credit 行为。
+
+主代码另外提供独立的动态 **EGCA (Evidence-Guided Code Attribution)** 路径，位于
+`verl/workers/opsd/egca.py`，由 `worker.opsd.egca.enabled`（入口环境变量
+`EGCA_ENABLED`）控制，默认关闭。它只作用于自监督 cycle localization，不绑定 direct
+grounding、direct mask CE、DLC-QA 或 no-target。worker 仍在合法 SAMTok depth-2 mask
+group 上解码 prefix/counterfactual，计算 coarse/fine Shapley 与 target/reconstruction
+evidence；但当前默认 `update_mode=weighted_ce` 不把 signed credit 写入 GRPO advantage。
+trainer 先按 `sample_uid` 聚合同一 prompt 的六个 localization rollout，再用其真实 pixel-IoU、
+evidence gate 和 coarse/fine credit 生成 detached、非负的 sample/token weights。随后从同一
+自监督行的 `seg_ground_truth` 构造独立 teacher-forcing batch，执行一次命名为
+`opsd/egca_weighted_self_distill_loss` 的 GT SAMTok CE；证据权重覆盖完整 mask group，
+coarse/fine 只允许增加对应 code-token 权重，负 Shapley 被截为零。这样循环仍提供 on-policy
+探索和 reward，EGCA 只提供 rollout-conditioned self-distillation，不会形成额外的负向拒识通道。
+`gres_no_target`、padding、非法 group 和 supervised source 均不会进入该 CE batch；它们仍保留
+原有二值拒识、GRPO 或 direct supervision 语义。`EGCA_OPD_ENABLED` 仍可让 evidence gate
+乘到 mid-route privileged OPD/JSD sample weight。
+
+`update_mode=legacy_advantage` 与 `credit_mode=raw|contrastive` 仅保留给历史 ablation：该
+兼容路径才会在 `compute_advantage` 后向 localization advantage 注入 signed credit，默认配置和
+新的 20k 入口均不使用它。当前实现采用解码证据 gate 而非额外可训练 evidence head；因此不宣称
+存在 learned calibration-head 参数更新。新入口 `tools/train_selfsupervised_20k_egca_weighted_ce_8gpu.sh`
+使用 20k 自监督 parquet、8 卡、batch 128、1 epoch；对应的
+`tools/train_selfsupervised_20k_egca_weighted_ce_4gpu_tmp.sh` 只用于本机 smoke test，覆盖为
+4 卡和 `MAX_STEPS=1`，不改变生产脚本默认拓扑。
+新模式 `reference_mode=target` 从每条样本的 GT SAMTok depth-2 group 动态提取 coarse/fine
+code，作为 counterfactual reference；只有显式设置 `reference_mode=fixed` 时才使用旧的
+code-0 reference，避免固定 code-0 在新训练中成为隐含的拒识偏置来源。
+
+### 3.7 GRPO/OPSD token 监督诊断边界
+
+`analysis/opsd_vs_grpo_diagnostic/` 是独立的离线诊断管线，不改变训练算法。`extract_signals.py` 只接受共同 student checkpoint 上导出的固定 rollout：必须同时包含完整 GRPO group 的 `advantages`、`response_mask`、`old_log_probs`、sampled `target_ids`、student logits、privileged teacher logits、route 和 `R_Ci`。脚本先验证完整 group（不能在路由子集上重新归一化 advantage），再固定筛选当前实现真正的 `on_policy_distill` 且 `R_Ci>=0.65` 分布教学分支，按 `(R_Ci,sample_id)` 排序，两种方法共用相同行和 mask。GRPO 调用 `verl.trainer.core_algos.compute_policy_loss` 的真实 clipped surrogate；OPSD 调用 `verl.workers.opsd.distillation.chunked_weighted_jsd_loss` 的真实 generalized-JSD、teacher entropy 权重、sample weight 和 response mask。两者均通过 autograd 计算 sampled-token 的 `-∂L/∂z[y]`，并执行有限差分检查。
+
+当前仓库的 teacher diagnosis JSONL 和 FSDP checkpoint 没有保存这些逐 token logits/rollout 张量，因此严格脚本缺少输入时只写 `metadata.json` 的 blocked 状态，不生成随机或手工热力图。为满足日志级诊断需求，`plot_logged_proxy.py` 仍可从单个真实 OPSD run 生成 rollout/logged-loss proxy；新增 `plot_dual_proxy.py` 则读取真实 GRPO-only run 与 OPSD run，按 12 个时间阶段生成双热力图和两条独立的 logged-direction 路径：GRPO 面板把阶段聚合的一个 `pixel_iou_mean` 广播到六列，OPSD 面板保留每条 diagnosis 的六个真实 `pixel_ious`，并以该 diagnosis 的六次 rollout 均值为中心显示正负残差。因此该图直接展示 row-wise scalar credit 与 rollout-level evidence variation 的监督结构差异，但由于两套 run 不是共同 checkpoint/fixed rollout，不能作 loss 因果消融，也不能称为 token autograd 或参数更新图。`plot_signals.py` 的严格二维面板在没有 before/after 参数更新时明确使用允许的 local-logit-gradient fallback；只有 A/B 位置由更新前 teacher/student sampled-token log-prob 差异预注册阈值划分。严格图和两种日志代理图都只覆盖 OPSD 分布教学分支，不覆盖 regenerate、mask-code localization 或 SECA direct-CE 权重。 第一张增强双热力图由 `plot_ab_enhanced.py` 生成，使用统一对称色标和离散色阶；第二张配对更新图由 `plot_paired_update_direction.py` 严格要求共同 checkpoint/fixed rollout 的 `delta_logp_grpo`、`delta_logp_opsd`、`teacher_gap`、`group_id`，当前输入缺失时只写 blocked metadata，不生成模拟路径。
+
+新增的 `analysis/token_update_scatter/` 是另一条只读、离线的论文图诊断管线。`extract_token_updates.py` 从文档记录的 disjoint RefCOCO parquet 固定抽取样本，用同一个 processor 对 SAMTok base、官方 GRPO checkpoint、Pixel-OPSD checkpoint 和独立 direct-supervision checkpoint 做真实 teacher-forced 多模态前向；只保留 GT depth-2 mask-code token，并保存四套 log-prob、有限值 mask、目标 token 位置和 `intervention_rollouts.jsonl`。由于历史 run 没有共同 sampled rollout、逐 token logits 或 before/after optimizer state，该管线采用明确命名的 `teacher_alignment` fallback：横轴是独立 teacher 与 base 的 log-prob 差，纵轴是历史 checkpoint 相对 base 的实际 `Δlog p`。这不是重新执行 GRPO/OPSD 更新，也不能将两套不同训练 parquet 的 checkpoint 差异表述为公平 objective 消融或因果 token credit。`plot_token_updates.py` 生成共享点、范围和色标的二维 GRPO/Pixel-OPSD 面板及同一批点的三维视图；三维 reliability 明确定义为 base 对 GT mask-code 序列的 `exp(mean log p)`，不是训练代码的 `R_Ci`。脚本、配置、审计、图注和真实数组均保存在该目录，且不修改论文、训练入口或 checkpoint。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -659,7 +799,7 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 
 | 文件 | 职责 |
 |---|---|
-| `README.md` | CycleGRPO 项目入口、训练/评测命令、公开结果和路径占位符 |
+| `README.md` | CycleGRPO 项目入口、环境/数据重建说明、四个 routing 70k 训练入口、评测命令、公开结果和路径占位符 |
 | `README_EasyR1.md` | 上游 EasyR1/veRL 框架说明 |
 | `tools/multinode/launch_four_trials.sh` / `tools/multinode/launch_four_cycle_trials.sh` | 四组纯 20k 两节点 Ray controller；读取 Ray 地址/namespace/试验 env，在就绪超时内预检每组 16 Ray GPU，以导出 env 启动并记录实际 trainer launcher PID；后者是面向用户的明确 pure-cycle 入口，不创建 SSH head/worker |
 | `tools/multinode/clusters.tsv.example` | 纯自监督四组两节点 Ray 清单模板；填写平台 Ray 地址、namespace 和试验 env 文件 |
@@ -670,13 +810,32 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/gpu_power_hold.sh` | 显式 GPU 压力占用工具；默认仅对 GPU 0--3 各启动一个独立 worker，预留约 40000 MiB 并持续 BF16 矩阵乘以维持 GPU 利用率/功耗。支持 `start`、`status`、`stop`，只按自身 worker tag 停止 PID，绝不扫描或终止其他 CUDA 进程 |
 | `tools/reassemble_fsdp_checkpoint.py` | CPU/Gloo 离线 FSDP checkpoint 重组器；按 checkpoint 文件名发现并启动同等数量 CPU rank，逐参数收集原 world-size shard 后在 rank 0 还原完整 state dict、复制 processor/config 并写出 HF safetensors。用于训练 world size 无法同时获得足量 GPU 时的评测导出 |
 | `tools/run_official_cyclegrpo_keepalive.sh` | 调用未修改官方 CycleGRPO 训练入口；仅训练成功退出后启动 CUDA 保活工具，训练失败保留原退出码 |
+| `tools/train_selfsupervised_40k_teacher_8gpu.sh` | 40k scaling 纯自监督 OPSD/teacher 单节点八卡入口；batch 128，pixel-empty 二值 no-target 惩罚与正例空 mask 惩罚开启，不启用 direct/DLC-QA |
+| `tools/train_selfsupervised_80k_teacher_8gpu.sh` | 80k scaling 纯自监督 OPSD/teacher 单节点八卡入口；启动时原子合并 40k cycle 与 40k segmentation parquet，batch 128，pixel-empty 二值 no-target 惩罚与正例空 mask 惩罚开启 |
+| `tools/train_selfsupervised_20k_egca_4gpu.sh` | 当前服务器四卡 EGCA 纯自监督入口；读取 20k raw cycle parquet，batch 128、1 epoch，开启 teacher/OPSD/pixel-empty/正例空 mask 惩罚，每 5 step 保存且最多保留 2 个 checkpoint，结束后启动 CUDA 保活 |
+| `tools/train_selfsupervised_20k_opsd_all_samples_4gpu.sh` | 四卡 routing 消融入口；使用历史 20k 配置，关闭 SECA/EGCA，跳过 R_Ci 三路由分类并将全部 image-cycle 样本送入 OPSD privileged correction，保留原始 GRPO，结束后启动 CUDA 保活 |
+| `tools/train_selfsupervised_20k_egca_weighted_ce_8gpu.sh` / `tools/train_selfsupervised_20k_egca_weighted_ce_4gpu_tmp.sh` | 新版 EGCA 20k 自监督入口与本机临时 smoke wrapper；生产脚本默认 8 卡、batch 128、1 epoch，rollout evidence 只生成非负 GT self-distillation CE 权重，临时 wrapper 覆盖为 4 卡/1 step 且不启动保活 |
+| `tools/train_supervised_70k_common_8gpu.sh` | 70k 混合训练的共享启动器；默认校验 20k/30k/10k/10k，缩量 wrapper 下按固定种子和 cycle source 分层生成 25%/50% parquet 与匹配的 DLC-QA JSONL，校验行数；启动 7-GPU Ray head 与 GPU 7 的本地 Llama judge，传递历史 batch/anchor 配置，退出时清理自有 Ray session 并请求八卡 hold |
+| `tools/train_supervised_70k_baseline_8gpu.sh` | 70k 历史 OPSD+有监督 baseline wrapper；SECA 和 cycle-only SECA 均关闭 |
+| `tools/train_supervised_70k_baseline_25pct_8gpu.sh` / `tools/train_supervised_70k_baseline_50pct_8gpu.sh` | 历史 baseline 的全流数据量消融 wrapper；分别使用 25%/50% 分层子集和 45/90 默认训练步数，独立 run 名称、Ray/judge 端口与 Ray 临时目录 |
+| `tools/train_supervised_70k_baseline_25pct_4gpu_tmp.sh` | 25% baseline 的本机四卡一步 smoke wrapper；GPU 0--2 训练、GPU 3 judge，batch `114/228/57`，独立端口和日志，不启动结束占卡 |
+| `tools/train_supervised_70k_seca_8gpu.sh` | 70k 历史 OPSD+有监督 SECA wrapper；SECA evidence gate 与 direct mask CE token credit 开启，其他训练配置与 baseline 相同 |
+| `tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh` | 基于 SECA 正式 70k wrapper 的四个 routing 阈值单因素消融；分别覆盖 `(low,high)=(0.30,0.85)/(0.70,0.85)/(0.50,0.65)/(0.50,1.00)`，其余配置不变 |
+| `tools/train_supervised_70k_seca_routing_l030_h085_4gpu_tmp.sh` | `l030/h085` routing 变体的本机四卡一步 smoke wrapper；复用完整 70k SECA 数据和算法配置，GPU 0--2 训练、GPU 3 judge，batch `114/228/57`，不启动结束占卡 |
+| `tools/demo_refcoco_compare_1000.sh` / `tools/demo_three_capabilities.sh` | 学生演示启动器；在同一 RefCOCO 1k 子集上比较 SAMTok/Ours，及展示最佳 ours mask captioning/VQA；推理期间 GPU 1--3 运行 hold，正常或异常退出时恢复四卡 hold |
+| `tools/demo_refcoco_compare.sh` / `tools/demo_three_capabilities.sh` | 精简演示启动入口；静默调用 GPU hold helper，仅在发现 GPU 正被其他计算占用时输出一条通用提示，不打印逐卡状态表 |
+| `tools/record_pixel_opsd_demo.sh` | 录屏用单图三任务启动器；读取 `logs/pixel_opsd_recording_demo/inputs/` 的三个 JSON 任务描述，在一个模型进程中运行指代分割、region captioning 和 general VQA，并把 JSON/PNG 结果写入对应 `outputs/` 目录；模型、VQ-SAM2 和 CUDA 设备可由环境变量覆盖 |
+| `tools/train_supervised_70k_baseline_4gpu_tmp.sh` / `tools/train_supervised_70k_seca_4gpu_tmp.sh` | 本机临时 smoke wrapper；使用 CUDA 0--2 训练、CUDA 3 本地 Llama judge，batch `114/228/57` 仅跑 1 step，不启动结束占卡 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `experiments/pegc_ablation_20260902/tools/eval_direct_grpo_refusal_suite.sh` | 探索副本两版 direct-GRPO/Refusal Credit checkpoint 的四 bench 串行评测；使用本地 Llama-3.1 8B 评分 DLC，汇总 GRES 的 T_acc/N_acc/gIoU/cIoU，并在完成后恢复 GPU 占卡
+| `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh` | 探索分支 Evidence+Mask Credit 的 cycle-only 正样本 no-target 惩罚对照；cycle=1.0，direct=0.0 |
 | `TRAIN.md` | 旧的单/多节点 cold-start SFT 环境备忘，路径具有内部环境痕迹 |
 | `setup.py` / `pyproject.toml` | 将仓库安装为 `verl`；ruff 规则和 Python `>=3.9` |
 | `requirements.txt` | CUDA/PyTorch 之外的核心依赖；包括 VQ-SAM2/RefCOCO 转换所需的 Hydra、iopath、COCO RLE、COCO caption 评价和 torchvision；NumPy 限制在 2 以下以兼容当前 W&B，Transformers 锁定 `4.54-4.57`，vLLM `>=0.8` |
 | `Makefile` | 上游开发命令 |
-| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_grefcoco_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` / `tests/test_seca.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、gRefCOCO 排除抽样、DAM QA schema、anchor 配置边界和 first-mask 离线诊断解析 |
+| `paper/iclr2027/pixelopsd/build_pdf.sh` | 论文构建入口；在论文目录执行三遍 pdflatex/BibTeX 并输出最终 PDF 页数 |
+| `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/` | 由作者提供的 LaTeX 论文包整理出的可直接编译项目；包含 Figure 4 的真实 GroundingSuite 定性对比、`make_qualitative_figure.py` 图像生成器、样本来源说明和 `build_pdf.sh` |
+| `tests/test_opsd_core.py` / `tests/test_tokenizer.py` / `tests/test_gres_subset_metrics.py` / `tests/test_no_target_reward.py` / `tests/test_balanced_cycle_dataset.py` / `tests/test_grefcoco_cycle_dataset.py` / `tests/test_dam_caption_qa.py` / `tests/test_supervised_anchors.py` / `tests/test_first_mask_diagnostic.py` / `tests/test_seca.py` / `tests/test_egca.py` | 无 GPU 单元测试；覆盖 OPSD、processor、GRES 指标、no-target、混合配额、gRefCOCO 排除抽样、DAM QA schema、anchor 配置边界、SECA 兼容路径和动态 EGCA Shapley/证据 gate |
 
 ### 5.2 `verl/`：RL 引擎
 
@@ -689,17 +848,25 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `trainer/core_algos.py` | GAE、GRPO、RLOO、ReMax、REINFORCE++，PPO clip loss、KL/value loss |
 | `trainer/data_loader.py` | 主 train/val 与可恢复的独立辅助 train `RLHFDataset`、sampler/DataLoader |
 | `trainer/metrics.py` | reward、length、timing、throughput 指标汇总 |
-| `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分，以及 regenerate/direct-mask CE 的独立梯度累积调用 |
+| `workers/fsdp_workers.py` | actor/ref/critic 构建，FSDP-vLLM 权重切换，多模态前处理，rollout 后 token/tIoU 评分，以及 regenerate/direct-mask CE/EGCA weighted self-distillation 的独立梯度累积调用 |
 | `workers/actor/dp_actor.py` | log-prob 前向、动态 micro-batch、PPO loss、独立 caption anchor KL、命名的 teacher-forcing CE、梯度累积和 optimizer step |
 | `workers/critic/dp_critic.py` | GAE/PPO 可选 value model；GRPO 主配置通常不启用 critic |
 | `workers/rollout/vllm_rollout_spmd.py` | SPMD vLLM engine、采样参数、视觉输入和 response tensor 构造；caption task 动态以 logit bias 屏蔽 SAMTok/object-reference vocabulary |
 | `workers/sharding_manager/fsdp_vllm.py` | FSDP 参数与 vLLM engine 同步/offload |
 | `workers/sharding_manager/fsdp_ulysses.py` | sequence parallel 数据切分/还原 |
 | `workers/reward/function.py` | 动态加载 sequential/batch 自定义 reward 并写 token-level score |
-| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation 配置及边界校验 |
-| `workers/opsd/seca.py` | 统一的 SECA 空间证据信用分配：mid-route JSD evidence gate 与 direct mask CE hierarchical token credit；由 `worker.opsd.seca.enabled` 控制 |
+| `workers/opsd/config.py` | pixel IoU、路由、caption safety、EMA teacher、regenerate、distillation、SECA 自监督/兼容路径与动态 EGCA 配置及边界校验 |
+| `workers/opsd/egca.py` | 动态 EGCA 的合法 SAMTok group 解析、coarse/fine Shapley counterfactual credit、decoded evidence gate、非负完整 group teacher-forcing 权重、legacy 对比式 token credit 与 OPD sample-weight gate |
+| `workers/opsd/seca.py` | 统一的 SECA 空间证据信用分配：自监督/混合训练的 mid-route JSD evidence gate 与 direct mask CE hierarchical token credit；由 `worker.opsd.seca.enabled` 和自监督子开关控制 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
-| `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、共享 image embedding 的批量 `union`/`first_mask` 解码、尺寸恢复和像素 IoU |
+| `analysis/opsd_vs_grpo_diagnostic/extract_signals.py` / `plot_signals.py` | 共同固定 rollout 的真实 GRPO/OPSD autograd token 梯度提取、相同行热力图和 local-gradient 二维诊断；缺少 logits 时拒绝生成图 |
+| `analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py` | 从真实 GRPO-only 与 OPSD experiment logs 生成双方法 rollout/logged-loss 代理图；渲染 12 个候选布局并选择单一双路径版本 |
+| `analysis/opsd_vs_grpo_diagnostic/plot_ab_enhanced.py` | 从真实日志代理信号绘制增强双热力图，采用多级发散色阶和最小机制标注 |
+| `analysis/opsd_vs_grpo_diagnostic/plot_paired_update_direction.py` | 从共同 checkpoint/fixed rollout 的实测 sampled-token `delta_logp` 生成 GRPO/OPSD 配对更新方向；缺少输入时阻止生成 |
+| `analysis/token_update_scatter/extract_token_updates.py` / `estimate_token_contribution.py` | 在固定 disjoint RefCOCO 样本上对真实 HF checkpoint 做 teacher-forced mask-code log-prob 提取，并计算显式 teacher-alignment 横轴；不启动训练 |
+| `analysis/token_update_scatter/plot_token_updates.py` | 以共同点、共同范围和实际 checkpoint `Δlog p` 渲染二维/三维 token-update 诊断图 |
+| `analysis/token_update_scatter/implementation_audit.md` / `caption.tex` / `README_zh.md` / `config.yaml` | 记录 GRPO/OPSD 源码审计、坐标单位、可靠性定义、checkpoint/data provenance、限制和复现命令 |
+| `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、可复用 image embedding 的批量 `union`/`first_mask` 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
 | `models/monkey_patch.py` | 为多种 HF MLLM 注册 flash attention 和混合多模态 forward |
 | `models/transformers/*.py` | Qwen2/3-VL、Qwen3.5、Gemma4 的 RoPE、embedding 与 forward 适配 |
@@ -719,9 +886,10 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | 文件/组 | 职责 |
 |---|---|
 | `qwen3vl_4b_mt.sh` | 当前论文主训练入口 |
-| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式连接平台 1 或 2 节点 Ray cluster 的 OPSD 入口；pure controller 使用 `2 nodes / >=16 training GPUs`，有监督 controller 使用 `1 node / >=7 training GPUs`、`NUM_GPUS=7` 和本机 GPU 7 judge；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 与 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `qwen3vl_4b_refcoco10k_volcengine.sh` | 火山引擎默认单节点 8 卡、可显式连接平台 1 或 2 节点 Ray cluster 的 OPSD 入口；pure controller 使用 `2 nodes / >=16 training GPUs`，有监督 controller 使用 `1 node / >=7 training GPUs`、`NUM_GPUS=7` 和本机 GPU 7 judge；`LOCAL_JUDGE_TRAIN_GPUS` 允许本地 smoke 参数化保留卡数；`DIRECT_TRAIN_DATA`/`DIRECT_BATCH_SIZE` 与 `CAPTION_QA_TRAIN_DATA`/`CAPTION_QA_BATCH_SIZE` 建立独立外部监督流 |
+| `tools/train_selfsupervised_40k_teacher_8gpu.sh` / `tools/train_selfsupervised_80k_teacher_8gpu.sh` | scaling 纯自监督八卡入口，分别使用 40k cycle parquet 与 40k cycle + 40k segmentation 的 80k 合并 parquet；统一 batch 128 和 teacher/pixel-empty 配置 |
 | `experiments/multinode/trial_01.env` 至 `trial_04.env` | 四个可审计纯 20k 两节点 H20 模板；GPU 0--7 全部训练、统一 `128/156/256`，分别测试 official/refcoco prompt 与 first/union decode |
-| `experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env` | 四个混合任务 env：pixel-empty 20k、pixel-empty 70k（bs112/direct+CE+DLC-QA/7+1）、official-bbox 20k 和 official source-aware prompt 20k；20k 使用单节点 8 GPU、batch 128/156 step，70k 使用 1x7+GPU7 Llama、batch 112/178 step，均保持 G=K=6 与 response 256 |
+| `experiments/multinode/supervised_trial_01.env` 至 `supervised_trial_04.env` | 四个混合任务 env：pixel-empty 20k、pixel-empty 70k（历史配置 main/direct/QA=`128/256/64`、7+1）、official-bbox 20k 和 official source-aware prompt 20k；20k 使用单节点 8 GPU、batch 128/156 step，70k 使用 1x7+GPU7 Llama、156 step，均保持 G=K=6 与 response 256 |
 | `config.yaml` | CycleGRPO 的 data/algorithm/worker/reward/trainer 配置 |
 | `format_prompt/non_thinking.jinja` | 原样输出 prompt；主入口使用 |
 | `format_prompt/r1v.jinja` | 旧的 think/answer 包装模板 |
@@ -797,7 +965,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 |---|---|
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；分割生成默认最多 256 个新 token（可通过 `GRES_MAX_NEW_TOKENS` 覆盖）；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的严格离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS；另提供仅供 RefCOCO 调用的公开 CycleGRPO raw-token 兼容解析 helper |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。`cyclegrpo_legacy` 是单独的公开脚本兼容模式，强制 batch 1、128 token、special-token skip 与宽松 raw-token parser，不得作为标准分数和严格协议对比。其他模式每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数、协议与实际生成参数，协议不匹配时会重新生成 |
+| `mr_baselines/` | 五个本地基线的 MR sampled 推理适配器（Sa2VA、PaDT、UniPixel、InstructSeg、EVF-SAM）、SAMTok/图片预检、PaDT RLE 转换、保留占卡显存的单模型启动器、独立收尾监控及严格全量 RLE scorer；四个推理适配器支持按全局样本序号从中断点续跑，续跑写入独立目录；`finalize_resumed.py` 在各后缀成功退出后逐条校验顺序、严格评分、填表并请求四卡 GPU hold |
+| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。`cyclegrpo_legacy` 是单独的公开脚本兼容模式，强制 batch 1、128 token、special-token skip 与宽松 raw-token parser，不得作为标准分数和严格协议对比。其他模式每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数、协议与实际生成参数，协议不匹配时会重新生成。`demo_compare_1000.py` 在固定 seed 下抽取同一组 1,000 个 RefCOCO val 样本，按普通表达分割 SAMTok/Ours、实时显示百分比进度、保存实测 cIoU/mIoU、最大逐样本 IoU 增益对比图；`demo_three_capabilities.py` 从该预测目录选取 Ours IoU 最高样本，使用预测 mask token 做 mask-conditioned captioning，并在原图上运行传统 VQA。`record_three_tasks.py` 是独立的录屏入口：读取三个都指向同一图像的 JSON 输入，单进程依次执行 referring segmentation、region captioning、general VQA，输出三份结构化 JSON、预测/GT mask 和三张大字 PNG；固定录屏案例为 RefCOCO case `115981`（已有成功 IoU 约 `0.9747`） |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成默认上限为 256（可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 覆盖），默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
@@ -805,6 +974,17 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `bbox/` | Qwen2.5/3/3.5、InternVL、Gemma、Llama 的 bbox 输出泛化；解析 `[x1,y1,x2,y2]` 并按 0-1000 坐标还原 |
 
 无图 Llama judge 通过 `eval_llama_without_image.py` 调用 OpenAI-compatible vLLM。对于未在 tokenizer 内声明 chat template 的 Llama-3.1 HF 权重，服务端须显式提供 Llama 3 chat template；评测器还必须传入 `stop_token_ids=[128009]`，将 `<|eot_id|>` 视为每道选择题的结束 token。单题只需输出一个选项，生成上限为 16 token，避免在正确答案后继续生成下一轮 `assistant` header。
+
+`refcoco/demo_three_capabilities.py` 的 mask-captioning 与传统 VQA 仅在可视化和 `result.json` 中保留模型最终回答；会清除 `<think>...</think>` 推理块和孤立 think 标签，若清理后没有最终文本则显式报错，避免生成空白能力展示图。
+
+录屏专用 `record_three_tasks.py` 将输入与输出都渲染为横向大字展板，按实际文本测量高度，
+保留原图比例。caption/VQA 的 `answer` 和展板仅显示清理 think 标签后的最终文本，原始响应仍保存到
+`raw_response`；无合法非空分割或无最终文本会报错。终端分三步报告进度，结束后报告一个质量指标
+（单例真实像素 IoU）和两个文本非空检查，后者不是语义准确率。`summary.json` 记录实际 checkpoint、
+UTC 开始时间、耗时和样例范围，`outputs/results.txt` 便于翻阅，shell 入口将完整 stdout/stderr 同时写入
+`evaluation.log` 并保留 Python 退出码。固定 case 是从历史成功案例选出的定性展示，不能代表全量测试集；
+region captioning 的蓝色 mask 是已保存的 SAMTok 区域输入，其 token 进入 prompt，GT mask 仅供分割 IoU。
+该入口仍使用原有短分割 prompt 和 `legacy_union`，不改变论文训练或标准 benchmark 主执行路径。
 
 评测脚本通常直接加载 Hugging Face checkpoint 和 mask tokenizer 权重，不经过 `verl` trainer。训练的 `global_step_*/actor` 是 world-size 相关 FSDP shard，不能直接传给 `from_pretrained`；先通过火山引擎评测入口的 export-only worker 导出 safetensors。评测推理不需要、也不应连接训练 Ray cluster。DLC-Bench 的模型推理与外部语言 judge 分离，前者可离线运行，后者需要单独配置凭据。
 
@@ -846,7 +1026,7 @@ judge URL 填为 `-`。pixel-empty 20k、official-bbox 20k 和 official source-a
 并由 node-affine actor 在 GPU 7 启动 Llama，GPU 8--31 不使用。controller 从 env 读取 `NNODES`、`NUM_GPUS`、
 `LOCAL_JUDGE_ENABLED`，按实际拓扑预检 Ray、只对 judge-enabled 行执行 judge start/status/stop，并将 env
 完整导出给 trainer。20k 任务保持 batch 128、156 step、G=K=6、response 256；70k 任务消费 20k cycle、
-30k direct RefCOCO、10k no-target 和 10k DLC-QA，使用 batch `112/224/56`、178 step、pixel-empty、
+30k direct RefCOCO、10k no-target 和 10k DLC-QA，使用 batch `112/224/56`、179 step、pixel-empty、
 direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller 不执行 SSH、`ray start`、`ray stop`
 或 NCCL 网卡配置。真实启动前应执行 `launch --dry-run`，确认每个 trial 的节点/GPU/judge 分支。
 
@@ -1934,7 +2114,7 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 代码：修改 `projects/rl/experiments/multinode/supervised_trial_01.env`、`supervised_trial_03.env`、
   `supervised_trial_04.env` 和 `tools/multinode/supervised_clusters.tsv.example`；未修改训练算法或数据。
 - 行为：三个 20k 自监督任务的 `NNODES` 从 2 改为 1，仍由 Ray 登记 GPU 0--7、batch 128、156 step；
-  70k 任务保持单节点 7 卡训练并在 GPU 7 启动 Llama，因此每个任务物理最多使用 8 张卡。
+70k 任务保持单节点 7 卡训练并在 GPU 7 启动 Llama，因此每个任务物理最多使用 8 张卡。
 - 验证：执行四个 env 与 controller 的 `bash -n`、混合清单 `launch --dry-run`、确认 4 个 Ray 检查和仅 1 个
   judge 启动命令，并通过 `git diff --check`；未连接真实 Ray/H20 集群。
 
@@ -2183,3 +2363,1452 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 代码：未修改训练算法；修改 `README.md` 与 `code.md` 数据/环境说明。
 - 文档：预检现在使用入口真实变量名 `DIRECT_GROUNDING_ENABLED`、`DIRECT_MASK_CE_ENABLED`、`SUPERVISED_CAPTION_QA_ENABLED`，并检查 OPSD、SECA、routing、EMA teacher、teacher analysis/confidence、caption safety 全部开启；明确合并 40k 文件仅作说明，正式入口使用 30k+10k split。
 - 验证：README 全部 bash block、70k 训练入口和 eval 入口通过 `bash -n`；核心依赖 import smoke 通过；两条监督 parquet source 严格为 30,000 `refcoco_cycle` 与 10,000 `gres_no_target`；`git diff --check` 通过。
+### 2026-09-13 — Pixel-OPSD manuscript iteration
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `paper/iclr2027/pixelopsd/main.pdf`.
+- Behavioral impact: expanded Related Work, Method, OPD, EGCA, supervised mixing, training schedule, evaluation protocol, ablation rationale, cross-benchmark analysis, reproducibility, and conclusion. The body is nine pages with Conclusion on page 9; references occupy two pages and the appendix follows.
+- Verification: three-pass pdflatex/BibTeX; 12 pages total. No fatal, undefined-reference, or overfull diagnostics in `main.log`; underfull vbox warnings remain from float balancing.
+
+### 2026-09-13 — figure regeneration
+- Changed files: `paper/iclr2027/pixelopsd/figures/overview.pdf`, `framework.pdf`, `results_bars.pdf`, `qualitative.pdf`, and regenerated `main.pdf`.
+- Behavioral impact: regenerated all four manuscript figures from the maintained plotting script after layout updates; no training or evaluation behavior changed.
+- Verification: figure generation completed successfully; three-pass LaTeX/BibTeX compile produced a 12-page artifact with no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — pagination command fix
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `paper/iclr2027/pixelopsd/main.pdf`.
+- Behavioral impact: corrected the doubled-backslash conclusion break that printed literal LaTeX commands; the manuscript now has a clean nine-page body, with references starting after the conclusion and spanning two pages, followed by the appendix.
+- Verification: three-pass pdflatex/BibTeX; 12 pages total; `pdftotext` confirms no literal `clearpage` or `sectionConclusion` text and `main.log` has no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — qualitative figure spacing refinement
+- Changed files: `paper/iclr2027/pixelopsd/make_revised_figures.py`, regenerated the four figure PDFs and `main.pdf`.
+- Behavioral impact: increased qualitative panel height and separated its legend from the image-row metadata to reduce top-row collisions; no model, training, or evaluation behavior changed.
+- Verification: plotting script completed successfully; three-pass LaTeX/BibTeX compile produced 12 pages with no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — final body/reference pagination pass
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: consolidated the analysis narrative before the conclusion, preserved a nine-page body with clean conclusion boundary, and increased bibliography leading so references occupy two physical pages.
+- Verification: three-pass pdflatex/BibTeX; 12 pages total, no literal LaTeX command text, and no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — analysis-page density pass
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added design-implication, audit-trail, and reader-checklist prose before the conclusion to improve the previously sparse analysis page while preserving the nine-page body and two-page bibliography.
+- Verification: three-pass pdflatex/BibTeX; 12 pages total; pages 7–9 now contain connected analysis/conclusion text, with no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — result-chart label margin
+- Changed files: `paper/iclr2027/pixelopsd/make_revised_figures.py`, regenerated `results_bars.pdf` and `main.pdf`.
+- Behavioral impact: widened the left plotting margin so the full `GroundingSuite` label remains visible at normal paper scale.
+- Verification: plotting script and three-pass LaTeX/BibTeX compile succeeded; 12 pages and no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — algorithmic method clarification
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added explicit five-step training procedure and gradient/information-boundary description for OPD, EGCA, policy, and supervised losses; no training code or evaluation behavior changed.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — appendix and source-syntax cleanup
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: expanded the appendix with rollout-record, evaluation-command, hyperparameter-disclosure, and inference-path details; corrected command escaping introduced during the expansion.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, one-page appendix, and no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — introduction motivation and contribution roadmap
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added a literature-facing motivation paragraph, explicit OPD/EGCA/supervised contribution roadmap, and research questions; retained the nine-page body, two-page references, and one-page appendix.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with clean conclusion/reference boundary and no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — literature citation integration
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: connected the motivation and Related Work claims to policy optimization, pixel MLLM, distillation, preference-learning, and multimodal pretraining references; no experimental values or training behavior changed.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body and two-page references, no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — full-width table layout
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: converted the main comparison and ablation exhibits to full-width elastic tables so columns use the available page width; metric ownership and provisional cells are unchanged.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with no fatal, undefined-reference, or overfull diagnostics.
+
+### 2026-09-13 — paragraph command cleanup
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: corrected escaped paragraph and math commands in the algorithmic method text so labels render as typography rather than literal strings.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, one-page appendix, and no fatal, undefined-reference, overfull, or missing-character diagnostics.
+
+### 2026-09-13 — ablation float environment correction
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: corrected the ablation exhibit's closing environment to `table*`, ensuring the full-width table is placed and captioned as intended.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — restrained table emphasis
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added light header and proposed-method row shading using `xcolor`/`colortbl` to improve table scanning without changing metric values or table ownership.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, one-page appendix, and no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — appendix reproducibility detail
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: expanded the appendix with data-conversion, determinism, and logging-schema details so the supplementary page is a substantive reproducibility artifact rather than a short placeholder.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body, two-page references, and one-page appendix; no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — cross-reference labels
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added formal labels to all figures and tables and replaced informal figure/table mentions with resolvable cross-references.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, no fatal or undefined-reference diagnostics, and `git diff --check` passes.
+
+### 2026-09-13 — equation cross-references
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: labeled the cycle, OPD, and EGCA equations and connected their surrounding prose with explicit equation references.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — ablation caption clarification
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: clarified the ablation caption's fixed controls, progressive row semantics, diagnostic ownership, and meaning of provisional dashes.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, one-page appendix, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — clean-build color package fix
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: removed the duplicate `xcolor` option load already provided by the ICLR style, retaining `colortbl` for row shading. Clean builds now run BibTeX and resolve citations correctly.
+- Verification: three-pass pdflatex/BibTeX from the paper directory; `main.bbl` generated, 12 pages produced, and no fatal, undefined-reference, overfull, missing, or option-clash diagnostics.
+
+### 2026-09-13 — caveat deduplication
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: consolidated repeated provisional/audit caveats in the body so the method-to-evidence narrative is less defensive; the explicit placeholder policy remains stated once in the evaluation section and appendix.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — related-work citation anchoring
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: attached direct citations to the SAMTok/pixel-MLLM, CycleGRPO, and supervised multimodal claims in Related Work, strengthening technical comparisons without adding unsupported claims.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — abstract evaluation scope
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added a concise evaluation-scope sentence to the abstract and adjusted bibliography leading to retain exactly two reference pages after the added front-matter text.
+- Verification: three-pass pdflatex/BibTeX; 12 pages, nine-page body, two-page references, one-page appendix, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — self-contained figure captions
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: rewrote all four figure captions to state the visual encoding, evaluation condition, and intended takeaway; no figures or metric values changed.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — result interpretation narrative
+- Changed files: `paper/iclr2027/pixelopsd/main.tex`, regenerated `main.pdf`.
+- Behavioral impact: added a main-findings subsection that interprets the headline table and signed transfer figure along separate spatial, semantic, and stability axes, while explicitly preserving provisional-value caveats.
+- Verification: three-pass pdflatex/BibTeX; 12 pages with nine-page body and two-page references, no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 — benchmark-chart title margin
+- Changed files: `paper/iclr2027/pixelopsd/make_revised_figures.py`, regenerated `results_bars.pdf` and `main.pdf`.
+- Behavioral impact: moved benchmark titles and case-count labels inward so the full `GroundingSuite` text is visible and does not collide with the plot boundary.
+- Verification: plotting script and three-pass LaTeX/BibTeX compile succeeded; 12 pages with no fatal, undefined-reference, overfull, or missing diagnostics.
+
+### 2026-09-13 - 探索分支拆分 cycle/direct 正样本 no-target 惩罚
+
+- 代码：更新 `experiments/pegc_ablation_20260902/verl/workers/opsd/config.py`、`verl/workers/fsdp_workers.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_pegc_ablation.sh`；新增 `tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：探索分支支持独立的 cycle 与 direct 正样本空 mask 惩罚；本实验仅对 cycle localization 开启 `1.0`，direct GRPO 设为 `0.0`，Evidence、Mask Credit、DLC-QA 和 1/10 数据配方不变。根目录主训练入口不受本探索实验影响。
+- 验证：探索分支配置 fallback/显式值断言、Python `py_compile`、两个 shell 入口 `bash -n` 通过；训练与四项评测待启动。
+
+### 2026-09-13 - 固化拆分惩罚实验的本机四卡入口
+
+- 代码：更新 `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：默认拓扑改为当前服务器 GPU0--2 训练、GPU3 启动本地 Llama judge，批大小调整为 `108/216/54`；8 卡服务器仍可通过 `TRAIN_GPU_LIST`、`TRAIN_NUM_GPUS`、`LLAMA_GPU` 覆盖，cycle/direct 惩罚值保持 `1.0/0.0`。
+- 验证：脚本通过 `bash -n`；训练尚未启动。
+
+### 2026-09-13 - 修正拆分惩罚入口启动提示
+
+- 代码：更新 `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：恢复 Llama judge 启动提示中的实际 GPU 编号显示；不改变 CUDA 绑定、惩罚拆分或训练参数。
+- 验证：脚本通过 `bash -n`。
+
+### 2026-09-13 - 恢复 judge GPU 提示变量
+
+- 代码：更新 `experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh`。
+- 行为：启动日志显示实际 `LLAMA_GPU` 编号，便于跨服务器确认 GPU 绑定。
+- 验证：`bash -n` 通过。
+
+### 2026-09-13 - 修复 branch launcher 的 conda 激活阻断
+
+- 代码：更新 `experiments/pegc_ablation_20260902/projects/rl/qwen3vl_4b_pegc_ablation.sh`。
+- 行为：训练入口跳过易受容器 CONDA_PREFIX/PATH 影响的 `conda activate`，直接使用 `/bin/python3` 与 `/bin/ray`，避免在 judge 健康后阻断 Ray 训练。
+- 验证：launcher 通过 `bash -n`；待重新启动训练验证。
+
+### 2026-09-13 - 缩短拆分惩罚实验 Ray 临时目录
+
+- 代码：更新 experiments/pegc_ablation_20260902/tools/train_evidence_mask_credit_cycle_penalty_only_1of10_epoch1.sh。
+- 行为：将默认 RAY_SHORT_ROOT 改为 /dev/shm/pegc-cycle，满足 launcher 的绝对路径和 32 字符限制，避免 judge 加载后训练入口退出。
+- 验证：脚本通过 bash -n。
+
+### 2026-09-13 - 加密消融展示并压缩论文重复分析
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`、`paper/iclr2027/pixelopsd/make_revised_figures.py`；新增 `paper/iclr2027/pixelopsd/figures/ablation_diagnostics.pdf`。
+- 行为：消融表扩展为前缀一致性、粗/细 IoU、边界 F1、校准、QA 与拒答率等独立诊断；新增仅描述启用信号的消融图，不填充未导出的 Pixel-OPSD 结果。将重复的后段总结合并为方法分析、审计轨迹与评测交接三部分；参考文献仍保持两页，正文结构和 EGCA 唯一模块命名不变。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功，生成 12 页 PDF（正文 9 页、参考文献 2 页、附录 1 页）；无致命 LaTeX 错误，交叉引用和图表资源均可解析。
+
+### 2026-09-13 - 按 ICLR 浮动体约束调整首屏与正文比例
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将 overview 图从 Introduction 首段移至 Related Work 之后，避免 `figure* [t]` 回浮到标题页顶部；移除正文中的独立 Reproducibility 小节，将其审计内容保留在 Analysis 与附录；参考文献改为紧凑双页排版。
+- 验证：`./build_pdf.sh` 成功生成 12 页 PDF，页序核验为正文 9 页、参考文献 2 页、附录 1 页；overview 从第 2 页开始，未发现致命 LaTeX 错误。
+
+### 2026-09-13 - 修正首屏浮动体并收束正文后半段
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：overview 图改在 Related Work 后排版，防止 ICLR 双栏浮动规则将其回置到第一页；正文删除独立重复的 Reproducibility 小节，改为机制诊断、范围与审计、评测交接三个连续段落；保留完整九页正文与两页参考文献。
+- 验证：运行 `./build_pdf.sh` 成功，生成 12 页（正文 9 页、参考文献 2 页、附录 1 页）；overview 位于第 2 页，日志无致命错误。
+
+### 2026-09-13 - 加深方法推导并平衡双页参考文献
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：在 Method 中补充 token/code credit routing、teacher 因果顺序、优化成本及组件边界的细节；将后半段重复的跨基准/可复现总结压缩为单一 Interpretability and Reproducibility 段落与机制诊断段，避免页面填充式重复；调整 bibliography 间距使参考文献稳定占两页。
+- 验证：运行 `./build_pdf.sh` 成功，生成 12 页 PDF；页序为正文 9 页、参考文献 2 页、附录 1 页，`main.log` 无 fatal、undefined-reference、overfull 或 missing-resource 诊断。
+
+### 2026-09-13 - 扩展消融机制解释以平衡第七页
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：在消融表和诊断图后补充各变体的因果预期、指标归属与导出统计协议，使消融章节成为独立实验分析而非空表占位；不改变任何占位数值或主表指标。
+- 验证：`./build_pdf.sh` 成功，PDF 保持 12 页（正文 9、参考文献 2、附录 1），并完成第 7 页渲染检查，未见图文重叠或裁切。
+
+### 2026-09-13 - 固定结论后参考文献双页边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：在 bibliography 前加入显式分页，恢复较易读的 `small` 字号、1.05 行距和 12pt 条目间距，使参考文献完整占用第 10--11 页；附录从第 12 页开始，结论完整留在第 9 页。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页；页序核验为正文 9 页、参考文献 2 页、附录 1 页，`main.log` 未出现 fatal、undefined-reference、overfull 或 missing-resource 诊断。
+
+### 2026-09-13 - 压缩失败类型分析以保持九页正文
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：在 Interpretability and Reproducibility 中加入紧凑的 selection/extent/relational failure taxonomy，解释两个 benchmark 的互补压力；控制段落长度，避免正文扩展到第十页。
+- 验证：`./build_pdf.sh` 成功生成 12 页，正文仍为 9 页，参考文献 2 页、附录 1 页；第 9 页完成渲染检查。
+
+### 2026-09-13 - 补充训练顺序与因果解释
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：在结论前补充训练阶段顺序与可用证据的因果说明，解释 cycle warm-up、OPD、EGCA 和持续有监督锚点的关系；不新增模块名称或实验指标。
+- 验证：运行 `./build_pdf.sh` 成功，仍为正文 9 页、参考文献 2 页、附录 1 页；构建日志无致命错误。
+
+### 2026-09-13 - 平衡双页参考文献的垂直密度
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将参考文献条目间距从 12pt 调整为 18pt，在保留两页边界的前提下减少第 11 页底部空白；正文与附录内容不变。
+- 验证：`./build_pdf.sh` 成功生成 12 页，页序仍为正文 9 页、参考文献 2 页、附录 1 页。
+
+### 2026-09-13 - 修复结论段落句法断裂
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：修正 Conclusion 中 headline metrics 句子的标点与大小写断裂，保持原有论断和占位结果不变。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页；`main.log` 无 fatal、undefined-reference、overfull 或 missing-resource 诊断。
+
+### 2026-09-13 - 放大定性证据并收紧图内留白
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `paper/iclr2027/pixelopsd/figures/qualitative.pdf`。
+- 行为：提高定性图中四个 panel 的有效占比并上移图例，保留统一坐标系、目标/基线/本方法轮廓和四类错误覆盖；不改变画布尺寸与正文分页。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 8 页渲染检查无字体重叠、裁切或图例遮挡。
+
+### 2026-09-13 - 在 overview 中显式标注推理边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `paper/iclr2027/pixelopsd/figures/overview.pdf`。
+- 行为：在 outcome 卡片加入 “inference: image + query only” 标注，明确 EGCA 只参与训练期 credit assignment，不增加推理输入或路径；不改变方法定义和图尺寸。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 2 页渲染检查新增标注清晰且无重叠。
+
+### 2026-09-13 - 提升 framework 跨栏图有效占比
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 `framework.pdf` 的跨栏宽度从 0.90 调整为 0.95 文本宽度。
+- 行为：放大训练数据流、解码证据和目标函数节点，提升 token/pixel/更新路径的可读性；不改变图内容、推理路径或分页结构。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 5 页渲染检查无溢出、裁切或节点重叠。
+
+### 2026-09-13 - 轻量放大 overview 跨栏图
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 `overview.pdf` 的跨栏宽度从 0.90 调整为 0.94 文本宽度。
+- 行为：提高问题、OPD/EGCA 干预和 inference boundary 标注的可读性，不改变图内容或首屏位置。
+- 验证：`./build_pdf.sh` 成功生成 12 页；第 2 页渲染检查通过，图内元素无重叠或裁切。
+
+### 2026-09-13 - 明确 framework 的训练/推理信息边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `paper/iclr2027/pixelopsd/figures/framework.pdf`。
+- 行为：在 rollout 区域标注 inference path，在 decoded-evidence 区域标注 target-conditioned training-only，强化目标掩码不进入推理路径的视觉证据。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 5 页渲染检查新增标注无重叠、裁切或越界。
+
+### 2026-09-13 - 提升主表与消融表行距可读性
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：为主比较表和独立消融表设置 1.35 的行距，在保持全宽和仅 eval 指标的前提下提高扫描性；更大的行距试验会破坏九页正文约束，未保留。
+- 验证：`./build_pdf.sh` 成功生成 12 页，正文 9 页、参考文献 2 页、附录 1 页；第 5、7 页渲染检查无表格溢出。
+
+### 2026-09-13 - 收紧实验叙事中的假设语气
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将机制解释从“expected to”改为明确的可检验问题，将未来时态的统计承诺改为评测记录描述，避免把未填结果写成已证实结论。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页，正文/参考文献/附录页序不变。
+
+### 2026-09-13 - 压缩 caption 以保持九页正文
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将消融图注压缩为独立且明确的诊断说明，避免冗余句子把 Conclusion 推到第十页；主表 caption 保持简洁，所有占位策略仍在表注/附录中说明。
+- 验证：`./build_pdf.sh` 成功生成 12 页，正文 9 页、参考文献 2 页、附录 1 页。
+
+### 2026-09-13 - 合并 Method 后段层级以改善主线阅读
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将 credit routing、teacher ordering、optimization cost 和 component boundaries 从连续编号小节改为段落级 signposts，保留全部技术内容但减少层级碎片，更接近 ICLR 论文的主线叙事。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页，正文/参考文献/附录页序不变。
+
+### 2026-09-13 - 回退 framework 重叠的 token strip 尝试
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`。
+- 行为：移除渲染检查中与 target-conditioned 标注和 EGCA 节点发生重叠的额外 token strip，保留无重叠的训练/推理边界标注版本。
+- 验证：重新运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 5 页复核无文字重叠或裁切。
+
+### 2026-09-13 - 精修草稿式措辞与消融图注
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将 abstract、消融分析和附录中的 “current draft / expected effect / will report” 等草稿式表述改为正式、可验证的论文措辞；明确占位单元格仅等待最终 checkpoint 导出。
+- 验证：`./build_pdf.sh` 成功生成 12 页，正文 9 页、参考文献 2 页、附录 1 页，构建无致命错误。
+
+### 2026-09-13 - 增加 overview 纵向层次
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将 overview 画布高度从 3.12 调整为 3.40 英寸。
+- 行为：为问题、干预和结果卡片提供更充分的内部空间，提高示例图和关键标签的可读性；不改变图语义或正文页数。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 2 页渲染检查无图文重叠或裁切。
+
+### 2026-09-13 - 收束结论并移除草稿式 checkpoint 收尾
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：将 Conclusion 末句改为方法边界与部署接口的正式总结，移除“等待最终 checkpoint”措辞；占位说明继续保留在表注和附录中。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页，正文 9 页、参考文献 2 页、附录 1 页。
+
+### 2026-09-13 - 加密消融诊断展项并平衡第七页版面
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `paper/iclr2027/pixelopsd/figures/ablation_diagnostics.pdf`。
+- 行为：扩大消融诊断画布，加入因果阶段说明和独立诊断 rail（semantic/prefix、coarse-to-fine overlap、boundary calibration、QA/refusal），仅描述启用的学习信号与评测维度，不引入新模块或未经核验的分数。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；日志仅保留参考文献页的既有 underfull vbox 提示，正文图表无 fatal、overfull、裁切或明显重叠。
+
+### 2026-09-13 - 修正消融诊断 rail 的标签拥挤
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`。
+- 行为：缩短 diagnostic rail 的显示标签并重新分配横向位置，避免长标签在窄色块中发生截断或粘连；诊断含义不变。
+- 验证：重新生成图并运行 `./build_pdf.sh` 成功生成 12 页；第 7 页渲染复核标签无遮挡、无重叠。
+
+### 2026-09-13 - 收紧结果图与定性图的边界标注
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `results_bars.pdf` 和 `qualitative.pdf`。
+- 行为：将结果图的 delta 文本和变化箭头从右边界向内收，将定性图例上移空间重新平衡，避免标注与边界或 case 标题产生视觉粘连；数据和图语义不变。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 6、8 页渲染检查无裁切、遮挡或文字重叠。
+
+### 2026-09-13 - 记录 v27 严格视觉自评结果
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v27.txt`。
+- 行为：将“编译/溢出检查通过”和“相对主页论文的视觉质量通过”分开记录，明确图表信息密度、页面填充和 section 比例仍未达到验收门槛；不把占位结果纳入审美评审。
+- 验证：自评依据最新 `main.pdf`、`main.log` 及第 2、5、6、7、8 页渲染结果；当前 gate 保持 FAIL，继续迭代。
+
+### 2026-09-13 - 提升结果表的最小行高
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在文档级设置 `\extrarowheight=2pt`。
+- 行为：增加主比较表和独立消融表的基础行间距，使通栏评测表更易扫描；不增加参数字段、不改变任何评测数值或表格列定义。
+- 验证：运行 `./build_pdf.sh` 成功生成 12 页；`main.log` 无 fatal、undefined-reference 或 overfull 诊断，正文仍为 9 页。
+
+### 2026-09-13 - 放大 overview 以匹配参考论文首屏信息密度
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将 overview 画布高度从 3.40 调整为 4.05 英寸。
+- 行为：尝试放大问题、OPD/EGCA 干预和 inference-boundary 三段式视觉摘要；4.05 英寸和 3.68 英寸版本都会使正文变为 13 页，违反 9 页正文约束，故回退到 3.40 英寸原版。
+- 验证：回退后重新生成图并运行 `./build_pdf.sh`，恢复 12 页总页数和 9 页正文；该实验版本不作为最终图形提交。
+
+### 2026-09-13 - 在固定画布内增加 overview 的具体状态
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `overview.pdf`。
+- 行为：在问题卡加入 noun/relation/boundary 三类可混淆错误，在干预卡加入 coarse-to-fine partial-code 状态，在结果卡加入 diagnose/teach/anchor 三条收益轨；不改变方法定义、数据或画布高度。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 后检查第 2 页图内元素、分页和日志诊断。
+
+### 2026-09-13 - 修正 overview 错误标签的实际重叠
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`。
+- 行为：将问题卡中与 `R_C` 框重叠的 noun/relation/boundary 色块改为分散的短标签，避免新增状态说明遮挡核心标量框。
+- 验证：重新生成图并运行 `./build_pdf.sh` 后复核第 2 页；标签与 `R_C`、照片和卡片边界均无重叠，正文仍为 9 页。
+
+### 2026-09-13 - 为 qualitative 网格补充错误类型标题
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `qualitative.pdf`。
+- 行为：四个 matched panel 的标题增加 coarse displacement、boundary drift、extent correction、stable prediction 语义标签，并改为两行排版；轮廓、IoU 和坐标系保持不变。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh`，检查第 8 页标题换行无重叠、裁切或越界。
+
+### 2026-09-13 - 重排 qualitative 图例以消除标题竞争
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`。
+- 行为：移除会占用 panel 标题空间的居中图例，改为标题下方的单行颜色说明，保持 target/baseline/Pixel-OPSD 的视觉编码不变。
+- 验证：重新生成图并运行 `./build_pdf.sh`，第 8 页渲染检查 panel 标题、图例和图像边界无重叠。
+
+### 2026-09-13 - 建立 section 长度比例审计基线
+
+- 代码：新增 `paper/iclr2027/pixelopsd/section_ratio_audit_v28.txt`。
+- 行为：记录 Pixel-OPSD 正文各 section 的页覆盖范围，并与本地 RMP-SAM、Grasp Any Region、OMG-Seg、SAMTok 的 section 分布对照；明确实验/视觉证据段落偏短，避免用页数相等替代实质内容。
+- 验证：使用 `pdfinfo`、`pdftotext` 和渲染页核对页数与章节位置；该审计用于后续重排，当前 gate 保持 FAIL。
+
+### 2026-09-13 - 将 Conclusion 锚定在正文第九页底部
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在 Conclusion 前加入可伸缩垂直间距。
+- 行为：保持正文内容和页数不变，将 Conclusion 稳定放置在第九页剩余空间的底部，避免结论悬在页面中部；不引入 filler 文本。
+- 验证：运行 `./build_pdf.sh` 并渲染第 9 页，检查 Conclusion 未溢出到参考文献页。
+
+### 2026-09-13 - 评估并回退主表字号扩展实验
+
+- 代码：短暂将主表和消融表改为 `\normalsize` 与更大行距，随后恢复原有 `\small`/`1.35` 设置。
+- 行为：字号扩展使文档变为 13 页，违反 9 页正文约束；回退后保留此前安全的全局 `\extrarowheight=2pt`，不改变表格字段或结果。
+- 验证：回退后重新运行 `./build_pdf.sh`，确认恢复 12 页总页数和 9 页正文。
+
+### 2026-09-13 - 重绘通栏主评测表
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py` 生成 `figures/main_table.pdf`，并更新 `main.tex` 使用该通栏评测展项。
+- 行为：主表采用分组/换行表头、统一灰/青色行层次，仅保留现有 eval 指标；不增加参数列、不改变任何数值。为保持 9 页正文，表格画布压缩为 1.0 英寸并使用 8.7pt 字号；外层恢复为 `table*` 以保持 Table 编号语义。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；主表 PDF 资源加载正常，正文仍为 9 页，渲染检查无标题重叠。
+
+### 2026-09-13 - 重绘独立消融评测表
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py` 生成 `figures/ablation_table.pdf`，并更新 `main.tex` 使用通栏 `Table 2`。
+- 行为：消融表采用阶段行、换行表头和统一灰/青色层次，仅保留 prefix agreement、空间、校准和 QA/refusal 等独立诊断；占位单元格继续使用 `--`，不重复主表指标。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 成功生成 12 页；第 7 页显示为 `Table 2`，表格与诊断图均无裁切、重叠，正文仍为 9 页。
+
+### 2026-09-13 - 将参考文献压缩为单页
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 bibliography 组改为 `\scriptsize`、`\baselinestretch=0.95`、`\bibsep=0pt`。
+- 行为：参考文献从两页压缩为一页，正文保持 9 页，附录顺序不变；不删除引用条目。
+- 验证：运行 `./build_pdf.sh` 成功生成 11 页（9 页正文、1 页参考文献、1 页附录）；第 10 页渲染确认条目未裁切，日志无 `Overfull`，仅保留 bibliography 页的既有 `Underfull vbox` 提示。
+
+### 2026-09-13 - 轻量放大 overview 跨栏宽度
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 `overview.pdf` 宽度从 0.94 调整为 0.98 文本宽度。
+- 行为：提高第 2 页问题/干预/结果摘要的有效面积和标签可读性，不改变画布高度、图内布局或方法语义。
+- 验证：运行 `./build_pdf.sh` 并渲染第 2 页，确认正文仍为 9 页且图形无横向裁切。
+
+### 2026-09-13 - 移除 overview 中贴边的 partial-code 说明
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`。
+- 行为：删除贴近 EGCA 框上沿的冗余 `partial-mask states` 标签，保留独立的 `z1 / z1:z2 / z1...zK` 状态色条，避免任何细小文字粘连。
+- 验证：重新生成图并运行 `./build_pdf.sh`，第 2 页渲染确认 overview 内部无文字重叠，正文仍为 9 页。
+
+### 2026-09-13 - 启用模板级 flushbottom 页面对齐
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在文档开始处启用 `\flushbottom`。
+- 行为：让正文页的可用高度通过模板正常伸缩分配，稳定第 9 页 Conclusion 的底部位置；不新增文字或改变图表数据。
+- 验证：运行 `./build_pdf.sh` 成功生成 11 页；第 9 页渲染确认 Conclusion 位于页底且无异常拉伸，日志无 `Overfull`。
+
+### 2026-09-13 - 局部放宽 bibliography 的底部对齐
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在 bibliography 分组内加入 `\raggedbottom`。
+- 行为：参考文献保持单页和紧凑条目，不让全局 `\flushbottom` 强行拉伸参考文献页；正文页布局和 Conclusion 位置保持不变。
+- 验证：运行 `./build_pdf.sh` 成功生成 11 页；无新增 `Overfull` 或引用错误，保留 page 5 浮动体的既有 `Underfull vbox` 提示待后续版面重排处理。
+
+### 2026-09-13 - 改为全局 raggedbottom 以消除浮动体警告
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将文档级 `\flushbottom` 改为 `\raggedbottom`，Conclusion 前的显式伸缩保持不变。
+- 行为：消除 page 5 浮动体组合引起的 `Underfull vbox`，避免模板强行拉伸段落；正文页数、图表顺序和结论位置不变。
+- 验证：运行 `./build_pdf.sh` 成功生成 11 页；`main.log` 不再包含 `Underfull`、`Overfull`、undefined-reference 或 fatal 诊断。
+
+### 2026-09-13 - 评估并回退参考文献字号放大实验
+
+- 代码：短暂将 bibliography 改为 `\footnotesize`/`0.80` 行距，随后恢复 `\scriptsize`/`0.95`。
+- 行为：更大字号会使参考文献重新占用两页，违反单页参考文献约束；恢复后保留 9 页正文、1 页参考文献、1 页附录布局。
+- 验证：回退后运行 `./build_pdf.sh` 成功生成 11 页，正文和引用顺序不变。
+
+### 2026-09-13 - 评估并回退 Experiments 浮动体抑制实验
+
+- 代码：短暂在 Experiments 前加入 `\suppressfloats[t]`，随后删除。
+- 行为：该命令虽让章节标题先于表格出现，却把主表和结果图推迟到下一页，造成第 5 页大面积空白；已回退以保持整体页面填充。
+- 验证：回退后运行 `./build_pdf.sh`，恢复 11 页布局；该实验版本不作为最终稿。
+
+### 2026-09-13 - 移除主表中裁切的指标分组色带
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，重新生成 `figures/main_table.pdf`。
+- 行为：删除在压缩画布中发生文字裁切的装饰性色带，保留清晰的换行表头、行层次和完整 eval 指标，避免任何视觉错误。
+- 验证：运行 `python make_revised_figures.py && ./build_pdf.sh` 后复核第 5 页主表无裁切或重叠，正文仍为 9 页。
+
+### 2026-09-13 - 执行 v31 完整交付门审计
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v31.txt`。
+- 行为：一次性核对 PDF 页数、section/图表数量、禁止模块名、LaTeX 致命诊断和占位符策略，并将机械检查与相对参考论文的人工视觉 gate 分开。
+- 验证：自动检查通过（11 页、9 页正文、无 fatal/overfull/undefined），人工视觉 gate 仍为 FAIL，继续迭代。
+
+### 2026-09-13 - 补充附录 update pseudocode
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex` 附录，在 Inference path 后加入 Update pseudocode。
+- 行为：以两句压缩摘要明确 rollout、prefix decode、teacher/evidence、四项 loss、归一化和共享 optimizer update 的可复现顺序；不新增正文模块或实验结果。
+- 验证：运行 `./build_pdf.sh` 成功恢复 11 页（9 页正文、1 页参考文献、1 页附录），附录未溢出到新页。
+
+### 2026-09-13 - 轻量放大 framework 跨栏宽度
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 `framework.pdf` 宽度从 0.95 调整为 0.98 文本宽度。
+- 行为：增加训练/证据/目标函数节点的有效显示面积，提高第 4 页 framework 标签可读性；不改变图高、节点关系或分页。
+- 验证：运行 `./build_pdf.sh` 并渲染第 4 页，确认无横向裁切、节点重叠，正文仍为 9 页。
+
+### 2026-09-13 - 完成 11 页全页渲染完整性审计
+
+- 代码：新增 `paper/iclr2027/pixelopsd/fullrender_audit_v33.txt`。
+- 行为：统一 72 dpi 栅格化 PDF 全部 11 页，记录页面尺寸和正文带内像素占用，确认无空白页、尺寸异常或资源丢失；低占用页标记为后续版面优化目标。
+- 验证：运行 `pdftoppm` 与只读 PIL 统计，11 页均为 612x792 且含有效内容；该审计不把渲染完整性误报为相对参考论文的质量通过。
+
+### 2026-09-13 - 量化正文页面有效像素密度
+
+- 代码：新增 `paper/iclr2027/pixelopsd/page_density_audit_v29.txt`。
+- 行为：以统一 80 dpi 渲染和阈值统计正文 1--9 页的非页边像素占比，定位第 2、5 页为当前最稀疏页面；该诊断不把页边距误判为内容，也不通过 filler 提高密度。
+- 验证：运行 `pdftoppm` 与只读 PIL 统计得到可复现密度表；当前 gate 保持 FAIL，后续针对第 2、5 页做有效内容重排。
+
+### 2026-09-13 - 在 overview 后加入方法运行示例
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`。
+- 行为：尝试在 Figure 1 后加入 running example，具体说明语义正确但边界过扩的轨迹如何分别由 OPD 与 EGCA 处理；该段即使压缩也会使正文变为 13 页，故删除，不作为最终稿内容。
+- 验证：删除后运行 `./build_pdf.sh`，恢复 12 页总页数和 9 页正文；不改变图表或结果。
+
+### 2026-09-13 - 适度放大 qualitative evidence 网格
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将 qualitative 画布高度从 4.45 调整为 4.78 英寸。
+- 行为：尝试扩大四个 matched panel 的有效图像面积；4.78 英寸版本会使正文变为 13 页，违反 9 页约束，故回退到 4.45 英寸原版。
+- 验证：回退后重新生成图并运行 `./build_pdf.sh`，恢复 12 页总页数和 9 页正文；该实验版本不作为最终图形提交。
+
+### 2026-09-13 - 修复 100k scaling runner 的磁盘峰值与 Llama judge 超时
+
+- 代码：更新 `tools/run_100k_scaling_opsd_8gpu.sh`。
+- 行为：将 checkpoint 周期从每 5 step 调整为每 25 step，并将保留数量从 2 改为 1；单个 FSDP checkpoint 约 69 GiB，避免下一次保存前双 checkpoint 峰值导致训练在 `experiment_log.jsonl` 写入时触发 `OSError: [Errno 28] No space left on device`。新增可覆盖的 `JUDGE_TIMEOUT_SECONDS`（默认 600 秒），用于覆盖本次 Llama vLLM 首次编译超过原 180 秒健康检查窗口的问题。训练仍使用 `RESUME=true`，数据、loss、Ray 拓扑和 1 epoch 配置不变。
+- 验证：从 `run.log` 确认磁盘满根因与 vLLM 180 秒超时；运行 `bash -n tools/run_100k_scaling_opsd_8gpu.sh`、`git diff --check -- tools/run_100k_scaling_opsd_8gpu.sh`，并核对启动/清理两处均使用 600 秒默认超时。
+
+### 2026-09-13 - 回退实验图表底部浮动试验
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将主表和结果图的浮动参数从 `[!b]` 恢复为 `[t]`。
+- 行为：底部浮动试验将实验标题推迟到图表之后，并在第 6 页产生大块无效留白；恢复顶部浮动以保留此前更紧凑的正文流和图表顺序。
+- 验证：对试验版第 5--6 页执行栅格检查，确认试验版版面退化后回退；下一步重新编译并检查总页数、日志告警及第 5--6 页视觉布局。
+
+### 2026-09-13 - 更新当前论文版式自审结论
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v34.txt`，记录恢复顶部浮动后的当前 PDF 审查结果。
+- 行为：明确区分机械交付通过与相对主页论文的主观展示质量未通过，避免把无溢出误报为视觉优越性；记录第 5--6 页顺序改善及主表、消融表、图表信息密度仍需提升的差距。
+- 验证：基于最新 `main.pdf`（11 页）及 90 dpi 渲染的第 5、6、9 页检查；`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警。
+
+### 2026-09-13 - 在九页约束内增密主结果表
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将 `main_table.pdf` 画布由 1.48 英寸增至 1.78 英寸、表格有效框增高并将字体增至 9.2 pt；未添加未经核验的 baseline 数值。
+- 行为：主表在跨栏页面中具有更大的行高和可读字号，减少窄条视觉问题，同时保持正文页数与现有指标范围不变。
+- 验证：重新运行 `python make_revised_figures.py` 与 `./build_pdf.sh`；`main.pdf` 为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警，并渲染第 5 页确认表格无裁切或重叠。该改动仍不足以宣称达到主页论文主表的半页信息密度。
+
+### 2026-09-13 - 记录主表增密后的严格自审
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v35.txt`。
+- 行为：以最新 11 页 PDF 重新评估图表可读性、页数、告警和 section 比例；明确主表可读性提升但仍未达到参考论文的信息密度，因此严格门槛保持 FAIL。
+- 验证：基于第 5 页 90 dpi 栅格图、`pdfinfo` 页数和 `main.log` 诊断执行；未将机械检查结果误报为论文质量通过。
+
+### 2026-09-13 - 回退主表过度增高试验
+
+- 代码：再次调整 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将主表画布从 2.28 英寸恢复为 1.78 英寸，并恢复有效表格框高度。
+- 行为：2.28 英寸版本即使保持三行数据也将 Conclusion 推至第 10 页，违反正文 9 页约束；恢复 1.78 英寸以保持正文分页稳定。
+- 验证：重新生成图并编译，`main.pdf` 恢复为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；该试验版本不作为最终版。
+
+### 2026-09-13 - 回退主表分组装饰叠加试验
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，移除主表上方新增的分组线与标签。
+- 行为：该装饰在栅格化 PDF 中落入表头/首行区域并造成视觉叠加，违反无重叠要求；移除后恢复稳定的无冲突表格。
+- 验证：重新生成图并编译，`main.pdf` 为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；第 5 页视觉检查确认无叠加。
+
+### 2026-09-13 - 回退消融表高度扩展试验
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，将 `ablation_table.pdf` 画布从 2.02 英寸恢复为 1.55 英寸。
+- 行为：高度扩展会将正文推至第 10 页，且不能解决占位诊断值造成的信息密度不足；恢复稳定尺寸以保持 9 页正文约束。
+- 验证：重新生成图并编译，`main.pdf` 恢复为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；第 7 页检查无裁切或重叠。
+
+### 2026-09-13 - 完成正文全页严格自审
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v36.txt`。
+- 行为：对正文 1--9 页进行 110 dpi 全量栅格检查，并核对七个图形资源；分别记录机械版式通过与相对主页论文的视觉/写作门槛未通过，避免将无碰撞误判为超越参考论文。
+- 验证：`pdftoppm` 全页渲染、像素占用统计、`pdftotext` 禁用模块名检查及 `main.log` 诊断均完成；严格 gate 继续为 FAIL。
+
+### 2026-09-13 - 提升消融诊断图层次与因果顺序可读性
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，增大消融诊断图 active/off 节点，加入不改变语义的紧凑 causal-order 轨道，并新增 `reviewer_self_audit_v37.txt`。
+- 行为：在原有画布内提高行间层次和因果顺序可读性，未引入新模块或新指标，也未改变占位数据。
+- 验证：重新生成图并编译 `main.pdf`（11 页）；90 dpi 检查第 7 页确认轨道、标签和诊断 rail 无重叠/裁切，日志无版式告警；全局参考论文优越性 gate 仍保持 FAIL。
+
+### 2026-09-13 - 回退 qualitative 图宽度扩展试验
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 qualitative 跨栏图宽度从 0.95 恢复为 0.90 文本宽度。
+- 行为：0.95 版本虽放大 panel，却将正文扩展到 10 页并破坏第 9 页 Conclusion 约束；恢复 0.90 以保持分页稳定。
+- 验证：重新编译后 `main.pdf` 恢复 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；试验版不作为最终图形布局。
+
+### 2026-09-13 - 为 overview 增加具体失败状态证据条
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，在 Problem 卡片底部加入 noun、extent、edge 三个同风格缩略图，并移除被其替代的冗余说明行；新增 `reviewer_self_audit_v38.txt`。
+- 行为：提高 overview 的视觉状态数量和下半区利用率，明确 scalar reward 对不同失败类型的混淆；不改变方法、指标或推理路径。
+- 验证：重新生成图并编译 `main.pdf`（11 页）；110 dpi 检查第 2 页确认缩略图均在卡片内、与 scalar/标签/邻卡片无重叠，日志无版式告警；全局主页论文优越性 gate 仍为 FAIL。
+
+### 2026-09-13 - 收紧逐图参考级评审门槛
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v39.txt`。
+- 行为：将评审拆分为五项逐图门槛，并对 overview、framework、results、ablation、qualitative 逐一判定；机械无碰撞通过不再等同于参考级信息密度通过。
+- 验证：基于当前 11 页 PDF、全量图资源和同尺度本地参考图复核；五张图均通过机械清洁项但未通过参考级密度项，global gate 明确为 FAIL。
+
+### 2026-09-13 - 标注 framework 的 EGCA 反馈路径
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，在 EGCA 指向目标函数的反馈箭头旁加入 `code credit` 语义标签；新增 `reviewer_self_audit_v40.txt`。
+- 行为：明确长反馈箭头表示代码级 credit 回流，提升方法图可解释性；不改变节点、公式、训练路径或推理接口。
+- 验证：重新生成图并编译 `main.pdf`（11 页）；110 dpi 检查第 5 页确认标签不接触节点、分隔线、caption 或正文，日志无版式告警；全局严格 gate 仍为 FAIL。
+
+### 2026-09-13 - 为 qualitative panels 增加局部放大证据
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，在每个 qualitative panel 内加入基于目标 mask 包围盒的 zoom inset，并新增 `reviewer_self_audit_v41.txt`。
+- 行为：局部放大显示 boundary/extent 轮廓差异，提高证据图的信息密度；复用现有目标、CycleGRPO 和 Pixel-OPSD 轮廓，不增加指标或推理输入。
+- 验证：重新生成图并编译 `main.pdf`（11 页）；110 dpi 检查第 8 页确认四个 inset 均位于各自 panel 内且不触碰标题、图例、相邻 panel 或 caption，日志无版式告警；全局严格 gate 仍为 FAIL。
+
+### 2026-09-13 - 回退主表内部脚注叠加试验
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，移除放置在主表画布底部的 protocol 脚注。
+- 行为：脚注经 PDF 缩放后落入 Pixel-OPSD 最后一行，造成可见叠加；移除后恢复已验证的无冲突表格，协议说明保留在 caption 和正文。
+- 验证：重新生成图并编译，`main.pdf` 为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；失败试验不作为交付版。
+
+### 2026-09-13 - 清理摘要中的过程性占位说明
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除摘要中关于 provisional checkpoint 单元的过程性说明；占位符解释保留在表格 caption 与附录。
+- 行为：摘要聚焦问题、OPD、EGCA 和监督混合的研究叙事，避免将内部结果转移流程写入主摘要，不改变任何实验数据或方法定义。
+- 验证：重新编译后 `main.pdf` 为 11 页，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警，`git diff --check -- main.tex` 通过；严格参考级 gate 仍为 FAIL。
+
+### 2026-09-14 - 调整总览/方法图位置并合并实验叙述
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 overview 跨栏图移至 Related Work 前、使其浮动到正文第 2 页顶部；将 framework 跨栏图移至 Method 标题后、使其浮动到 Method 开头；将 Experiments 中逐条短 subsection 合并为三组 claim-bearing 段落并使用 inline signpost。
+- 行为：恢复“总览图 -> 方法框架图 -> 实验证据”的读者路径，实验部分由碎片化短段改为较长的 evaluation design、headline comparison、controls and measurement 叙述；不改变方法、指标或训练实现。
+- 验证：重新编译并渲染第 2、3、5、6 页，确认图位置和段落结构符合要求；`main.pdf` 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细结论记录于 `reviewer_self_audit_v44.txt`。
+
+### 2026-09-14 - 将实验标题对齐主页论文命名风格
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，把自定义的 `Headline comparison`、`Evaluation design`、`Controls and measurement` 标题改为参考论文常用的 `Experiment Setup`、`Main Results` 和 `Ablation Study and Visual Analysis`；数据、基线、指标和实现检查归入 Experiment Setup，比较叙述归入 Main Results。
+- 行为：实验 section 的标题层级和命名与本地 SAMTok/RMP-SAM 等主页论文一致，避免自行发明章节名；不改变实验内容或指标。
+- 验证：重新编译并检查标题分页，`main.pdf` 为 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v45.txt`。
+
+### 2026-09-14 - 按主页论文规范清理摘要、引言与相关工作结构
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，删除 Introduction 中自定义的 Motivation/Contributions/Research questions 加粗标题，删除 Related Work 中自定义 subsection 标题并改为连续比较叙述；在 Method 前保留分页边界，使 framework 位于 Method 开头；补充 related-work 比较段落以避免第 2 页无效空白。
+- 行为：摘要、引言、相关工作恢复标准论文连续段落风格；总览图位于第 2 页顶部，framework 位于第 3 页 Method 开头；不改变方法、指标或训练实现。
+- 验证：重新编译并渲染第 1--3 页，确认无自定义引言标题、总览/框架图位置正确且无碰撞；`main.pdf` 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v46.txt`。
+
+### 2026-09-14 - 补充 related-work 方法边界比较
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在连续 Related Work 叙述末尾加入与 adapter/reranking 方法的边界比较段落，避免使用自定义小标题并改善第 2 页有效内容密度。
+- 行为：明确 Pixel-OPSD 保持 actor/decoder 接口和 sampled trajectory 的差异，不引入新模块或新实验主张。
+- 验证：重新编译并渲染第 2--3 页，`main.pdf` 仍为 11 页（正文 9 页），overview 在第 2 页顶部、framework 在第 3 页 Method 开头，日志无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v47.txt`。
+
+### 2026-09-14 - 将消融实验归入 Experiments 标准层级
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，把顶层 `Ablation Study and Visual Analysis` 改为 Experiments 下的 4.3 subsection，并保留 4.1 `Experiment Setup`、4.2 `Main Results`。
+- 行为：实验标题层级对齐本地 RMP-SAM 等主页论文的组织方式；Introduction/Related Work/Conclusion 仍为连续标准段落，不增加自定义标题。
+- 验证：重新编译并渲染第 7 页确认显示为标准 4.3 标题，`main.pdf` 为 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v48.txt`。
+
+### 2026-09-14 - 完成摘要/引言/相关工作/结论结构复核
+
+- 代码：新增 `paper/iclr2027/pixelopsd/reviewer_self_audit_v49.txt`，复核当前 `main.tex` 的 Abstract、Introduction、Related Work、Conclusion 和实验标题层级。
+- 行为：确认摘要为单段标准叙述，引言为无自定义标题的连续段落，Related Work 为无自定义 subsection 的连续比较，Conclusion 为无内部 subsection 的标准段落；不改变科学内容。
+- 验证：依据第 1--3、7 页 90 dpi 渲染及 `main.log`，确认总览/框架图位置、页数和告警均稳定；严格图形优越性仍未宣称通过。
+
+### 2026-09-14 - 清理解释性章节残留自定义 subsection
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，删除 `Interpretability` subsection 标题，使 Interpretability and Reproducibility 以连续正文呈现，仅保留 mechanistic diagnostics 与 failure taxonomy 两个证据性段落 signpost。
+- 行为：减少不必要的自创层级，使全文更接近主页论文的自然段落结构；不改变方法、实验或结论内容。
+- 验证：重新编译并渲染第 9 页，`main.pdf` 为 11 页（正文 9 页），Conclusion 仍在第 9 页底部，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v50.txt`。
+
+### 2026-09-14 - 将 Conclusion 合并为主页论文式单段
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 Conclusion 的三个短段合并为一个连续段落，保留原有论断和第 9 页底部锚定。
+- 行为：结论呈现更接近主页论文的紧凑叙述，不新增结果或主张。
+- 验证：重新编译并渲染第 9 页，`main.pdf` 为 11 页（正文 9 页），无段落碰撞或裁切，`main.log` 无 Underfull/Overfull/Fatal/Undefined 告警；详细审计记录于 `reviewer_self_audit_v51.txt`。
+
+### 2026-09-14 - 对齐实验后半段层级并恢复九页正文
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 Qualitative Analysis 与 Interpretability and Reproducibility 纳入 Experiments 子层级，改用 Qualitative Results 及其 subsubsection；删除重复的解释性诊断段落，并保留机制信息于附录记录。
+- 行为：实验结构更接近主页论文的 4.1/4.2/4.3 组织，Conclusion 紧接实验并回到第 9 页；Abstract、Introduction、Related Work、Conclusion 仍无自定义标题分段，EGCA 仍是唯一空间模块。
+- 验证：运行 `./build_pdf.sh`，`main.pdf` 为 11 页（正文 9 页、参考文献 1 页、附录 1 页），`main.log` 无 Underfull/Overfull/Undefined/Fatal 告警；已检查第 9--10 页分页与 Conclusion 位置。
+
+### 2026-09-14 - 恢复主页论文式自然段边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在 Introduction 与 Related Work 的主题转换处加入自然段空行，不添加任何自定义标题；保留 Abstract/Conclusion 单段和 Experiments 标准层级。
+- 行为：引言按动机、误差归因、贡献、研究问题分成自然段；相关工作按 pixel MLLM、CycleGRPO/OPD、监督锚点与差异化定位组织，阅读节奏更接近主页论文。
+- 验证：重新编译并渲染第 1--3 页，`main.pdf` 仍为 11 页（正文 9 页），总览图位于第 2 页顶部，`main.log` 无 Underfull/Overfull/Undefined/Fatal 告警；审计记录见 `reviewer_self_audit_v53.txt`。
+
+### 2026-09-14 - 移除实验定性分析中的自定义小标题
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 Sensitivity and stability、Qualitative protocol、Threats to validity 合并为 Experiments 下的连续自然段，保留 `Qualitative Results` 作为标准实验子节。
+- 行为：实验后半段不再引入主页论文中不存在的 subsubsection 标题，定性、稳定性和有效性讨论以连贯段落呈现；不改变指标、方法或图表。
+- 验证：运行 `./build_pdf.sh`，`main.pdf` 保持 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Undefined/Fatal 告警。
+
+### 2026-09-14 - 补充实验末尾可复现性段落
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在 Qualitative Results 与 Conclusion 之间加入连续的 checkpoint、manifest、token-level audit 说明，不新增标题。
+- 行为：填充第 9 页实验末尾的有效内容，明确诊断记录和统一评测协议，保持 Conclusion 在正文最后一页。
+- 验证：运行 `./build_pdf.sh` 并渲染第 9 页，`main.pdf` 仍为 11 页（正文 9 页），无版面或引用警告。
+
+### 2026-09-14 - 修复 Method 前空白页并定位框架图
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除 Related Work 与 Method 之间导致双栏浮动体延迟的强制 `clearpage`。
+- 行为：Related Work 尾部与 Method 连续排版，framework 图稳定位于第 3 页顶部，消除原先仅有少量文字的空白页；不改变方法内容。
+- 验证：运行 `./build_pdf.sh` 并渲染第 2--4 页，`main.pdf` 为 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Undefined/Fatal 告警。
+
+### 2026-09-14 - 放大主评测表的版面占比
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，增大主表画布、字体、行高与单元格内边距；表格仍只包含评测指标。
+- 行为：主表在双栏页面中具有更清晰的阅读尺寸和更接近主页论文的版面占比，不引入训练参数或额外字段。
+- 验证：重新生成 figures 并运行 `./build_pdf.sh`，`main.pdf` 仍为 11 页（正文 9 页），第 6 页无重叠/溢出，`main.log` 无版面警告。
+
+### 2026-09-14 - 细化 Main Results 的自然段组织
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 benchmark 定义、方法对比、训练协议与完整数据控制拆为少量较长自然段，不新增自定义小标题。
+- 行为：实验叙述更接近主页论文的长段落风格，避免短句堆叠，同时保持主表指标独立、结果不变。
+- 验证：运行 `./build_pdf.sh`，正文仍为 9 页（总 11 页），无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 扩展单段 Abstract 的信息密度
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在不引入标题或分段的前提下补充 scalar-credit 问题、三阶段方法递进、共享接口和评测协议。
+- 行为：摘要长度与主页论文常见摘要更接近，仍明确 OPD -> EGCA -> supervised mixing，且不新增结果或未经验证的数值。
+- 验证：运行 `./build_pdf.sh`，`main.pdf` 仍为 11 页（正文 9 页），`main.log` 无版面或引用警告。
+
+### 2026-09-14 - 进一步提升主表可读尺寸
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，进一步增加主表画布高度、字体与行间距，保持仅展示评测指标。
+- 行为：主表在第 6 页的可读尺寸更接近主页论文展示，且不改变任何数值或比较对象。
+- 验证：重新生成图表并运行 `./build_pdf.sh`，`main.pdf` 仍为 11 页（正文 9 页），第 6 页无重叠、裁切或溢出，日志无版面警告。
+
+### 2026-09-14 - 清理 Conclusion 单段的源文件边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除 Conclusion 正文末尾多余的空段边界，确保源文件和渲染结果均为单段结论。
+- 行为：不改变结论文字或分页，仅使单段结构检查无歧义。
+- 验证：运行 `./build_pdf.sh`，`main.pdf` 仍为 11 页（正文 9 页），`main.log` 无版面或引用警告。
+
+### 2026-09-14 - 将定性结果并入消融分析小节
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除额外的 `4.4 Qualitative Results` 标题，将定性图说明作为 `4.3 Ablation Study and Visual Analysis` 的连续正文。
+- 行为：Experiments 现在严格保持 4.1/4.2/4.3 三个主页论文式小节，定性结果、消融与分析在同一小节内组织；不改变图表内容。
+- 验证：运行 `./build_pdf.sh` 并检查 PDF 章节编号仅出现 4.1、4.2、4.3，正文仍 9 页且无版面警告。
+
+### 2026-09-14 - 补足 Introduction 的动机论证段落
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，加入关于语义选择、空间细化和语言表达三类耦合决策及其对应干预的连续论证段落，不添加标题。
+- 行为：Introduction 的篇幅与主页论文更接近，动机到 OPD/EGCA/监督混合递进关系更清楚；总览图仍位于第 2 页顶部。
+- 验证：运行 `./build_pdf.sh` 并渲染第 1--2 页，正文保持 9 页（总 11 页），无版面或引用警告。
+
+### 2026-09-14 - 消除可能被误判为自定义标题的措辞
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将 Main Results 正文中的 “headline comparison” 改为普通的 “main comparison”，避免与用户禁止的自定义标题产生歧义。
+- 行为：不改变实验含义或结构，仅统一正文措辞；章节层级保持主页论文式 4.1/4.2/4.3。
+- 验证：运行 `./build_pdf.sh`，正文 9 页、总计 11 页，日志无版面或引用警告。
+
+### 2026-09-14 - 启用 ICLR final 排版模式
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，加入模板提供的 `\\iclrfinalcopy`，关闭 review 模式左侧行号。
+- 行为：PDF 版面与主页论文成稿一致，不再显示灰色逐行编号；章节、图表和正文内容不变。
+- 验证：运行 `./build_pdf.sh` 并渲染第 1 页，确认行号消失；`main.pdf` 仍为 11 页（正文 9 页），`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 固定 framework 与 Method 的连续起始页
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，精简 Related Work 并在 Method 前保留分页，使 framework 图与 Method 标题从第 3 页同步开始；补充一段方法边界比较以改善第 2 页填充。
+- 行为：消除 framework 位于 Related Work 尾部之后的顺序歧义，保持 overview 第 2 页顶部、framework 第 3 页顶部，章节组织更接近主页论文。
+- 验证：重新编译并渲染第 2--3 页，正文仍 9 页（总 11 页），无版面或引用警告。
+
+### 2026-09-14 - 完善第 2 页 Related Work 填充与顺序
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，补充一段无标题的 preference/on-policy distillation 比较，保持 Related Work 完整结束后再分页进入 Method。
+- 行为：第 2 页内容填充更均衡；第 3 页 framework 图与 `3 Method` 标题同步置顶，避免浮动体与 Related Work 交错。
+- 验证：运行 `./build_pdf.sh` 并渲染第 2--3 页，`main.pdf` 保持 11 页（正文 9 页），无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 扩展主表方法对比并修正长方法名排版
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py`，主表加入来自公开 SAMTok 验证表的五个以上先前方法，并扩大方法列、调整字号与单元格间距。
+- 行为：主表现在同时比较 LISA、MLLMSeg、HiMTok、ARGenSeg、CycleGRPO、SAMTok、Qwen25VL-SAMTok (rl) 与 Pixel-OPSD；仅展示评测指标，不填入训练配置；不可比或未公开指标继续使用 `--`，长方法名不再贴边或溢出。
+- 验证：重新运行 `make_revised_figures.py` 与 `build_pdf.sh`，`main.pdf` 共 11 页（正文 9 页）；渲染第 6 页检查主表、柱状图和图注，无 Underfull/Overfull/Undefined/Fatal 日志警告或可见文字裁切。
+
+### 2026-09-14 - 补足第 9 页实验分析并保持结论收束
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在 4.3 末尾补充跨基准解释、负结果报告原则、定性案例选择和训练/部署边界分析，移除结论前的弹性填充。
+- 行为：正文实验分析不再过早结束；第 9 页由连续实验讨论自然过渡到 Conclusion，减少大面积空白，同时保持结论为正文最后一节。
+- 验证：运行 `./build_pdf.sh`，`main.pdf` 仍为 11 页（正文 9 页）；渲染第 9 页确认新增段落与结论无重叠、无裁切，`main.log` 无版面警告。
+
+### 2026-09-14 - 更新为作者指定论文标题
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex` 的 `\\title`。
+- 行为：论文标题改为 `Pixel-OPSD: Beyond Scalar Rewards for Pixel-Level MLLMs via On-Policy Self-Distillation`，与作者指定版本一致；正文内容和章节结构不变。
+- 验证：重新运行 `./build_pdf.sh`，检查首页标题换行、总页数及日志版面诊断。
+
+### 2026-09-14 - 增加实验图表并细化段落节奏
+
+- 代码：更新 `paper/iclr2027/pixelopsd/make_revised_figures.py` 与 `paper/iclr2027/pixelopsd/main.tex`，新增 evaluation map 和 failure-mode analysis 两类实验诊断图，并将实验、消融、引言和相关工作中的长段落拆分为中等长度自然段。
+- 行为：实验部分现在包含主表、主结果柱状图、实验分析双面板、消融表、消融诊断图和定性图；新增图只表达评测协议与误差归因，不引入虚构指标或新模块。
+- 验证：运行 `make_revised_figures.py` 与 `build_pdf.sh`，共 13 页（正文 11 页，含参考文献和附录）；`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告，并检查实验图表无可见文字重叠或裁切。
+
+### 2026-09-14 - 压缩实验尾部冗余并恢复结论收束
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，删除实验尾部重复的协议解释，保留定性案例、复现记录和结论所需论证。
+- 行为：新增实验双面板图后，正文压缩为 10 页；结论回到实验正文最后一页，避免单独生成空白结论页；段落仍保持按论证功能拆分。
+- 验证：运行 `build_pdf.sh`，`main.pdf` 共 12 页（正文 10 页、参考文献和附录），日志无 Underfull/Overfull/Undefined/Fatal 警告；第 10 页视觉检查确认结论与实验分析无重叠或裁切。
+
+### 2026-09-14 - 恢复 ICLR 九页正文限制并合并实验诊断图
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，将消融诊断图与定性图合并为横向双面板，压缩实验尾部重复说明并保留一段可复现性边界说明。
+- 行为：正文恢复为 9 页；第二页顶部贡献总览、Method 顶部框架图、实验主表和消融表均保留，实验诊断图与定性图共享一张横向展板，减少浮动体造成的空白页。
+- 验证：运行 `build_pdf.sh`，`main.pdf` 共 11 页（正文 9 页、参考文献和附录）；`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告，并渲染第 8--9 页确认图表无裁切或重叠。
+
+### 2026-09-14 - 修复第 3 页空白并完成逐页正文审查
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除 Related Work 与 Method 之间导致孤立页的 `\\clearpage`，并补充必要的 Method 实现边界说明。
+- 行为：第 3 页现在直接显示 Method 顶部框架图与方法正文；正文保持 9 页，第二页贡献总览图、主表和消融表均保留。
+- 验证：重新运行 `build_pdf.sh`，渲染第 1--9 页逐页检查；确认无空白正文页、图表裁切或重叠，`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 按实际页面覆盖率补足第 9 页正文
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，在实验图表之后补充因果可证伪性、图表组织、复现边界和混合 batch 归一化说明。
+- 行为：修正“页数为 9 但第 9 页仅有结论”的问题；正文仍为 9 页，Conclusion 保持在第 9 页末尾，新增内容均属于实验协议与实现解释。
+- 验证：逐页渲染第 1--9 页并检查实际内容覆盖；`main.pdf` 共 11 页，`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 恢复参考文献默认字体与行距
+
+- 代码：更新 `paper/iclr2027/pixelopsd/main.tex`，移除参考文献组中的 `\\scriptsize`、`\\baselinestretch=0.95`、`\\bibsep=0pt` 和 `\\selectfont` 压缩设置。
+- 行为：参考文献现在使用 ICLR 模板默认字体、字号和条目间距；正文排版未被缩小。由于取消压缩，参考文献从一页扩展为两页，总 PDF 变为 12 页，但正文仍为 9 页。
+- 验证：运行 `build_pdf.sh`，检查参考文献页渲染和正文页数；`main.log` 无 Underfull/Overfull/Undefined/Fatal 警告。
+
+### 2026-09-14 - 整理 Overleaf 可直接导入的项目包
+
+- 代码：生成 `paper/iclr2027/Pixel-OPSD-Overleaf.zip`，包含 `main.tex`、ICLR 模板 `.sty/.bst`、`references.bib`、`math_commands.tex` 和全部 `figures/*.pdf`。
+- 行为：zip 根目录直接包含 `main.tex`，不包含本地 `.aux/.log/.out`、审计截图、训练日志或旧编译缓存，可直接上传 Overleaf 并以 `main.tex` 编译。
+- 验证：检查 zip 清单共 15 个项目文件，确认主标题、参考文献路径、总览图、框架图、主表和消融表路径均存在。
+
+### 2026-09-15 - 增加指定 step_178 权重的 GRES prompt 搜索临时入口
+
+- 代码：新增 `evaluation/gres/qwen3vl_gres_eval_prompt_search_tmp.py`，仅用于当前 checkpoint 的离线 prompt ablation；维护中的 `qwen3vl_gres_eval.py` 未改变。
+- 行为：通过 `PROMPT_VARIANT` 切换严格匹配、证据核验、目标保护、短 prompt cardinality、显式计数、视觉容错、多对象容错、按短语动态路由、动态放宽及动态属性严格规则等候选指令，统一要求 no-target 输出训练分布中的 `No target.`，并为每轮实验写入独立 case 目录和 metrics 文件。
+- 验证：候选入口已通过 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile`；第 1--10 次候选均完成 14229/14229 样本并成功生成 N_acc/T_acc/gIoU/cIoU 指标；动态路由候选曾发现并修正词边界正则错误，修正后的有效动态候选继续使用同一完整数据和 `legacy_union` 解码协议；第 10 个 `dynamic_balanced` 候选按显式对象类别进行动态拒识并容忍关系措辞噪声，完整结果已与默认 prompt 对比。
+
+### 2026-09-16 - 完成作者论文包 Figure 4 定性对比
+
+- 代码：新增 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/` LaTeX 项目包及 `make_qualitative_figure.py`；更新该包的 `main.tex`、`README.md` 和 `build_pdf.sh`，生成 `figures/qualitative_comparison.pdf`。
+- 行为：Figure 4 不再使用 reserved/pending 占位布局，而是读取相同 GroundingSuite official-long-prompt manifest 的 3,715 条结果，固定展示 step-156 CycleGRPO 与 step-178 Pixel-OPSD 的四个真实案例（target recovery、extent refinement、failure、stable prediction），并在统一图像坐标中显示 target、baseline、ours 轮廓及逐例 IoU。正文明确记录评测协议、checkpoint 和样本类型；Figure 3 的待补数值占位保持不变。
+- 验证：运行 `python3 make_qualitative_figure.py` 生成 PDF；渲染图4检查无文字/图像裁切或重叠；运行 `./build_pdf.sh` 成功生成 14 页 `main.pdf`，最终 `main.log` 无 Fatal、Undefined citation/reference 或 missing-file 错误（仅保留既有 Underfull 排版提示）；生成 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final-overleaf.zip`（zip 根目录直接包含 `main.tex`），并检查清单不含 `.aux/.log/.out` 编译缓存。
+
+### 2026-09-16 - 按作者反馈校正 Figure 4 的 baseline 与样例选择
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/main.tex`、`make_qualitative_figure.py` 和 `README.md`，重新生成 `figures/qualitative_comparison.pdf` 及可直接导入的论文包。
+- 行为：论文明确将 SAMTok 作为 pretrained baseline/reference，将 CycleGRPO 定义为独立的 scalar-reward post-training comparator；Figure 4 使用同一 3,715 条 official-training-long-prompt manifest，仅展示相对 SAMTok 的四个大幅正增益样例（内部选择索引 374、633、158、2974，IoU 增益分别为 +0.970、+0.965、+0.964、+0.959），不在图中显示 case 编号、逐例 IoU、长 caption 或下降案例。消融表同时保留 SAMTok 和 CycleGRPO 两个参照行。
+- 验证：重新运行 `python3 make_qualitative_figure.py` 和 `python3 -m py_compile make_qualitative_figure.py`；核验四条匹配输入的正增益；渲染 Figure 4 确认无文字/图像裁切或重叠；随后运行 `./build_pdf.sh`，检查 14 页 PDF、引用与文件路径诊断，并重新打包 Overleaf 项目。
+
+### 2026-09-16 - 按 Oral qualitative figure 风格扩展 Figure 4 三模型对比
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`main.tex` 和 `README.md`，加入官方 CycleGRPO 结果并重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：Figure 4 采用 `GT | SAMTok | CycleGRPO | Pixel-OPSD` 四列极简布局，方法名只出现一次，每个预测格仅保留 IoU 数值；不显示 query、case 编号、长 caption、图例解释或额外说明。六个匹配样例覆盖大幅恢复、中等提升、小幅提升和接近持平，避免只展示 0 到 0.9+ 的单一增益区间。
+- 参考与依据：检索并核对 CVPR 2024 官方 Oral 日程及 10 篇公开 Oral 论文（Florence-2、LISA、InternVL、MMMU、Eyes Wide Shut、Visual Program Distillation、Learning to Segment Referred Objects、SceneFun3D、360+x、Describing Differences），归纳其共同的短列标题、同一输入横向对齐、低文字密度、指标贴近预测格和多难度样例组织方式。
+- 验证：确认 SAMTok、CycleGRPO、Pixel-OPSD 三套结果均为同一 3,715 条 manifest 且 image/query 顺序完全一致；运行 `python3 -m py_compile make_qualitative_figure.py`、重新生成并渲染 Figure 4，随后运行 `./build_pdf.sh` 并重新打包 Overleaf 项目。
+
+### 2026-09-16 - 完成 Figure 4 三模型最终版交付
+
+- 代码：最终同步 `main.tex`、`make_qualitative_figure.py`、`README.md`、`figures/qualitative_comparison.pdf`、`submission_preview.pdf` 和 Overleaf zip。
+- 行为：Figure 4 固定为 `GT | SAMTok | CycleGRPO | Pixel-OPSD`，六行样例同时保留大幅、中等、小幅和近似持平变化；每个预测格仅显示 IoU，方法名只显示在列头。
+- 验证：`./build_pdf.sh` 成功生成 14 页 `main.pdf`；渲染第 10 页确认无裁切、重叠或过密文字；`main.log` 无 Fatal、Undefined citation/reference 或 missing-file 错误；zip 根目录包含 `main.tex` 且排除编译缓存。
+
+### 2026-09-16 - 修正 Figure 4 样例约束并加入输入 caption
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`main.tex` 和 `README.md`。
+- 行为：六个样例全部满足 Pixel-OPSD IoU 同时高于 SAMTok 与 CycleGRPO 且优势超过 0.1；移除不满足该约束的原第三、六个样例。每行左侧展示真实 referring caption，右侧四个等宽面板依次为 GT、SAMTok、CycleGRPO、Pixel-OPSD，预测面板只保留 IoU 数值；新样例的轮廓差异经过逐格视觉筛选。
+- 验证：核验样例 IoU 为 `0.44/0.25/0.97`、`0.57/0.37/0.98`、`0.45/0.08/0.86`、`0.37/0.47/0.89`、`0.51/0.66/0.93`、`0.52/0.27/0.96`（SAMTok/CycleGRPO/Pixel-OPSD）；重新生成并渲染 Figure 4，确认 caption、等宽图格和轮廓差异可读。
+
+### 2026-09-16 - 参考 2026 Oral 风格完成 Figure 4 交付版
+
+- 参考：核对 CVPR 2026 官方 Oral 日程及公开论文 CoSMo3D、GeoViS、RobotSeg、INSID3、PR-MaGIC、R2-Seg、VGGT-Segmentor、Molmo2、CURE、SegMoTE 的 qualitative panels，采用其等宽对比列、左侧输入描述、短列名和格内指标标注风格。
+- 代码：最终更新 `make_qualitative_figure.py`、`main.tex`、`README.md`、`figures/qualitative_comparison.pdf`、`submission_preview.pdf` 和 Overleaf zip。
+- 验证：运行 `python3 -m py_compile make_qualitative_figure.py` 与 `./build_pdf.sh`；生成 14 页 PDF，渲染第 10 页确认 caption、等宽图格和 mask 轮廓均可读，日志无 Fatal、Undefined citation/reference 或 missing-file 错误。
+
+### 2026-09-16 - 优化 Figure 4 mask 可视化细节
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`main.tex`、`README.md`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：预测与 GT mask 改为低透明度实心填充叠加，并使用 0.65pt 细边界；IoU 标记同步缩小并降低不透明度。该绘法保留原图纹理、目标内部细节和多目标之间的空间关系，避免粗描边遮挡内容。
+- 验证：通过 `python3 -m py_compile make_qualitative_figure.py`；重新生成 Figure 4 并渲染检查六行样例，确认 mask 区域、边界、caption、IoU 和等宽面板均无裁切或重叠；随后运行 `./build_pdf.sh` 并更新 Overleaf zip。
+
+### 2026-09-16 - 统一 Figure 4 面板宽度并进一步细化边界
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`README.md`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：所有样例先放入相同 `1.33` 固定宽高比画布，再进入四个模型列，保留原图比例并消除竖幅样例造成的窄面板；mask 边界进一步细化为 `0.20pt`。
+- 验证：运行 `python3 -m py_compile make_qualitative_figure.py`，渲染 Figure 4 检查六行四列外框等宽且无图像拉伸、裁切或文字重叠；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并重新打包 Overleaf 项目。
+
+### 2026-09-16 - 恢复 Figure 4 边界并提高原图清晰度
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`README.md`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：mask 边界恢复为 `0.65pt`；原图与 overlay 使用 `interpolation="none"`，Figure 4 PDF 导出分辨率提升至 `1200dpi`，避免原始照片在导出时被低分辨率栅格化或平滑压缩。
+- 验证：运行 `python3 -m py_compile make_qualitative_figure.py`，通过 `pdfimages -list` 核对 Figure 4 内嵌图像分辨率，再渲染检查边界、细节和等宽面板；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并重新打包 Overleaf 项目。
+
+### 2026-09-16 - 按作者选择保留 Figure 4 三个样例
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`main.tex`、`README.md`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：Figure 4 仅保留原六行中的第三、第五、第六行（manifest 索引 `1525、1947、2050`），删除其余三个样例；三模型列、caption、IoU、固定宽高比画布和高分辨率图像渲染保持不变。
+- 验证：运行 `python3 -m py_compile make_qualitative_figure.py`，核对生成图仅含三行并渲染检查无裁切或重叠；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并重新打包 Overleaf 项目。
+
+### 2026-09-16 - 按三行布局压缩 Figure 4 空白
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：Figure 4 总高度根据保留的三行样例自适应，减少六行模板遗留的垂直空白并放大有效图格；样例索引、等宽面板、0.65pt 边界和高分辨率图像保持不变。
+- 验证：重新渲染 Figure 4 检查三行间距、caption、mask 和 IoU 标注；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并更新 Overleaf 项目包。
+
+### 2026-09-16 - 将 Figure 4 调整为横向紧凑布局
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：缩短三行 Figure 4 的总高度，标题行高度改为 `0.18`、行间距改为 `0.03`，并将 PDF 外边距设为 `0.01in`；样例行紧密排列，图像上下不再保留额外空白。
+- 验证：重新渲染 Figure 4 检查横向比例、行间距、上下边界、caption 和等宽图格；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并更新 Overleaf 项目包。
+
+### 2026-09-16 - 移除 Figure 4 图像填充框并铺满面板
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`、`README.md`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：删除固定画布的白色 padding，不再为不同原图比例补边；原图和对应 mask 直接铺满各自等宽面板，并通过 `aspect="auto"` 拉伸到统一面板尺寸，去除当前第三行的填充框。
+- 验证：重新渲染 Figure 4 检查三行无填充边框、原图与 mask 对齐、列宽一致且无裁切；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并更新 Overleaf 项目包。
+
+### 2026-09-16 - 恢复 Figure 4 标题与样例行间距
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：恢复六行版本使用的标题行比例 `0.22` 与行间距 `0.14`，并按三行内容设置总高度；GT、SAMTok、CycleGRPO、Pixel-OPSD 标题与第一行之间，以及各样例行之间重新保留清晰间隔。无填充框和原图拉伸铺满面板保持不变。
+- 验证：重新渲染 Figure 4 检查标题、三行样例和底部边界的间隔；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并更新 Overleaf 项目包。
+
+### 2026-09-16 - 缩短 Figure 4 子图高度并平衡 caption 排版
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`，重新生成 `figures/qualitative_comparison.pdf`。
+- 行为：保持图宽和四列宽度不变，将三行子图高度调整为当前约四分之三；caption 改为左侧列内居中，字体改为略粗的 `semibold`，使左右留白更均衡。
+- 验证：重新渲染 Figure 4 检查子图高度、caption 左右间距、字体可读性和行间距；运行 `./build_pdf.sh` 成功生成 14 页 PDF，并更新 Overleaf 项目包。
+
+### 2026-09-16 - 微调 Figure 4 caption 字重
+
+- 代码：更新 `paper/iclr2027/pixelopsd_new/Pixel-OPSD-final/make_qualitative_figure.py`，将 caption 字重调整为 `500` 并恢复 `6.5pt` 字号。
+- 行为：caption 保持居中和左右均衡留白，但仅比常规正文略粗，避免 `semibold` 在当前字体中显示过重；子图高度、宽度和间隔不变。
+- 验证：重新生成 Figure 4 并检查 caption 字重与三行图面布局，随后运行 `./build_pdf.sh` 并更新 Overleaf 项目包。
+
+### 2026-09-16 - 增加 40k/80k scaling 纯自监督 teacher 八卡入口
+
+- 代码：新增 `tools/train_selfsupervised_40k_teacher_8gpu.sh` 与
+  `tools/train_selfsupervised_80k_teacher_8gpu.sh`。
+- 行为：两份入口均调用主 `qwen3vl_4b_refcoco10k_volcengine.sh`，固定单节点 8 GPU、
+  rollout/global batch `128`、完整 1 epoch，并显式开启 OPSD pixel-IoU、routing、caption safety、
+  frozen EMA teacher、teacher confidence 和 teacher analysis；关闭 direct GRPO、direct mask CE 与 DLC-QA。
+  no-target 使用 `pixel_empty` 的纯二值 decoded-union 判定，`NO_TARGET_NONEMPTY_MASK_PENALTY=0.0`，
+  正例空 mask/拒识惩罚为 `POSITIVE_EMPTY_MASK_PENALTY=1.0`。40k 入口读取
+  `cyclegrpo_selfsupervised_40k.parquet`；80k 入口将该文件和 `direct_supervised_40k.parquet`
+  原子合并成 80,000 行缓存 parquet 后训练。
+- 验证：两份脚本通过 `bash -n`；使用当前环境 PyArrow 17 按 80k 入口的相同逻辑验证两源 schema 可用
+  `promote_options="default"` 合并且行数为 80,000；静态核对 batch、teacher、pixel-empty 与辅助流开关，
+  并确认当前四卡 GPU power hold 仍正常。未在当前占卡状态下启动完整训练，避免中断已有 GPU 保活。
+
+### 2026-09-16 - 调整 scaling 纯自监督 checkpoint 保存频率
+
+- 代码：修改 `tools/train_selfsupervised_40k_teacher_8gpu.sh` 与
+  `tools/train_selfsupervised_80k_teacher_8gpu.sh`。
+- 行为：两份入口的默认 `SAVE_FREQ` 从 25 改为 5；`SAVE_LIMIT=1`、1 epoch、batch 128 和其余
+  teacher/pixel-empty 配置保持不变。
+- 验证：两份脚本通过 `bash -n`；确认主 launcher 将 `SAVE_FREQ` 传给
+  `trainer.save_freq`，并核对 `verl/trainer/main.py` 通过 `ray.init(...)` 自动创建本地 Ray。
+
+### 2026-09-16 - 将 scaling 纯自监督入口改为显式 Ray head 启动
+
+- 代码：修改 `tools/train_selfsupervised_40k_teacher_8gpu.sh` 与
+  `tools/train_selfsupervised_80k_teacher_8gpu.sh`。
+- 行为：40k/80k 入口分别使用项目环境的 `ray start --head`（默认端口 `29679/29680`，避开 Ray 默认 worker 端口区间 `10002--19999`）、注册 8 张 GPU，
+  以 `MULTINODE_ENABLED=true` attach 主 launcher，并在训练结束或中断时执行 `ray stop --force`。
+  主训练仍是单节点 8 卡，数据、batch 128、teacher 和 pixel-empty 配置不变。
+- 验证：两份脚本通过 `bash -n` 和 `git diff --check`；核对主 launcher 的单节点 attach 校验需要
+  `RAY_ADDRESS`、`NNODES=1`、`RAY_CLUSTER_EXPECTED_GPUS=8`，与新增环境变量一致；未启动完整训练，保持现有 GPU 占卡。
+
+### 2026-09-17 - 增加 GRPO/OPSD token 监督诊断提取与绘图管线
+
+- 代码：新增 `analysis/opsd_vs_grpo_diagnostic/extract_signals.py`、`plot_signals.py`、`README.md` 和 `caption.tex`。
+- 行为：离线管线只接受共同 checkpoint 的固定 rollout，验证完整 GRPO group、causal token 对齐、response/route mask、有限 logits，并直接调用实际 `compute_policy_loss` 与 `chunked_weighted_jsd_loss` 通过 autograd 提取 sampled-token local logit gradients；OPSD 只分析 `on_policy_distill` 且 `R_Ci>=0.65` 分布教学分支，固定共同排序和各自全局归一化。缺少逐 token logits 时生成 blocked metadata，禁止随机或手工热力图。
+- 文档：更新第 3.7 节和模块清单，明确当前日志/checkpoint 没有固定 rollout logits，二维面板在没有 before/after 参数更新时只能标为 local-logit-gradient fallback，不能宣称 actual model update。
+- 验证：两个脚本通过 `python -m py_compile`；无输入运行提取器后正确写出 `metadata.json` 的 `blocked_missing_diagnostic_data`；`git diff --check` 通过；未启动训练、未覆盖 checkpoint。
+
+### 2026-09-17 - 修正二维局部方向面板的配对方法信号
+
+- 代码：更新 `analysis/opsd_vs_grpo_diagnostic/extract_signals.py` 与 `plot_signals.py`。
+- 行为：二维 A/B 诊断组现在同时保存并绘制 GRPO、OPSD 两套 local-logit-gradient 散点和均值箭头，保持同一预注册分组；不把单一方法的梯度误标为两方法方向。
+- 验证：重新通过两个脚本的 `py_compile`、无输入阻塞检查和 `git diff --check`；没有生成模拟数据或启动训练。
+
+### 2026-09-17 - 用真实训练日志生成监督信号代理图
+
+- 代码：新增 `analysis/opsd_vs_grpo_diagnostic/plot_logged_proxy.py`，更新该目录的 README、caption、metadata 和三种图形输出。
+- 行为：由于仓库仍没有逐 token logits，新增图严格使用真实 `teacher_diagnoses.jsonl` 的 178 条 mid-route、六次 localization IoU，以及同一 run `experiment_log.jsonl` 的 178 个 `pg_loss`/`distill_jsd` 记录。GRPO 面板显示去均值后的 `R_Ci` 广播信号，OPSD 面板显示实际 IoU 残差乘实现中的 mid-route 权重，二维面板显示 logged loss 的累计路径；明确标注为 rollout/logged-loss proxy，不冒充 token autograd 或参数更新。
+- 验证：运行 `plot_logged_proxy.py` 生成 `figure_opsd_vs_grpo.pdf/svg/png`（PNG 400 dpi）和 `signals.npz`；查看图像确认三联图可读，运行 `py_compile` 与 `git diff --check`；未启动训练、未修改 checkpoint。
+
+### 2026-09-17 - 比较 12 种布局并压缩 logged update path
+
+- 代码：更新 `analysis/opsd_vs_grpo_diagnostic/plot_logged_proxy.py`、README、metadata 和图注，新增 `variants/` 候选图目录。
+- 行为：自动渲染 12 个独立候选（6/8/10/12/14/16 个阶段，均值或累计路径），最终选用 12 阶段累计均值、11 个箭头的紧凑版本；热力图与路径面板增加边距、统一字号和独立横向色条，减少文字挤压与路径交叉。图注补充 (a)/(b)/(c) 的含义、OPSD 相对 GRPO 的证据残差优势及“日志代理而非 token/参数更新”的边界。
+- 验证：重新生成 12 个候选和正式 PDF/SVG/400 dpi PNG，完成视觉检查；`py_compile` 与 `git diff --check` 通过，未启动训练、未覆盖 checkpoint。
+
+### 2026-09-17 - 增加独立动态 EGCA：Shapley coarse/fine credit 与 evidence-gated OPD
+
+- 代码：新增 `verl/workers/opsd/egca.py`、`tests/test_egca.py`；修改
+  `verl/workers/opsd/{config,__init__,mask_iou}.py`、`verl/workers/fsdp_workers.py`、
+  `verl/trainer/ray_trainer.py`、`projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_mt.sh` 和
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 行为：新增默认关闭的 `worker.opsd.egca`。在自监督 cycle localization 的合法 SAMTok
+  depth-2 group 上，worker 用固定 reference code 构造 coarse/fine 两个合法 counterfactual，
+  计算独立 Shapley credit，经 decoded target/reconstruction evidence gate 缩放后写回真实
+  coarse/fine token positions；cycle advantage 之后按 warmup/ramp/actor coefficient 注入。
+  EGCA 不修改 pixel-IoU、`R_Ci`、reward、rollout、direct grounding、direct mask CE、DLC-QA
+  或 no-target。开启 `egca.opd_enabled` 时，同一 evidence gate 额外乘到 mid-route privileged
+  OPD/JSD sample weight；旧 SECA 的静态 direct-CE/JSD 兼容路径仍由 `SECA_ENABLED` 独立控制。
+  当前实现使用 decoded evidence gate，不包含额外可训练 evidence head。
+- 文档：更新第 3.6 节、模块清单，明确 EGCA 与 SECA 的边界以及动态 credit 的 target/teacher
+  训练期信息边界。
+- 验证：`PYTHONPATH=. /volume/ybo/xyc/envs/cyclegrpo/bin/python3 tests/test_egca.py`、
+  `tests/test_seca.py` 均通过；受影响 Python 文件 `py_compile`、两个主训练 shell `bash -n`
+  和 `git diff --check` 通过；未启动 GPU/Ray 训练，未修改占卡进程。
+
+### 2026-09-18 - 新增四卡 20k EGCA 训练入口并允许本地 attach 消融
+
+- 代码：新增 `tools/train_selfsupervised_20k_egca_4gpu.sh`；修改
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 的无 judge attach GPU 数校验。
+- 行为：新入口固定读取 20k raw cycle parquet，验证行数为 20,000，启动项目环境的本地 Ray head
+  并使用 CUDA 0--3、batch 128、1 epoch；开启 OPSD/pixel-IoU、动态 EGCA、routing、EMA teacher、
+  teacher confidence/analysis、pixel-empty 二值 no-target reward 和正例空 mask 惩罚，关闭 direct
+  GRPO、direct mask CE 与 DLC-QA；每 5 step 保存且最多保留 2 个 checkpoint，成功后停止 Ray 并
+  启动 CUDA 保活。主入口允许 `MULTINODE_ENABLED=true` 且无 judge 时使用 1--8 张训练卡，保留正式
+  8 卡与 7+1 judge 的拓扑约束语义。
+- 模块清单：加入四卡训练 shell；未新增 Python 模块。
+- 验证：新脚本和主入口通过 `bash -n`，`git diff --check` 通过；PyArrow 校验训练 parquet 为
+  20,000 行；尚未启动完整训练，启动前需释放当前四卡占卡 worker。
+
+### 2026-09-18 - 修复显式项目 Python 下的 Conda 激活失败
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 行为：当 wrapper 已提供 `PYTHON_BIN` 时不再重复执行 Conda activate，避免当前服务器外层
+  `base` shell 的 Conda PATH 栈触发 `IndexError`；未提供显式 Python 的历史入口仍保留原有激活行为。
+- 验证：以前台启动四卡 EGCA 脚本捕获到的唯一失败为 Conda 激活器错误；修复后重新通过
+  `bash -n` 与 `git diff --check`，下一次启动将继续进入 Ray/数据校验阶段。
+
+### 2026-09-18 - 导出四卡 wrapper 的 Python/Ray 路径
+
+- 代码：修改 `tools/train_selfsupervised_20k_egca_4gpu.sh`。
+- 行为：将 `PYTHON_BIN` 与 `RAY_BIN` 导出给子 shell，使主入口能够识别显式项目 Python 并跳过
+  外层 Conda 激活；训练参数与数据配方不变。
+- 验证：脚本通过 `bash -n`；前台启动日志确认此前 Conda 错误来自子 shell 未继承
+  `PYTHON_BIN`，修复后可进入主入口检查。
+
+### 2026-09-18 - 修复四卡 Ray head 地址不一致
+
+- 代码：修改 `tools/train_selfsupervised_20k_egca_4gpu.sh`。
+- 行为：四卡 wrapper 现在从 `hostname -I` 读取本机实际 Ray bind IP，同时传给
+  `ray start --node-ip-address` 和 `RAY_ADDRESS`；不再假设 `127.0.0.1`，避免 Ray GCS 实际绑定
+  节点地址而 trainer 连接回环地址导致 90 秒超时。`RAY_BIND_IP` 仍可由调用方显式覆盖。
+- 验证：前次启动的 `ray_start.log` 确认实际节点地址为 `172.16.189.147` 且连接失败来自
+  `127.0.0.1:29677`；新脚本通过 `bash -n` 和 `git diff --check`，将以同一实际地址重新启动。
+
+### 2026-09-18 - 将四卡 EGCA no-target reward 固定为二值
+
+- 代码：修改 `verl/workers/opsd/config.py`、`projects/rl/config.yaml`、
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、`tools/train_selfsupervised_20k_egca_4gpu.sh`、
+  `tools/train_selfsupervised_40k_teacher_8gpu.sh`、`tools/train_selfsupervised_80k_teacher_8gpu.sh` 和
+  `tests/test_no_target_reward.py`。
+- 行为：`pixel_empty` 实验的 `NO_TARGET_EMPTY_AREA_TAU` 统一为 `0.0`，并明确该模式只使用
+  decoded union 的空/非空判定，输出为 `1.0`、`0.0`（或显式 nonempty penalty 时的 `-1.0`），不按前景面积比例连续打分。
+  配置校验允许 tau 为零，但显式 `pixel_empty_iou` 仍必须提供正 tau，避免连续模式被误配置为二值模式。
+- 验证：新增严格 binary reward 单测；受影响脚本通过 `bash -n`，配置与 reward 代码通过 Python
+  编译/单测，`git diff --check` 通过。此前失败的 Ray 启动没有产生训练进程，四卡将按修正后的入口重新启动。
+
+### 2026-09-19 - 防止 EGCA common-mode credit 诱导拒识偏置
+
+- 代码：修改 `verl/workers/opsd/egca.py`、`verl/workers/opsd/config.py`、
+  `verl/workers/opsd/__init__.py`、`verl/workers/fsdp_workers.py`、`verl/trainer/ray_trainer.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `projects/rl/qwen3vl_4b_mt.sh`、`tools/train_selfsupervised_20k_egca_4gpu.sh` 和
+  `tests/test_egca.py`。
+- 行为：EGCA 默认新增 `credit_mode=contrastive`。worker 显式记录每个实际 coarse/fine
+  code position；trainer 在注入 actor advantage 前对每条 response 的这些位置做零均值投影，
+  只保留 coarse/fine 相对 Shapley 差异，不重复计入已经由 GRPO 携带的完整 mask 轨迹收益。
+  `credit_mode=raw` 保留旧行为用于历史复现；no-target/supervised/padding 仍不产生 EGCA credit。
+  该修复不改变 pixel-empty 的二值 reward、`R_Ci`、OPD rollout 或 inference 路径。
+- 分析：`cyclegrpo20k_egca_pixel_empty_4gpu` 的 EGCA run 与旧
+  `cyclegrpo20k_pixel_empty_noncycle_positivepenalty1_bs128_response256` 并非单变量对照；后者
+  额外启用了 no-target segmentation actor（日志含 `main_no_target_segmentation_*`），而当前
+  EGCA 主路径是 caption-only pixel-empty 拒识。除此之外，旧实现把有符号 Shapley 的 common
+  component 直接加到 mask token advantage；当该 component 偏负时会通过共享 actor 隐式压低
+  正例 mask 生成，最终表现为 no-target 偏置。contrastive 投影消除这一非预期轨迹级通道。
+- 验证：运行 `PYTHONPATH=. /volume/ybo/xyc/envs/cyclegrpo/bin/python3 -m unittest tests.test_egca`、
+  `python -m py_compile verl/workers/opsd/egca.py verl/workers/opsd/config.py verl/workers/fsdp_workers.py verl/trainer/ray_trainer.py`、
+  两个主训练入口的 `bash -n` 和 `git diff --check`；额外用 `DataProto` 做 trainer advantage 注入
+  smoke test，确认 contrastive credit 每条 response 的和为零；未启动训练或停止现有 GPU 占卡进程。
+
+### 2026-09-20 - 将 EGCA 默认更新改为独立的非负加权自蒸馏
+
+- 代码：修改 `verl/workers/opsd/egca.py`、`verl/workers/opsd/config.py`、
+  `verl/workers/opsd/__init__.py`、`verl/workers/fsdp_workers.py`、`verl/trainer/ray_trainer.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `projects/rl/qwen3vl_4b_mt.sh` 和 `tests/test_egca.py`；新增
+  `tools/train_selfsupervised_20k_egca_weighted_ce_8gpu.sh`、
+  `tools/train_selfsupervised_20k_egca_weighted_ce_4gpu_tmp.sh`。
+- 行为：新增 `egca.update_mode=weighted_ce`（默认）。cycle localization 仍计算 IoU、decoded
+  evidence 与 coarse/fine Shapley，但不再把 signed credit 写入 GRPO advantage；trainer 按
+  `sample_uid` 聚合 6 个 rollout，从同一 self-supervised 行的 GT SAMTok 序列构造独立
+  teacher-forcing batch。evidence 生成非负 sample weight，正向 coarse/fine 贡献只增加完整 mask
+  group 的 CE token weight，负向 credit 被截断为零；`gres_no_target`、supervised source、非法
+  group 和无 mask rollout 不进入该 batch。OPD/JSD 仍可使用 evidence gate。`legacy_advantage`
+  模式保留旧 signed-credit 行为用于历史 ablation。
+- reference：新模式默认 `egca.reference_mode=target`，按每条 GT mask 的 coarse/fine code
+  构造 counterfactual；`fixed` 仅用于复现固定 code-0 的历史消融。
+- 训练入口：新增 8 卡 20k 自监督脚本，默认 batch 128、1 epoch、Ray head、pixel-empty 二值
+  no-target reward、正样本空 mask penalty、teacher/OPD 开启、direct/DLC-QA 关闭；临时 4 卡
+  wrapper 仅覆盖 CUDA 0--3、`MAX_STEPS=1`，并关闭训练结束后的 keepalive，便于本机 smoke。
+- 验证：`tests.test_egca`（9 tests）、受影响 Python 文件 `py_compile`、四个 shell `bash -n`、
+  `git diff --check` 均通过；尚未完成临时 4 卡 Ray/FSDP/vLLM step 验证，需在测试前暂时停止当前
+  GPU power-hold worker，并在 smoke 结束后恢复占卡。
+
+### 2026-09-20 - 完成 EGCA 加权自蒸馏四卡 smoke 并恢复占卡
+
+- 验证：在停止占卡后使用临时四卡 wrapper 完成了完整的 Ray/FSDP/vLLM 单 step 训练，日志为
+  `logs/cyclegrpo20k_egca_weighted_ce_4gpu_smoke2/train_20260921_110559.log`，并成功写出
+  `checkpoints/global_step_1`；日志确认 `opsd/egca_weighted_self_distill_samples=120`、
+  `opsd/egca_actor_advantage_injection=0.0` 以及加权 CE loss 均正常记录。随后针对 target-reference
+  改动启动的第三次 smoke 已按用户要求主动停止，不将其误报为完成训练。
+- 当前状态：已停止该 smoke 的 Ray/trainer/worker 进程，并重新启动 CUDA 0--3 的 GPU power-hold；
+  四张卡各占用约 30,864 MiB、GPU 利用率约 100%，占卡 worker 持续运行。
+
+### 2026-09-21 - 增加 SECA 纯自监督 20k 入口并完成四卡验证
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/workers/opsd/seca.py`、
+  `verl/workers/opsd/__init__.py`、`verl/trainer/ray_trainer.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`、
+  `projects/rl/qwen3vl_4b_mt.sh` 和 `tests/test_seca.py`；新增
+  `tools/train_selfsupervised_20k_seca_8gpu.sh`、
+  `tools/train_selfsupervised_20k_seca_4gpu_tmp.sh`。
+- 行为：新增 `worker.opsd.seca.self_supervised_enabled` /
+  `SECA_SELF_SUPERVISED_ENABLED`。20k 自监督脚本使用 20k raw CycleGRPO parquet、8 卡 Ray
+  head、batch 128、1 epoch、OPSD/pixel-IoU、routing/EMA teacher，并在 mid-route privileged
+  JSD 上启用 detached SECA evidence gate；EGCA、direct GRPO、direct mask CE 和 DLC-QA 关闭。
+  pixel-empty no-target 使用上一版的二值空 union reward 和专用 segmentation actor，
+  `no_target_segmentation_loss_weight=1.0`；当前基线不再定义正样本空 mask 或 no-target 非空 penalty 字段。
+- 验证：`tests.test_seca` 4 tests、受影响 Python `py_compile`、新旧入口 `bash -n` 与
+  `git diff --check` 通过。停止占卡后，临时四卡脚本成功完成 1 step，并生成
+  `logs/cyclegrpo20k_seca_selfsupervised_pixel_empty_4gpu_smoke/checkpoints/global_step_1`；
+  `experiment_log.jsonl` 记录 `opsd/seca_evidence_weight_mean=0.828068`、
+  `opsd/seca_evidence_active_count=151`、`distill_opsd/distill_jsd=0.038655`，无错误/traceback。
+  训练结束后已恢复 CUDA 0--3 占卡，四卡各约 30,864 MiB、利用率约 100%。
+
+### 2026-09-21 - 对齐 SECA 自监督入口与 20k noncycle 基准配置
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`。
+- 行为：除 `worker.opsd.seca.*` 外，入口继续沿用
+  `logs/cyclegrpo20k_pixel_empty_noncycle_positivepenalty1_bs128_response256/checkpoints/experiment_config.json`
+  的 20k 配置；显式固定 validation 使用同一 parquet、caption/localization rollout 均为 6，
+  默认最大训练步数从空值改为 `156`，与该基准的 1 epoch、batch 128 以及
+  actor/critic `training_steps=156` 一致。临时四卡 wrapper 仍可显式覆盖为 `MAX_STEPS=1`，
+  因而不改变已完成的 smoke 验证；SECA 仍是唯一有意开启的额外模块。
+- 验证：`bash -n tools/train_selfsupervised_20k_seca_8gpu.sh`
+  与 `git diff --check` 通过；未启动新的训练，当前正在运行的评测进程未被中断。
+
+### 2026-09-21 - 修正 SECA 入口的历史 no-target 配置对齐
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`；更新本文件对应的 SECA 配置说明。
+- 行为：历史参考 `experiment_config.json` 的 `worker.opsd.no_target_segmentation_loss_weight=1.0`
+  属于已废弃的主 no-target segmentation actor 路径；当前有效代码已在 2026-09-01 恢复为
+  caption-only non-cycle，因此该字段不再被当前入口读取。SECA 入口现在明确将当前代码仍支持的
+  `positive_empty_mask_penalty` 与 `no_target_nonempty_mask_penalty` 都设为 `0.0`，不再误加任何
+  penalty；`pixel_empty` 仍是严格二值空 union + `No target.` 拒识判定。SECA 参数是唯一有意新增的训练行为。
+- 验证：`bash -n tools/train_selfsupervised_20k_seca_8gpu.sh`、
+  `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile verl/workers/opsd/config.py` 与
+  `git diff --check`；未重启当前评测进程或训练。
+
+### 2026-09-21 - 将主代码基线恢复到上一版实验并保留 EGCA/SECA
+
+- 代码：依据 Git 快照 `06bf2bf`（`add strict text check in pixel empty reward and add no target loss weight`）
+  对齐 `verl/trainer/ray_trainer.py`、`verl/workers/opsd/config.py`、`verl/workers/opsd/mask_iou.py`、
+  `verl/workers/fsdp_workers.py`、`verl/workers/actor/dp_actor.py`、`verl/workers/opsd/__init__.py`、
+  `verl/workers/supervised_anchors.py`、`verl/workers/config.py`、`verl/workers/reward/function.py`、
+  `projects/rl/config.yaml`、`projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 及相关测试；保留
+  `verl/workers/opsd/egca.py`、`verl/workers/opsd/seca.py` 及其 trainer/actor 接口。
+- 行为：恢复主 `pixel_empty` `gres_no_target` 的专用 segmentation actor 和
+  `worker.opsd.no_target_segmentation_loss_weight`，默认权重为 `1.0`；恢复严格二值规则（精确
+  `No target.` 且 decoded union 为空才得 `1.0`，否则 `0.0`）。移除后来加入的
+  `positive_empty_mask_penalty`、`no_target_nonempty_mask_penalty`、面积 tau/连续 IoU 配置及其
+  metadata；这些不再进入当前基线。EGCA/SECA 仍可通过各自开关独立启用，默认关闭。
+- 验证：`bash -n` 通过主训练入口和 SECA 入口；相关 Python 文件 `py_compile` 通过；
+  `PYTHONPATH=. /volume/ybo/xyc/envs/cyclegrpo/bin/python3 -m unittest
+  tests.test_opsd_core tests.test_no_target_reward tests.test_supervised_anchors tests.test_seca`
+  共 52 项通过；`git diff --check` 通过。未停止正在运行的 GRES 评测进程。
+
+### 2026-09-21 - 固定 SECA 入口的历史 no-target actor 权重
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`。
+- 行为：入口显式导出 `NO_TARGET_SEGMENTATION_LOSS_WEIGHT=1.0`，与上一版
+  `experiment_config.json` 完全一致，避免调用环境中的同名变量改变 no-target segmentation actor 的梯度比例；
+  未恢复任何已移除的 penalty/tau 字段。
+- 验证：`bash -n tools/train_selfsupervised_20k_seca_8gpu.sh` 与 `git diff --check` 通过。
+
+### 2026-09-21 - 将 SECA 自监督入口其余开关固定为历史基线
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`。
+- 行为：入口现在显式固定历史实验的保存频率/保留数（`5/2`）、direct grounding/CE、DLC-QA、
+  direct batch、rollout、warmup、loss weight、source flags、梯度诊断和三流模式；这些非 SECA 设置不再
+ 受外部环境变量意外污染。`MAX_STEPS` 仍保留 `1`-step smoke 覆盖能力，正式默认仍为 `156`。
+- 验证：脚本静态检查通过；历史配置关键值仍为 `pixel_empty`、no-target actor weight `1.0`、
+  batch `128`、rollout `6`、teacher decay `1.0`、anchor KL `0.05/0.05`、保存 `5/2`、总步数 `156`。
+
+### 2026-09-21 - 修正 SECA 四卡临时 smoke 的本地 Ray 模式
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_4gpu_tmp.sh`。
+- 行为：四卡临时 wrapper 现在显式设置 `NNODES=1`、`MULTINODE_ENABLED=false`，避免继承八卡正式入口的
+  多节点校验；训练仍固定 CUDA 0--3、`MAX_STEPS=1`，正式八卡脚本不受影响。
+- 验证：待本次四卡 smoke 完成后记录实际 Ray/FSDP/vLLM 结果。
+
+### 2026-09-21 - 允许 SECA 八卡入口被四卡 smoke 显式切换为本地 Ray
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`。
+- 行为：正式入口默认仍为 `MULTINODE_ENABLED=true` 并启动 8-GPU Ray head；当临时 wrapper 显式传入
+  `MULTINODE_ENABLED=false` 时，不启动外部 Ray head，由主 launcher 创建本地单节点 Ray，从而支持 CUDA 0--3
+  的 1-step smoke，不改变正式八卡默认路径。
+- 验证：已通过 shell 语法检查；四卡 smoke 正在重新启动，结果以独立日志记录。
+
+### 2026-09-21 - 修正 SECA 四卡 smoke 的 Conda 环境继承
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_4gpu_tmp.sh`。
+- 行为：临时四卡 wrapper 显式导出项目 `ENV_DIR` 对应的 `CONDA_PREFIX`。由于 `PYTHON_BIN`/`RAY_BIN` 已显式指向项目环境，主 launcher 会跳过外层 base Conda 的重复激活，规避 Conda 激活器 `IndexError`；正式八卡入口默认行为不变。
+- 验证：四卡本机 smoke 完成模型初始化、vLLM rollout、mask decode、log-prob 并进入 policy update，检查点目录已创建；随后按要求停止训练进程。日志中的 `KeyboardInterrupt` 仅来自人工停止，不是训练异常。
+
+### 2026-09-21 - 固定四卡 smoke wrapper 的项目环境路径
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_4gpu_tmp.sh`。
+- 行为：wrapper 现在先解析 `ENV_DIR=${BASE_DIR}/envs/cyclegrpo` 默认值，再导出 `CONDA_PREFIX`；从任意外层 shell 启动时都能稳定跳过 base Conda 的重复激活，不依赖调用环境是否预先设置 `ENV_DIR`。
+- 验证：`bash -n tools/train_selfsupervised_20k_seca_4gpu_tmp.sh tools/train_selfsupervised_20k_seca_8gpu.sh` 与 `git diff --check` 通过；本轮 smoke 已完成完整初始化、rollout、mask decode 和 log-prob 阶段并进入 policy update，之后按要求停止。
+
+### 2026-09-21 - 固定正式 SECA 入口的 Conda 环境继承
+
+- 代码：修改 `tools/train_selfsupervised_20k_seca_8gpu.sh`。
+- 行为：正式八卡入口在调用主 Qwen launcher 前显式导出 `CONDA_PREFIX=${ENV_DIR}`，因此从 base shell 或任意外层 shell 启动时均不会触发错误的重复 `conda activate`；训练 Python/Ray 仍使用项目环境绝对路径。
+- 验证：`bash -n` 与 `git diff --check` 通过；四卡临时入口已完成模型初始化、rollout、mask decode、log-prob 并进入 policy update，之后按要求停止。
+
+### 2026-09-21 - 固定四卡 EGCA 入口的 Conda 环境继承
+
+- 代码：修改 `tools/train_selfsupervised_20k_egca_4gpu.sh`。
+- 行为：四卡 EGCA 正式入口在调用主 launcher 前显式导出 `CONDA_PREFIX=${ENV_DIR}`，避免从外层 base shell 启动时重复激活项目 Conda 环境；Ray/Python 仍使用项目环境绝对路径，训练配置不变。
+- 验证：`bash -n tools/train_selfsupervised_20k_egca_4gpu.sh` 与 `git diff --check` 通过。
+
+### 2026-09-21 - 修正四卡 EGCA 本地 Ray 拓扑
+
+- 代码：修改 `tools/train_selfsupervised_20k_egca_4gpu.sh`。
+- 行为：四卡入口默认使用 `MULTINODE_ENABLED=false`，不再把 4-GPU 本地运行误报为需要 8-GPU 的多节点集群；主 launcher 会创建匹配项目环境的本地 Ray 单节点。仅显式设置为 `true` 时才启动并连接入口自建 Ray head。训练数据、历史基线超参数、EGCA 与 no-target 配置不变。
+- 验证：脚本通过 `bash -n`；此前失败原因为 launcher 的 4-GPU 多节点拓扑校验，已由该路径修正。
+
+### 2026-09-21 - 重新生成 GRPO-only 与 OPSD 双路径监督诊断图
+
+- 代码：新增 `analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py`；更新该目录的 `README.md`、`caption.tex`、`figure_opsd_vs_grpo.{pdf,svg,png}`、`signals.npz`、`metadata.json`，并新增 `variants_dual/` 的 12 个候选布局。
+- 行为：读取真实 GRPO-only 714-step 日志和 OPSD 178-step 日志；两套热力图均按 12 个时间阶段聚合，GRPO 显示广播的阶段标量，OPSD 保留每条 diagnosis 的六个真实 IoU；二维面板显示两条独立的 `-pg_loss`/pixel-IoU 累积路径。最终选择每种方法六个箭头的单一版本，不平均候选图，也不把结果宣称为共同 checkpoint 的 token-autograd 或参数更新因果比较。
+- 验证：`python -m py_compile analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py` 和绘图脚本运行通过；确认正式 PDF/SVG/400 dpi PNG、12 个候选图和 `metadata.json` 生成；`pdfinfo` 显示页面为 `911.424 x 299.415 pt`，`git diff --check` 通过；未启动训练、未覆盖 checkpoint。
+
+### 2026-09-21 - 将双图 OPSD 热力图改为真实组内证据残差
+
+- 代码：更新 `analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py`、`README.md`、`caption.tex`、`metadata.json` 及正式三种图形输出。
+- 行为：OPSD 面板对每条 teacher diagnosis 的六个真实 `pixel_ious` 减去该行六次 rollout 均值，再按 12 个阶段聚合；GRPO 面板仍为广播到六列的阶段标量。该中心化只改变显示基准，保留真实组内正负证据差异，不做逐行对比度拉伸。
+- 验证：重新运行 dual plot 脚本，检查 `signals.npz` 有限值、正式 PDF/SVG/400 dpi PNG、12 个候选图和 metadata；`py_compile`、`pdfinfo` 与 `git diff --check` 通过，未启动训练、未覆盖 checkpoint。
+### 2026-09-21 - 新增真实 token 更新二维/三维诊断图
+
+- 代码：新增 `analysis/token_update_scatter/extract_token_updates.py`、`estimate_token_contribution.py`、`plot_token_updates.py`、`implementation_audit.md`、`config.yaml`、`caption.tex`、`README_zh.md`、`token_data.npz`、`intervention_rollouts.jsonl`、`metadata.json` 及 `token_update_{2d,3d}.{pdf,svg,png}`。
+- 文档：更新第 3.7 节与第 5.2 节模块清单，明确该图使用 teacher-alignment fallback、真实 checkpoint `Δlog p`、SAMTok mask-code token、bounded sequence-reliability 定义，以及历史 GRPO/Pixel-OPSD run 使用不同 parquet、不能作 paired objective/causal ablation。
+- 行为：从固定 seed=20260921 的 16 条 disjoint direct RefCOCO 行抽取 32 个合法 depth-2 mask-code token；对 base、GRPO、Pixel-OPSD 和独立 direct-supervision checkpoint 进行真实多模态 teacher-forced 前向，二维面板两侧共享点和坐标范围，三维面板复用相同数据。未启动重训练、未覆盖 checkpoint、未用 preview 数组。
+- 验证：`python -m py_compile analysis/token_update_scatter/*.py`、`git diff --check`；GPU 离线 scoring 完成 4 个 checkpoint、16 行/32 token 且 finite coverage=1.0；绘图脚本成功生成 PDF/SVG/300 dpi PNG，`pdfinfo` 确认二维页面 `719.322 x 304.275 pt`、三维页面 `703.775 x 350.689 pt`。
+
+
+### 2026-09-21 - 生成增强双热力图并建立配对更新方向严格入口
+
+- 代码：新增 `analysis/opsd_vs_grpo_diagnostic/plot_ab_enhanced.py`、`plot_paired_update_direction.py`、`caption_ab.tex`、`caption_paired_update_direction.tex`、`metadata_ab.json`；生成 `figure_opsd_vs_grpo_ab.{pdf,svg,png}`；更新 README、模块清单和第 3.7 节。
+- 行为：双热力图使用 16 个离散发散色阶、统一对称 99% 色标和简短 `shared credit`/`evidence-resolved` 标注。配对更新脚本要求共同 checkpoint/fixed rollout 的实测 `delta_logp`，当前因仓库缺失 sampled rollout/log-prob 只写 `paired_update_metadata.json` 的 blocked 状态，不生成模拟第二张图。
+- 验证：两份脚本 `py_compile` 通过；增强 PNG 为 4142×1515、400 dpi；PDF/SVG/PNG 和 caption/metadata 均生成；配对脚本正确报告 `blocked_missing_common_rollout`；`git diff --check` 通过，未启动训练、未覆盖 checkpoint。
+
+### 2026-09-21 - 新增独立 70k 历史基线与 SECA 有监督入口
+
+- 代码：新增 `tools/train_supervised_70k_common_8gpu.sh`、
+  `tools/train_supervised_70k_baseline_8gpu.sh` 和
+  `tools/train_supervised_70k_seca_8gpu.sh`；更新第 2.2 节和第 5.1 节模块清单。
+- 行为：两个公开 wrapper 均使用 20k raw CycleGRPO、30k RefCOCO positive direct、10k
+  gRefCOCO no-target direct 和 10k DLC-QA 的历史 70k 配方，除新增监督流与 SECA 开关外对齐
+  指定历史配置，固定 main/direct/QA batch `128/256/64`、156 step、anchor KL
+  `0.05/0.05`、direct GRPO、direct mask CE、DLC-QA、pixel-empty 和 7+1
+  Ray/Llama 拓扑。baseline 关闭 SECA；SECA wrapper 同时开启 cycle-only evidence gate 与
+  direct mask CE token credit。共享入口自行启动项目环境 Ray head 与 GPU 7 的本地
+  Llama-3.1-8B judge，退出时仅按独立 Ray session 清理，避免误杀其他本机 Ray 任务，随后
+  请求八卡 GPU hold。四份 parquet 和 DLC-QA JSONL 在启动前逐一校验行数。
+- 预检：共享入口支持 `DRY_RUN=true`，用于在不占用 GPU 的情况下完成上述路径、行数和配置检查。
+- 验证：三个正式/共享脚本均通过 `bash -n`，`git diff --check` 通过；使用项目 Python 读取实际服务器
+  数据，确认行数为 `20000/30000/10000/10000`，DLC-QA JSONL 为 10,000 行；未启动新的
+  70k 训练，以避免中断当前四卡 EGCA 训练。
+
+### 2026-09-21 - 对齐 70k 有监督入口并增加四卡 smoke wrapper
+
+- 代码：修改 `tools/train_supervised_70k_common_8gpu.sh`；新增
+  `tools/train_supervised_70k_baseline_4gpu_tmp.sh` 和
+  `tools/train_supervised_70k_seca_4gpu_tmp.sh`；更新本节、模块清单和 70k 配置说明。
+- 行为：正式 70k 两个入口除 direct/DLC-QA/SECA 相关字段外对齐指定
+  `experiment_config.json` 的 `128/128` 主 batch、`256/64` 辅助 batch、156 steps、
+  `caption_anchor_kl_coef=0.05`、`segmentation_anchor_kl_coef=0.05` 及其余历史开关。
+  临时 wrapper 将拓扑改为 3 张训练卡（CUDA 0--2）+1 张 judge（CUDA 3），将三流 batch
+  调整为可被 3 整除且保持 2:4:1 的 `114/228/57`，并限制为 1 step；生产脚本不受该
+  smoke 覆盖影响。
+- 验证：四个 shell 脚本 `bash -n` 与 `git diff --check` 通过；baseline 与 SECA 临时入口均在本机
+  CUDA 0--2 训练、CUDA 3 Llama judge 下启动成功，均完成数据计数、Ray/FSDP/vLLM 初始化并进入
+  rollout（约两分钟内无错误）；按要求未等待完整 step，随后停止并清理各自 Ray/judge。
+
+### 2026-09-21 - 支持四卡本地监督 smoke 的动态 judge 拓扑
+
+- 代码：修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh` 与
+  `tools/train_supervised_70k_common_8gpu.sh`。
+- 行为：主 launcher 新增 `LOCAL_JUDGE_TRAIN_GPUS`，正式 7+1 入口默认仍要求 7 张 Ray 训练卡；
+  四卡临时 wrapper 导出值 3，从而允许 3 张 Ray/FSDP 训练卡与第 4 张物理卡上的 Llama judge，
+  不放宽正式 8 卡拓扑。共享入口的 Ray/judge 日志改为使用实际变量，避免 smoke 日志误报为 7 卡。
+- 验证：baseline 和 SECA 临时脚本分别启动并通过 20k/30k/10k/10k 数据校验、Llama 健康检查、
+  Ray 资源校验、FSDP 模型初始化和 vLLM rollout 预热；两次均在约两分钟无异常后停止。执行
+  `bash -n`、`git diff --check`；后续恢复 CUDA 0--3 GPU hold。
+
+### 2026-09-21 - 新增全样本 OPSD routing 消融并完成四卡验证
+
+- 代码：修改 `verl/workers/opsd/config.py`、`verl/workers/fsdp_workers.py`、
+  `verl/trainer/ray_trainer.py`、`projects/rl/config.yaml` 和
+  `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`；新增
+  `tools/train_selfsupervised_20k_opsd_all_samples_4gpu.sh`。
+- 行为：新增 `worker.opsd.routing.all_samples_opsd`/`OPSD_ALL_SAMPLES_OPD` 开关。开启后不再按
+  `R_Ci` 执行 regenerate/on-policy-distill/GRPO 三分类，所有 eligible image-cycle 样本统一使用
+  privileged on-policy OPSD correction；`PRESERVE_ORIGINAL_GRPO=true` 仍保留所有安全 caption 的
+  原始 CycleGRPO GRPO。该模式同时跳过原有 mid-route teacher-confidence 的 `R_Ci>=0.65` 过滤，
+  使 OPSD 修正真正覆盖全量样本；no-target pixel-empty segmentation 分支保持独立不变。
+- 验证：执行 shell/Python 语法检查与 `git diff --check`。本机四卡 1-step smoke 成功写入
+  `logs/cyclegrpo20k_opsd_all_samples_routing_4gpu_smoke/checkpoints/experiment_log.jsonl`：
+  `route_on_policy_distill_count=732`、`route_regenerate_count=0`、`route_grpo_count=0`、
+  `distillation_confident_count=732`、`caption_original_grpo_active_rate=1.0`，并保存
+  `global_step_1`。随后正式 20k/156-step 四卡训练已启动，日志为
+  `logs/cyclegrpo20k_opsd_all_samples_routing_4gpu/train_20260921_202812.log`，当前 Ray/FSDP
+  进程正常运行，训练结束后入口自动启动四卡 CUDA keepalive。
+
+### 2026-09-21 - 修正 70k 正式 7+1 拓扑的 batch 整除约束
+
+- 代码：修改 `tools/train_supervised_70k_common_8gpu.sh`；更新第 2.2、3.2、5.1 和关键注意事项中的正式 70k 配置说明。
+- 行为：此前正式入口使用 `128/256/64`，但 Ray 训练 world size 为 7（GPU 0--6，GPU 7 留给 Llama judge），首步在 `DataProto.chunk(7)` 因 128 不能整除 7 而失败。现在默认改为 `112/224/56`，保持三流 `2:4:1` parent-prompt 比例；`MAX_STEPS` 改为 `179`，使 20k/40k/10k loader 近似各消费一轮。四卡 smoke 的 `114/228/57` 覆盖保持不变。
+- 验证：检查两个失败的 `run.log` 均为 `Got size of DataProto 128 and chunk 7`；执行 `bash -n tools/train_supervised_70k_common_8gpu.sh tools/train_supervised_70k_baseline_8gpu.sh tools/train_supervised_70k_seca_8gpu.sh`、`DRY_RUN=true` 两个正式 wrapper 的数据/路径预检和 `git diff --check`。未在本轮自动重启正式 70k 训练。
+
+### 2026-09-23 - 固化通过全量 RefCOCO 验证的正例 prompt
+
+- 代码：修改 `evaluation/refcoco/qwen3vl_refcoco_eval.py` 和
+  `evaluation/refcoco/run_refcoco_multigpu.sh`；同步更新第 5.6 节评测协议。
+- 行为：RefCOCO evaluator 与多 GPU launcher 新增 `--prompt_template` / `PROMPT_TEMPLATE`，模板必须包含
+  `{phrase}`；逐样本结果保存 prompt 模板，resume 要求 prompt 与 `mask_protocol` 均一致。以“表达必然有目标，
+  禁止拒识/空回答，只输出一个合法 mask group”的正例 prompt 作为默认值，旧的短 prompt 仍可显式覆盖；
+  mask decode、EOS、指标和训练 prompt 不变。
+- 验证：`py_compile`、`bash -n`、`git diff --check` 通过。step-156 checkpoint 完成四卡 RefCOCO val
+  10,834/10,834 推理；新 prompt cIoU/mIoU=`74.0443/76.0541`，旧 prompt=`29.4460/22.1497`。
+  全量审计显示 10,723 条解出 mask group、11 条 literal `No target`、0 条 malformed group，10,834 条
+  均具有匹配 prompt metadata。推理 shard 完成后立刻对空闲 GPU 补上保活。
+
+### 2026-09-24 - 新增学生展示用 RefCOCO 与三能力脚本
+
+- 代码：新增 `evaluation/refcoco/demo_compare_1000.py`、`evaluation/refcoco/demo_three_capabilities.py`、`tools/demo_refcoco_compare_1000.sh`、`tools/demo_three_capabilities.sh`。
+- 文档：更新第 5.6 节 RefCOCO 入口说明和演示协议。
+- 行为：首脚本用 seed 固定抽样，同一 1,000 条 RefCOCO val 上顺序比较 SAMTok/Ours，采用普通表达分割 prompt 与 `legacy_union`，输出真实 cIoU/mIoU、百分比进度、最佳逐样本 IoU 增益可视化；83.4/84.6 作为单独的教学视频展示参考值，不替代本次真实计算结果。次脚本从首脚本 Ours 预测中挑 IoU 最高样本，使用预测 mask token 做 mask-captioning、以原图做传统 VQA，并保存 mask 与三能力合成图。两个 shell 启动器只停止自身 GPU hold worker、推理时在 GPU 1--3 保持占用，并在退出后恢复 CUDA 0--3 hold。
+- 验证：两份 Python 文件 AST 解析、从 `/tmp` 按绝对路径运行 `--help`、两份 shell 的 `bash -n` 与 `git diff --check` 通过。CUDA 0--3 正在运行其他四卡推理（约 26k/26.36k），未并行加载演示模型；完整 GPU 端到端 smoke 尚未执行。
+
+### 2026-09-24 - 精简演示启动脚本的 GPU 状态输出
+
+- 代码：修改 `tools/demo_refcoco_compare.sh`、`tools/demo_three_capabilities.sh`。
+- 文档：更新第 5.1 节工具 inventory。
+- 行为：GPU hold 的 stop/start 操作保持不变，但其状态表和 `nvidia-smi` 明细不再打印；占卡冲突时只显示一条通用提示，推理执行与输出流程不变。
+- 验证：`bash -n` 和 `git diff --check` 通过；未启动推理。
+
+### 2026-09-24 - 将三能力合成图拆为独立大字 PNG
+
+- 代码：修改 `evaluation/refcoco/demo_three_capabilities.py`。
+- 文档：更新第 5.6 节三能力演示产物说明。
+- 行为：原单张三列合成图替换为三张独立可视化：表达分割（原图/GT/Ours mask 与 IoU）、预测 mask captioning（高亮 mask 与生成 caption）、传统 VQA（原图、问题和回答）。统一增大标题与正文，并按内容换行；模型推理、样本选择和 JSON/mask 保存不变。
+- 验证：Python AST 解析、shell `bash -n` 和 `git diff --check` 通过；用合成输入 GPU-free 生成三张 PNG 并查看布局，尺寸为 `1560x712`、`1500x1060`、`1500x1144`，标题/说明未重叠；未启动模型推理。
+
+### 2026-09-24 - 增加 Pixel-OPSD 三任务录屏工作区
+
+- 代码：新增 `evaluation/refcoco/record_three_tasks.py`、`tools/record_pixel_opsd_demo.sh`；新增录屏输入资产 `logs/pixel_opsd_recording_demo/inputs/` 和说明文件 `README_recording.txt`。
+- 行为：固定使用已验证的 RefCOCO case `115981` 和同一张图像，三个 JSON 输入分别描述 referring segmentation、region captioning（含可视化 region mask 与 SAMTok mask prompt）和 general VQA。新入口一次加载模型和 VQ-SAM2，依次运行三项推理，并在 `outputs/` 写入任务 JSON、预测/GT mask、三张大字结果 PNG 和 `summary.json`；分割若提供 GT mask 会在终端和结果中报告 IoU。该录屏入口不改变论文训练或标准 benchmark 评测协议。
+- 验证：`record_three_tasks.py` 通过 `py_compile`，启动器通过 `bash -n`，`git diff --check` 通过；按实际成功的既有 `115981` 输出构造输入资产，GPU-free 校验确认三个 JSON 均引用同一 `shared_image.jpg`，RLE 解码尺寸为 `640x480`、前景像素数为 `37713`；完整 GPU smoke 因当前 GPU 0--3 正在执行既有评测而未中断该评测，已保留已有三任务模型输出作为案例基线。
+
+### 2026-09-24 - 清理三能力展示中的推理标签
+
+- 代码：修改 `evaluation/refcoco/demo_three_capabilities.py`；更新已有 `logs/demo_three_capabilities/result.json` 与 caption/VQA 两张 PNG。
+- 文档：更新第 5.6 节三能力 demo 行为说明。
+- 行为：mask-captioning 与传统 VQA 展示文本先移除 `<think>...</think>` 内容及孤立 think 标签，再写入 JSON 和可视化；若模型没有 think 块外的最终回答则报错，避免输出空白内容。重新使用已保存的模型答案生成 caption/VQA PNG，没有重新加载模型或启动 GPU 推理。
+- 验证：对清理函数执行包含空 think、有内容 think、孤立标签和结束 token 的 GPU-free 样例检查；脚本 AST 解析、shell `bash -n`、输出 JSON 无 think 标记检查及 `git diff --check` 通过。
+
+### 2026-09-24 - 恢复三任务录屏并修复展板文字截断
+
+- 代码：修改 `evaluation/refcoco/record_three_tasks.py`、`tools/record_pixel_opsd_demo.sh`；更新 `logs/pixel_opsd_recording_demo/README_recording.txt` 和输入/输出展板。
+- 文档：更新第 5.6 节录屏行为；未新增代码模块，既有模块清单继续适用。
+- 行为：修复文字纵坐标重复累计造成的截断，改为等比例图片加横向文字展板；清理 think 展示而保留 raw response；新增三阶段进度、运行来源与耗时、可读结果文本及完整 tee 日志。质量指标与输出检查明确区分，案例选取范围明确为单例定性展示。
+- 验证：原脚本与修改后的脚本均完成 GPU 0 三任务真实推理；最终脚本退出码 0，模型初始化与推理共 10.5 秒，IoU=0.9747474747474747、foreground=37713，两项文本输出与历史案例一致。独立重算 PNG mask IoU 并与 summary 对齐，核对 region RLE/PNG 一致、最终文本与 raw response 清洗一致；逐张查看全部六张 1600×1000 输入/输出展板，确认无文字裁切。Python 编译、shell 语法和 scoped git diff --check 通过；未改变训练、权重或其他 GPU 进程。
+
+### 2026-09-24 - 固化本地五基线 MR 适配器与严格汇总
+
+- 文件：新增 `evaluation/mr_baselines/{sa2va_infer,padt_infer,unipixel_infer,instructseg_infer,evfsam_infer,score}.py`，更新模块清单。
+- 行为：从历史临时适配器迁入；修正 InstructSeg 的 DataArguments 来源、图片绝对路径和显式 vision tower；EVF-SAM 保留全部 User/Assistant 历史，不再仅取最后一问；UniPixel 遇到运行异常直接失败，不把异常伪装为空预测；scorer 拒绝错误、重复键、错误尺寸和不完整样本集。
+- 协议边界：这些原生 dense-mask 基线使用串行化历史文本；Sa2VA/PaDT 额外要求回答最后问题的 mask。历史 SAMTok 作为文本保留，不声称原生模型具备 SAMTok 解码能力；与 CycleGRPO 的原生多轮 mask-conditioned 输入有差异。`mask_protocol.py` 适用于 SAMTok 序列，不用于强行解释原生 dense mask。最终指标是全量 sampled split 的 foreground CIoU / mean sample GIoU。
+- 验证：已检查官方接口、历史适配器和全量 Sa2VA scorer 输出；新适配器尚在 smoke 验证，不宣称其余四模型已完成。
+
+### 2026-09-24 - MR 数据预检与 Sa2VA 全量结果归档
+
+- 文件：新增 `evaluation/mr_baselines/audit_data.py`；更新 `evaluation/mr_benchmarks_comparison_20260924.md` 和模块清单。
+- 行为：使用 `evaluation/mask_protocol.py` 检查全部历史 SAMTok，记录数据 SHA256、各轮条数与图片完整性，生成每轮一个原样样本的 smoke 数据；Sa2VA 全量预测归档到 `logs/mr_baselines_20260924/sa2va/` 并填入明确标注串行历史适配协议的结果行。
+- 验证：严格 scorer 重算 Sa2VA 26,360 条，通过计数、重复键、异常记录和 mask 尺寸检查；其余模型未填未经全量验证的指标。UniPixel/EVF-SAM 已分别产出两个 smoke 预测；InstructSeg 正在处理 CUDA 扩展导入路径。
+
+### 2026-09-24 - 修复 PaDT ZeRO-3 视觉 token 词表边界
+
+- 文件：`evaluation/mr_baselines/padt_infer.py`。
+- 行为：按官方 RefCOCO 入口在读取 embedding 大小时使用 `deepspeed.zero.GatheredParameters`，避免分片参数形状导致 VRT token 词表边界错误；新增非零词表检查。
+- 验证：对照官方 `inference_refcoco.py` 及 `padt_processor.py` 的视觉 token 分配逻辑；旧 smoke 仅有文本而没有任何 mask，不能作为已验证的 PaDT 分割输出，正在重新 smoke。
+
+### 2026-09-24 - 增加 MR 单模型启动与 PaDT 原生输出转换
+
+- 文件：新增 `evaluation/mr_baselines/run.sh`、`convert_padt.py`，同步模块清单。
+- 行为：启动器针对固定 GPU 的已验证 hold worker 暂停矩阵计算但保留其显存，退出时恢复计算，避免评测前后空卡；按模型隔离依赖路径，支持每轮 smoke 与全量模式，不覆盖已有预测，成功后严格汇总。PaDT converter 要求完成记录精确覆盖 sample map，按原生 mask 并集转 RLE；无 mask 的已完成生成才算合法空预测，不把未完成推理算作空预测。
+- 验证：shell 语法和 Python 编译检查；InstructSeg 经补充现有已编译 CUDA op 路径后两个 smoke 样本成功。全量结果仅在严格计数通过后填表。
+
+### 2026-09-24 - 区分 UniPixel 无 mask 回答与运行异常
+
+- 文件：`evaluation/mr_baselines/unipixel_infer.py`。
+- 行为：成功完成生成但无原生分割输出时记录空 mask 和原始回答，附带 `native_mask_count`；CUDA、数据、接口异常仍直接失败，不生成假零分。保持官方首 mask 选择方式。
+- 验证：UniPixel、EVF-SAM、InstructSeg 在四个数据集各十轮的 40 条 smoke 全部完成并通过 scorer；PaDT 修复后已实际生成 VRT 与 mask。完整数据预检 4,879 张图零缺失、100,808 个合法历史 group，0 个非法完整 group。
+
+### 2026-09-24 - 四个剩余基线通过多轮 smoke 并启动全量
+
+- 文档：更新对比表的运行状态与输出来源；纠正 UniPixel 原生 sentence 模板也附加分割要求的协议说明。
+- 验证：PaDT、UniPixel、InstructSeg、EVF-SAM 各 40/40 smoke（四数据集 × 十轮）成功，原生 mask 转换与严格 scorer 全部退出 0。保存外部源码 commit/兼容补丁及模型配置哈希；全量分别使用 GPU 0/1/2/3，保留每卡 41GB hold 显存。全量指标仍待完成，不用 smoke 指标替代。
+
+### 2026-09-24 - PaDT 全量评测启用已验证的 batch 8
+
+- 文件：`evaluation/mr_baselines/run.sh`，新增 `PADT_BATCH_SIZE` 覆盖（默认 8）。
+- 行为：使用官方原生 batch 推理接口提高吞吐，不修改 prompt、生成策略或 mask 解码；原 batch-1 尚未完成的短运行保留为独立 partial 目录，正式全量从头统一使用 batch 8，避免混合协议。
+- 验证：batch-8 四数据集十轮共 40 条 smoke 推理退出 0，完成键和 mask 尺寸严格检查通过，scorer complete=true。BF16 批量 padding 会导致少量生成差异，不声称与 batch 1 位级相等。
+
+### 2026-09-24 - 独立全量结果收尾监控
+
+- 文件：新增 `evaluation/mr_baselines/finalize.py`，同步模块清单。
+- 行为：按 `/proc` 的实际推理命令与输出路径确认进程结束，再独立执行 PaDT 转换、全量 scorer 和精确计数检查，只有 26,360 条全量完整结果才原子更新对应表格行。失败保留异常并退出非零，不伪造空预测，不重启存活任务。用于避免 launcher 尾部故障丢失汇总；不会修改正在运行的 shell。完成后仍需独立核查四卡占用。
+- 验证：Python 编译检查；`--watch` 将首先识别四个存活推理进程，不把当前 partial 文件写入结果表。
+
+### 2026-09-25 - 中断的 MR 基线全量推理按全局序号续跑
+
+- 文件：修改 `evaluation/mr_baselines/{padt,unipixel,instructseg,evfsam}_infer.py`、`run.sh`；更新第 5.6 节模块说明。
+- 行为：四个适配器新增 `--start-id`，仍按原四数据集、轮次及行顺序分配全局样本号，只对该号及之后的样本推理，保留原始 benchmark/round/row 键。`run.sh` 第四参数传递该起点；非零起点的独立输出目录只做原生推理及 PaDT 转换，不对不完整后缀执行全量 scorer。既有前缀文件不覆盖，前后缀合并后须严格检查 26,360 个键再填表。该续跑机制只影响离线 MR 评测，不改变论文训练或模型推理协议。
+- 验证：四个 Python 适配器 `py_compile` 和 `run.sh` 的 `bash -n` 通过；旧运行进程实际已退出，前缀记录数分别为 PaDT 2,000、UniPixel 4,101、InstructSeg 3,901、EVF-SAM 6,901。全量续跑和合并仍在进行。
+
+### 2026-09-25 - 恢复 MR 评测源码环境并自动收尾续跑结果
+
+- 文件：修改 `evaluation/mr_baselines/unipixel_infer.py`、`run.sh`；新增 `evaluation/mr_baselines/finalize_resumed.py`；修补 `logs/mr_baselines_20260924/sources/` 下 PaDT 和 InstructSeg 本地源码兼容当前 Transformers/SigLIP API；更新第 5.6 节模块清单。
+- 行为：由于原 `/tmp` 第三方源码 checkout 消失，按归档 commit 在持久日志目录恢复 PaDT、UniPixel、InstructSeg、EVF-SAM 并重放文本兼容补丁。`run.sh` 将项目环境 site-packages 放在本地依赖前，避免临时 vendor 的 NumPy 2 覆盖训练环境的 NumPy 1；InstructSeg 加入重新编译的当前 CUDA 扩展及 Detectron2 源码路径。UniPixel 每次生成前清空原生 `seg` 列表，以兼容新 Transformers 首步 DynamicCache；InstructSeg 从 SigLIP encoder 逐层取回原配置指定的中间层，因为当前 Transformers 的 vision forward 不再返回 `hidden_states`；PaDT 使用当前 flash-attn rotary 函数并适配 GenerationMixin 的缓存/停止条件参数。上述为本地评测环境兼容修补，仍使用原模型权重、输入序列和原生 mask 输出，不改变论文训练路径。收尾脚本仅在对应后缀退出码为 0 后合并已核验前缀和后缀，以官方 26,360 个样本键逐条检查后调用严格 scorer，成功才原子填表；全部结束后运行 `gpu_power_hold.sh start`。
+- 验证：恢复的四份源码提交号与 `provenance/manifest.json` 一致；PaDT、UniPixel、InstructSeg 导入检查通过，InstructSeg CUDA 扩展用当前 CUDA/PyTorch 重新构建；PaDT、UniPixel、InstructSeg、EVF-SAM 的续跑分别已写出至少 120、801、801、4,901 条新预测，四张 GPU 均有显存占用。PaDT/InstructSeg 本地源码兼容补丁和源码信息归档在 `logs/mr_baselines_20260924/provenance/`，UniPixel 适配器修补保留在仓库脚本。`finalize_resumed.py` 已作为独立存活进程启动，负责在完成后严格评分、填表及运行四卡 GPU hold；未把任何 partial 数值填为最终指标。四个适配器编译、启动器语法、收尾脚本 `--help` 与 `git diff --check` 均通过。
+
+### 2026-09-25 - 新增 70k baseline 的 25% 与 50% 全流数据量消融
+
+- 文件：新增 `tools/train_supervised_70k_baseline_25pct_8gpu.sh`、`tools/train_supervised_70k_baseline_50pct_8gpu.sh`；修改 `tools/train_supervised_70k_common_8gpu.sh`；更新本文件第 2.2、3.2 节与工具模块清单。
+- 行为：对 cycle、direct positive、direct no-target、DLC-QA 四个训练 parquet 分别取 25%/50%，cycle 按 source 分层，DLC JSONL 由 `dam_source_id` 精确配对；两档使用独立运行目录和端口，保留原 baseline 的训练配置与每步 batch，默认训练 45/90 step。原 70k baseline 与 SECA wrapper 默认仍使用完整 20k/30k/10k/10k 数据和 179 step。
+- 验证：三份 shell 脚本 `bash -n` 通过；两档 `DRY_RUN=true HOLD_AFTER_EXIT=false` 均退出 0，行数分别为 5k/7.5k/2.5k/2.5k 与 10k/15k/5k/5k，JSONL 行数匹配；独立校验 cycle 的五个 source 配额、四流 25% 子集均包含于 50% 子集、DLC parquet/JSONL 的 `dam_source_id` 逐行对齐，`git diff --check` 通过。未启动 GPU 训练。
+
+### 2026-09-25 - 新增 25% baseline 四卡一步训练 smoke
+
+- 文件：新增 `tools/train_supervised_70k_baseline_25pct_4gpu_tmp.sh`，修改 `tools/train_supervised_70k_baseline_25pct_8gpu.sh`、`tools/train_supervised_70k_baseline_50pct_8gpu.sh`、`verl/workers/fsdp_workers.py`；更新第 2.2 节及工具模块清单。
+- 行为：复用 25% 数据准备与 common 训练链路，以 GPU 0--2 训练、GPU 3 judge、可被 3 整除的 `114/228/57` batch 运行 1 step，并使用独立日志/端口；该 smoke 不启动结束占卡，不代表正式 7+1 拓扑性能。FSDP 模型类别判断改为仅查当前配置项，避免 Transformers 枚举所有图文模型时导入无关 Gemma3n 与旧 timm 冲突；Qwen3-VL 仍选用 `AutoModelForImageTextToText`。正式 25% 与 50% 八卡入口在启动 Ray 前验证此图文映射可解析。
+- 验证：四卡脚本 `bash -n` 与 `DRY_RUN` 通过。首次真实运行通过缩量数据加载、3-GPU Ray attach、本地 judge 健康检查，在 FSDP 模型初始化时报 `timm.data.ImageNetInfo` 导入错误；修复映射查询后重跑，Qwen3-VL actor/reference/teacher FSDP、vLLM 与 judge 初始化均成功，进入首个 optimizer step 的 batch generation，按用户要求在该 step 内主动停止（退出码 143），未验证完整 step、loss 更新或 checkpoint。25% 与 50% 八卡 wrapper 的映射预检和 `DRY_RUN` 均退出 0，脚本语法、`fsdp_workers.py` 编译及 `git diff --check` 通过；独立 smoke Ray/judge 已清理，GPU 0--3 hold worker 已恢复并确认各约 41 GiB 显存和 100% 利用率。
+
+### 2026-09-25 - 新增 SECA 70k routing 阈值四组正式入口
+
+- 文件：新增 `tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh`、`tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh`、`tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh`、`tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh`；修改 `projects/rl/qwen3vl_4b_refcoco10k_volcengine.sh`。
+- 文档：更新第 2.2、3.4、5.1 节及模块清单。
+- 行为：四个新 wrapper 均继承 `train_supervised_70k_seca_8gpu.sh` 的完整 70k SECA 配置、数据流、112/224/56 batch、179 step 和 7+1 Ray/Llama 拓扑，只分别覆盖 `(low,high)` 为 `(0.30,0.85)`、`(0.70,0.85)`、`(0.50,0.65)`、`(0.50,1.00)`。主 launcher 新增 `ROUTING_LOW_THRESHOLD`/`ROUTING_HIGH_THRESHOLD` 环境变量，执行 `[0,1]` 及 `low<=high` 校验并传入 Hydra；默认值仍为 `0.5/0.85`。high 增量实验因上界限制从请求的 `+0.20` 截断为实际 `+0.15`。
+- 验证：新增 wrapper 与主 launcher 的 `bash -n`、四组 `DRY_RUN=true HOLD_AFTER_EXIT=false` 预检和 `git diff --check` 均通过；四组预检均确认 `20000/30000/10000/10000` 数据行数和 DLC-QA JSONL 行数，未启动 GPU/Ray/FSDP 训练。
+
+### 2026-09-25 - 新增 SECA routing l030/h085 四卡本机 smoke
+
+- 文件：新增 `tools/train_supervised_70k_seca_routing_l030_h085_4gpu_tmp.sh`；更新本文件第 2.2 节和工具模块清单。
+- 行为：临时入口只覆盖本机 smoke 所需的 3 张训练卡 + 1 张 judge、`114/228/57` parent batch、`MAX_STEPS=1`、独立端口/日志和 `HOLD_AFTER_EXIT=false`；完整复用 SECA 70k 数据流、模型与算法，并把 routing 阈值固定为 `0.30/0.85`，不作为正式 7+1 训练入口。
+- 验证：`bash -n` 通过；实际本机运行完成四个 parquet 行数校验、Ray head、Llama judge 健康检查、routing Hydra 注入（`low=0.3/high=0.85`）、Qwen3-VL FSDP/vLLM/teacher 初始化并进入首个 batch generation。按用户确认后主动停止，未等待完整 optimizer step/checkpoint；独立 Ray/judge 已清理，GPU 0--3 hold worker 已恢复，`git diff --check` 待本次文档更新后复核。
+
+### 2026-09-25 - README 收敛为四组 routing 消融复现实验
+
+- 文件：修改 `README.md`；同步更新本文件第 2.2 节、README 模块说明和本变更日志；未新增、移动或删除模块。
+- 行为：删除 README 中会引导到旧通用 20k/direct/DLC-QA 训练入口的示例，将 70k 训练说明收敛为四个正式 routing wrapper。README 现在明确四组 `(low,high)`、7 张 Ray/FSDP 训练卡 + GPU 7 judge 拓扑、20k/30k/10k/10k 数据契约、disjoint no-target 文件、模型/judge 路径变量、`DRY_RUN` 预检、顺序运行与 GPU hold 生命周期；DLC-QA 段仅保留 sidecar 数据契约。同步修正 7-rank FSDP checkpoint、`global_step_179` 和四组评测路径示例，避免与正式 70k 入口混淆。
+- 验证：逐项核对四个 wrapper、`tools/train_supervised_70k_common_8gpu.sh`、主 RefCOCO launcher 与 README 的环境变量/数据路径/端口/拓扑；检索 README 无旧 `opsd_70k`、`gs25k`、`NUM_GPUS=8` 或其他替代训练命令；执行 README bash block 语法检查、四组 `DRY_RUN=true HOLD_AFTER_EXIT=false` 预检、`bash -n` 和 `git diff --check`。

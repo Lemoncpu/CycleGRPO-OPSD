@@ -100,6 +100,18 @@ def pixel_empty_reward(prediction: Optional[torch.Tensor], response: Optional[st
     return 1.0 if has_explicit_refusal and has_empty_union else 0.0
 
 
+def pixel_empty_iou_reward(prediction: Optional[torch.Tensor], area_tau: float = 0.10) -> tuple[float, float]:
+    """Return a continuous no-target score from decoded foreground area."""
+    if area_tau <= 0.0:
+        raise ValueError("area_tau must be positive.")
+    if prediction is None:
+        area_ratio = 0.0
+    else:
+        mask = prediction.detach().to(dtype=torch.bool)
+        area_ratio = float(mask.sum().item()) / float(max(mask.numel(), 1))
+    return float(1.0 - min(area_ratio / area_tau, 1.0)), float(area_ratio)
+
+
 def positive_empty_mask_penalty(
     target: Optional[torch.Tensor], prediction: Optional[torch.Tensor], response: Optional[str], amount: float
 ) -> float:

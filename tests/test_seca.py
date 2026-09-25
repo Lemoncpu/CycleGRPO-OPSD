@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from verl.workers.opsd.config import SECAConfig
-from verl.workers.opsd.seca import hierarchical_mask_token_weights, spatial_evidence_weight
+from verl.workers.opsd.seca import (
+    hierarchical_mask_token_weights,
+    self_supervised_evidence_weight,
+    spatial_evidence_weight,
+)
 
 
 class SECATest(unittest.TestCase):
@@ -30,6 +34,10 @@ class SECATest(unittest.TestCase):
         config = SECAConfig()
         config.post_init()
         self.assertFalse(config.enabled)
+        self.assertFalse(config.self_supervised_enabled)
+
+    def test_self_supervised_gate_missing_context_uses_floor(self):
+        self.assertEqual(self_supervised_evidence_weight(None, min_weight=0.5), 0.5)
 
 
 if __name__ == "__main__":

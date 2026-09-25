@@ -98,6 +98,7 @@ from .opsd import (
     extract_mask_token,
     mask_group_metadata,
     pixel_empty_reward,
+    pixel_empty_iou_reward,
     positive_empty_mask_penalty,
 )
 
@@ -1699,11 +1700,17 @@ class FSDPWorker(Worker):
                     pixel_ious[data_index] = float(
                         compute_binary_iou(target_mask[None], prediction[None])[0].item()
                     )
+                source_name = str(data.non_tensor_batch["source"][first])
+                penalty_amount = (
+                    pixel_config.direct_positive_empty_mask_penalty
+                    if source_name.startswith("supervised_grounding")
+                    else pixel_config.cycle_positive_empty_mask_penalty
+                )
                 positive_empty_penalties[data_index] = positive_empty_mask_penalty(
                     target_mask,
                     prediction,
                     responses[data_index],
-                    pixel_config.positive_empty_mask_penalty,
+                    penalty_amount,
                 )
 
         caption_groups = {}
@@ -1776,6 +1783,7 @@ class FSDPWorker(Worker):
         sample_uids = data.non_tensor_batch.get("sample_uid", data.non_tensor_batch["uid"])
         pixel_config = self.config.opsd.pixel_iou
         rewards = np.full(len(data), None, dtype=object)
+        area_ratios = np.full(len(data), None, dtype=object)
 
         sample_groups = {}
         for index, uid in enumerate(sample_uids):
@@ -1801,9 +1809,18 @@ class FSDPWorker(Worker):
                 decode_mode=pixel_config.mask_decode_mode,
             )
             for data_index, prediction in zip(indices, decoded):
-                rewards[data_index] = pixel_empty_reward(prediction, responses[data_index])
+                if pixel_config.no_target_reward_mode == "pixel_empty_iou":
+                    rewards[data_index], area_ratios[data_index] = pixel_empty_iou_reward(
+                        prediction, pixel_config.no_target_empty_area_tau
+                    )
+                else:
+                    rewards[data_index] = pixel_empty_reward(prediction, responses[data_index])
 
         data.non_tensor_batch["no_target_pixel_empty"] = rewards
+        data.non_tensor_batch["no_target_area_ratio"] = area_ratios
+        data.non_tensor_batch["no_target_empty_area_tau"] = np.full(
+            len(data), pixel_config.no_target_empty_area_tau, dtype=object
+        )
         data.non_tensor_batch["no_target_reward_mode"] = np.full(
             len(data), pixel_config.no_target_reward_mode, dtype=object
         )

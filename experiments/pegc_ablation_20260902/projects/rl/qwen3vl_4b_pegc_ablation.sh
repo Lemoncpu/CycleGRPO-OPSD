@@ -30,7 +30,10 @@ MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
 LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
 CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
+NO_TARGET_EMPTY_AREA_TAU="${NO_TARGET_EMPTY_AREA_TAU:-0.10}"
 POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
+CYCLE_POSITIVE_EMPTY_MASK_PENALTY="${CYCLE_POSITIVE_EMPTY_MASK_PENALTY:-${POSITIVE_EMPTY_MASK_PENALTY}}"
+DIRECT_POSITIVE_EMPTY_MASK_PENALTY="${DIRECT_POSITIVE_EMPTY_MASK_PENALTY:-${POSITIVE_EMPTY_MASK_PENALTY}}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
@@ -81,6 +84,10 @@ REFUSAL_CREDIT_ENABLED="${REFUSAL_CREDIT_ENABLED:-false}"
 REFUSAL_CREDIT_LOSS_WEIGHT="${REFUSAL_CREDIT_LOSS_WEIGHT:-0.05}"
 REFUSAL_CREDIT_WARMUP_START_STEP="${REFUSAL_CREDIT_WARMUP_START_STEP:-0}"
 REFUSAL_CREDIT_WARMUP_END_STEP="${REFUSAL_CREDIT_WARMUP_END_STEP:-0}"
+DIRECT_SOURCE_BALANCE_ENABLED="${DIRECT_SOURCE_BALANCE_ENABLED:-false}"
+DIRECT_SOURCE_BALANCE_POSITIVE_FRACTION="${DIRECT_SOURCE_BALANCE_POSITIVE_FRACTION:-0.5}"
+DIRECT_SOURCE_BALANCE_MIN_WEIGHT="${DIRECT_SOURCE_BALANCE_MIN_WEIGHT:-0.5}"
+DIRECT_SOURCE_BALANCE_MAX_WEIGHT="${DIRECT_SOURCE_BALANCE_MAX_WEIGHT:-2.0}"
 ADAPTIVE_BALANCE_ENABLED="${ADAPTIVE_BALANCE_ENABLED:-false}"
 CBBA_ENABLED="${CBBA_ENABLED:-false}"
 CBBA_TARGET_CONFIDENCE="${CBBA_TARGET_CONFIDENCE:-0.70}"
@@ -201,8 +208,8 @@ if [[ "${OPSD_ENABLED}" != "true" && "${OPSD_ENABLED}" != "false" ]]; then
     exit 1
 fi
 
-if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" ]]; then
-    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, or pixel_empty: ${NO_TARGET_REWARD_MODE}" >&2
+if [[ "${NO_TARGET_REWARD_MODE}" != "text" && "${NO_TARGET_REWARD_MODE}" != "official_bbox" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty" && "${NO_TARGET_REWARD_MODE}" != "pixel_empty_iou" ]]; then
+    echo "NO_TARGET_REWARD_MODE must be text, official_bbox, pixel_empty, or pixel_empty_iou: ${NO_TARGET_REWARD_MODE}" >&2
     exit 1
 fi
 
@@ -227,8 +234,8 @@ case "${CYCLE_PROMPT_MODE}" in
         ;;
 esac
 
-if [[ "${NO_TARGET_REWARD_MODE}" == "pixel_empty" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
-    echo "NO_TARGET_REWARD_MODE=pixel_empty requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
+if [[ ( "${NO_TARGET_REWARD_MODE}" == "pixel_empty" || "${NO_TARGET_REWARD_MODE}" == "pixel_empty_iou" ) && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
+    echo "NO_TARGET_REWARD_MODE=pixel_empty or pixel_empty_iou requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
     exit 1
 fi
 
@@ -249,6 +256,7 @@ for bool_name in \
     DIRECT_MASK_CE_ENABLED \
     DIRECT_MASK_CE_INCLUDE_NO_TARGET \
     REFUSAL_CREDIT_ENABLED \
+    DIRECT_SOURCE_BALANCE_ENABLED \
     MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED \
     THREE_STREAM_2_4_1_ENABLED \
     CBBA_ENABLED; do
@@ -479,12 +487,9 @@ if [[ -n "${DIRECT_NO_TARGET_TRAIN_DATA}" ]]; then
 fi
 DIRECT_TRAIN_FILES_OVERRIDE+="]"
 
-if [[ "${CONDA_PREFIX:-}" != "${ENV_DIR}" ]] && command -v conda >/dev/null 2>&1; then
-    CONDA_BASE="$(conda info --base)"
-    # shellcheck disable=SC1091
-    source "${CONDA_BASE}/etc/profile.d/conda.sh"
-    conda activate "${ENV_DIR}"
-fi
+# The launcher uses the explicit environment binaries below. Avoid conda activate here:
+# some container entrypoints expose an incomplete CONDA_PREFIX/PATH stack, which
+# makes activation fail even though ENV_DIR is a valid runnable environment.
 
 export PATH="${ENV_DIR}/bin:${PATH}"
 PYTHON_BIN="${PYTHON_BIN:-${ENV_DIR}/bin/python3}"
@@ -645,6 +650,7 @@ echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
 echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
 echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
 echo "Positive empty-mask penalty: ${POSITIVE_EMPTY_MASK_PENALTY}"
+echo "Cycle positive empty-mask penalty: ${CYCLE_POSITIVE_EMPTY_MASK_PENALTY}; direct positive empty-mask penalty: ${DIRECT_POSITIVE_EMPTY_MASK_PENALTY}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -664,6 +670,7 @@ echo "Direct CE/base gradient cosine diagnostic: ${DIRECT_MASK_CE_RECORD_BASE_GR
 echo "Pairwise multitask gradient diagnostic: ${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}"
 echo "Direct CE warmup: ${DIRECT_MASK_CE_WARMUP_START_STEP}-${DIRECT_MASK_CE_WARMUP_END_STEP} (target=${DIRECT_MASK_CE_LOSS_WEIGHT})"
 echo "Refusal Credit: ${REFUSAL_CREDIT_ENABLED} (weight=${REFUSAL_CREDIT_LOSS_WEIGHT}, warmup=${REFUSAL_CREDIT_WARMUP_START_STEP}-${REFUSAL_CREDIT_WARMUP_END_STEP}, no-target only)"
+echo "Direct source balance: ${DIRECT_SOURCE_BALANCE_ENABLED} (positive fraction=${DIRECT_SOURCE_BALANCE_POSITIVE_FRACTION}, weight=${DIRECT_SOURCE_BALANCE_MIN_WEIGHT}-${DIRECT_SOURCE_BALANCE_MAX_WEIGHT})"
 echo "Three-stream parent-prompt ratio 2:4:1: ${THREE_STREAM_2_4_1_ENABLED} (main=${ROLLOUT_BATCH_SIZE}, direct=${DIRECT_BATCH_SIZE}, DLC-QA=${CAPTION_QA_BATCH_SIZE}, training GPUs=${NUM_GPUS})"
 echo "Resume: ${RESUME}"
 echo "Maximum global step: ${MAX_STEPS:-<full epoch>}"
@@ -777,6 +784,9 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
     worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.cycle_positive_empty_mask_penalty="${CYCLE_POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.direct_positive_empty_mask_penalty="${DIRECT_POSITIVE_EMPTY_MASK_PENALTY}" \
+    worker.opsd.pixel_iou.no_target_empty_area_tau="${NO_TARGET_EMPTY_AREA_TAU}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
     worker.opsd.routing.low_threshold=0.5 \
     worker.opsd.routing.high_threshold=0.85 \
@@ -824,6 +834,10 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.supervised_anchors.refusal_credit.include_no_target=true \
     worker.supervised_anchors.refusal_credit.warmup_start_step="${REFUSAL_CREDIT_WARMUP_START_STEP}" \
     worker.supervised_anchors.refusal_credit.warmup_end_step="${REFUSAL_CREDIT_WARMUP_END_STEP}" \
+    worker.supervised_anchors.direct_source_balance.enabled="${DIRECT_SOURCE_BALANCE_ENABLED}" \
+    worker.supervised_anchors.direct_source_balance.positive_fraction="${DIRECT_SOURCE_BALANCE_POSITIVE_FRACTION}" \
+    worker.supervised_anchors.direct_source_balance.min_weight="${DIRECT_SOURCE_BALANCE_MIN_WEIGHT}" \
+    worker.supervised_anchors.direct_source_balance.max_weight="${DIRECT_SOURCE_BALANCE_MAX_WEIGHT}" \
     worker.supervised_anchors.gradient_diagnostics.enabled="${MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED}" \
     worker.reward.mask_tokenizer_path="${MODEL_PATH}/mask_tokenizer_256x2.pth" \
     worker.reward.sam2_pretrained_weight="${MODEL_PATH}/sam2.1_hiera_large.pt" \

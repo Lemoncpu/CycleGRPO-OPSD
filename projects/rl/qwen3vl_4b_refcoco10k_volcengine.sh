@@ -14,6 +14,10 @@ NUM_GPUS="${NUM_GPUS:-8}"
 MULTINODE_ENABLED="${MULTINODE_ENABLED:-false}"
 NNODES="${NNODES:-1}"
 LOCAL_JUDGE_ENABLED="${LOCAL_JUDGE_ENABLED:-false}"
+# Number of Ray training GPUs reserved when a separately launched local judge
+# occupies one physical GPU.  Production 8-GPU runs keep the historical value
+# of seven; four-GPU smoke runs override this to three.
+LOCAL_JUDGE_TRAIN_GPUS="${LOCAL_JUDGE_TRAIN_GPUS:-7}"
 RAY_CLUSTER_EXPECTED_NODES="${RAY_CLUSTER_EXPECTED_NODES:-${NNODES}}"
 RAY_CLUSTER_EXPECTED_GPUS="${RAY_CLUSTER_EXPECTED_GPUS:-$((NUM_GPUS * NNODES))}"
 RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS="${RAY_CLUSTER_CONNECT_TIMEOUT_SECONDS:-90}"
@@ -24,11 +28,32 @@ LOCALIZATION_ROLLOUTS="${LOCALIZATION_ROLLOUTS:-6}"
 OPSD_ENABLED="${OPSD_ENABLED:-true}"
 PIXEL_IOU_ENABLED="${PIXEL_IOU_ENABLED:-${OPSD_ENABLED}}"
 SECA_ENABLED="${SECA_ENABLED:-false}"
+SECA_SELF_SUPERVISED_ENABLED="${SECA_SELF_SUPERVISED_ENABLED:-false}"
 SECA_MIN_WEIGHT="${SECA_MIN_WEIGHT:-0.5}"
 SECA_MAX_WEIGHT="${SECA_MAX_WEIGHT:-1.0}"
 SECA_FALSE_POSITIVE_PENALTY="${SECA_FALSE_POSITIVE_PENALTY:-2.0}"
 SECA_COARSE_TOKEN_WEIGHT="${SECA_COARSE_TOKEN_WEIGHT:-1.5}"
 SECA_FINE_TOKEN_WEIGHT="${SECA_FINE_TOKEN_WEIGHT:-1.0}"
+EGCA_ENABLED="${EGCA_ENABLED:-false}"
+EGCA_OPD_ENABLED="${EGCA_OPD_ENABLED:-true}"
+EGCA_ACTOR_COEF="${EGCA_ACTOR_COEF:-0.2}"
+EGCA_CREDIT_MODE="${EGCA_CREDIT_MODE:-contrastive}"
+EGCA_UPDATE_MODE="${EGCA_UPDATE_MODE:-weighted_ce}"
+EGCA_REFERENCE_MODE="${EGCA_REFERENCE_MODE:-target}"
+EGCA_CE_LOSS_WEIGHT="${EGCA_CE_LOSS_WEIGHT:-0.05}"
+EGCA_CE_MIN_WEIGHT="${EGCA_CE_MIN_WEIGHT:-0.25}"
+EGCA_CE_MAX_WEIGHT="${EGCA_CE_MAX_WEIGHT:-1.0}"
+EGCA_CE_TOKEN_CREDIT_SCALE="${EGCA_CE_TOKEN_CREDIT_SCALE:-0.5}"
+EGCA_CE_TOKEN_WEIGHT_MAX="${EGCA_CE_TOKEN_WEIGHT_MAX:-2.0}"
+EGCA_EVIDENCE_MIN_WEIGHT="${EGCA_EVIDENCE_MIN_WEIGHT:-0.5}"
+EGCA_EVIDENCE_MAX_WEIGHT="${EGCA_EVIDENCE_MAX_WEIGHT:-1.0}"
+EGCA_FALSE_POSITIVE_PENALTY="${EGCA_FALSE_POSITIVE_PENALTY:-2.0}"
+EGCA_REFERENCE_COARSE_CODE="${EGCA_REFERENCE_COARSE_CODE:-0}"
+EGCA_REFERENCE_FINE_CODE="${EGCA_REFERENCE_FINE_CODE:-0}"
+EGCA_CREDIT_CLIP="${EGCA_CREDIT_CLIP:-1.0}"
+EGCA_WARMUP_STEPS="${EGCA_WARMUP_STEPS:-0}"
+EGCA_RAMP_STEPS="${EGCA_RAMP_STEPS:-0}"
+EGCA_MAX_GROUPS="${EGCA_MAX_GROUPS:-8}"
 # Historical 20k OPSD training let localization inherit the 256-token global
 # rollout cap. Keep that behavior unless an experiment explicitly overrides it.
 SEGMENTATION_MAX_RESPONSE_TOKENS="${SEGMENTATION_MAX_RESPONSE_TOKENS:-256}"
@@ -36,9 +61,13 @@ MASK_DECODE_MODE="${MASK_DECODE_MODE:-union}"
 LOCALIZATION_PROMPT_MODE="${LOCALIZATION_PROMPT_MODE:-mixed}"
 CYCLE_PROMPT_MODE="${CYCLE_PROMPT_MODE:-current}"
 NO_TARGET_REWARD_MODE="${NO_TARGET_REWARD_MODE:-text}"
-POSITIVE_EMPTY_MASK_PENALTY="${POSITIVE_EMPTY_MASK_PENALTY:-1.0}"
-NO_TARGET_NONEMPTY_MASK_PENALTY="${NO_TARGET_NONEMPTY_MASK_PENALTY:-1.0}"
+# This is a loss scale rather than a reward scale: GRPO standardization makes
+# the latter largely invariant within a rollout group.
+NO_TARGET_SEGMENTATION_LOSS_WEIGHT="${NO_TARGET_SEGMENTATION_LOSS_WEIGHT:-1.0}"
 ROUTING_ENABLED="${ROUTING_ENABLED:-${OPSD_ENABLED}}"
+OPSD_ALL_SAMPLES_OPD="${OPSD_ALL_SAMPLES_OPD:-false}"
+ROUTING_LOW_THRESHOLD="${ROUTING_LOW_THRESHOLD:-0.5}"
+ROUTING_HIGH_THRESHOLD="${ROUTING_HIGH_THRESHOLD:-0.85}"
 CAPTION_SAFETY_ENABLED="${CAPTION_SAFETY_ENABLED:-true}"
 CAPTION_SAFETY_FORCE_REGENERATE="${CAPTION_SAFETY_FORCE_REGENERATE:-true}"
 CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB="${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB:-true}"
@@ -162,8 +191,8 @@ if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
         echo "MULTINODE_ENABLED=true supports NNODES=1 or NNODES=2." >&2
         exit 1
     fi
-    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && ( ! "${NUM_GPUS}" =~ ^[1-7]$ ) ]]; then
-        echo "A local Llama judge requires NUM_GPUS between 1 and 7 so at least one GPU remains reserved." >&2
+    if [[ "${LOCAL_JUDGE_ENABLED}" == "true" && "${NUM_GPUS}" != "${LOCAL_JUDGE_TRAIN_GPUS}" ]]; then
+        echo "A local Llama judge requires NUM_GPUS=${LOCAL_JUDGE_TRAIN_GPUS} so one GPU remains reserved." >&2
         exit 1
     fi
     if [[ "${LOCAL_JUDGE_ENABLED}" == "false" && "${NUM_GPUS}" != "8" ]]; then
@@ -176,7 +205,7 @@ if [[ "${MULTINODE_ENABLED}" == "true" ]]; then
     fi
     expected_multinode_gpus="$((NUM_GPUS * NNODES))"
     if [[ "${RAY_CLUSTER_EXPECTED_NODES}" != "${NNODES}" || "${RAY_CLUSTER_EXPECTED_GPUS}" != "${expected_multinode_gpus}" ]]; then
-        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with exactly ${expected_multinode_gpus} training GPUs." >&2
+        echo "MULTINODE_ENABLED=true requires a ${NNODES}-node Ray cluster with at least ${expected_multinode_gpus} training GPUs." >&2
         exit 1
     fi
 elif [[ "${NNODES}" != "1" ]]; then
@@ -241,6 +270,7 @@ for bool_name in \
     DIRECT_GROUNDING_CONSUME_NO_TARGET_CAPTION \
     DIRECT_MASK_CE_ENABLED \
     SECA_ENABLED \
+    SECA_SELF_SUPERVISED_ENABLED \
     DIRECT_MASK_CE_INCLUDE_NO_TARGET \
     MULTITASK_GRADIENT_DIAGNOSTICS_ENABLED \
     THREE_STREAM_2_4_1_ENABLED; do
@@ -355,6 +385,23 @@ if [[ "${ROUTING_ENABLED}" == "true" && "${EMA_TEACHER_ENABLED}" != "true" ]]; t
     exit 1
 fi
 
+if [[ "${EGCA_ENABLED}" == "true" && ( "${OPSD_ENABLED}" != "true" || "${PIXEL_IOU_ENABLED}" != "true" ) ]]; then
+    echo "EGCA_ENABLED=true requires OPSD_ENABLED=true and PIXEL_IOU_ENABLED=true." >&2
+    exit 1
+fi
+if [[ "${EGCA_CREDIT_MODE}" != "contrastive" && "${EGCA_CREDIT_MODE}" != "raw" ]]; then
+    echo "EGCA_CREDIT_MODE must be contrastive or raw: ${EGCA_CREDIT_MODE}" >&2
+    exit 1
+fi
+if [[ "${EGCA_UPDATE_MODE}" != "weighted_ce" && "${EGCA_UPDATE_MODE}" != "legacy_advantage" ]]; then
+    echo "EGCA_UPDATE_MODE must be weighted_ce or legacy_advantage: ${EGCA_UPDATE_MODE}" >&2
+    exit 1
+fi
+if [[ "${EGCA_REFERENCE_MODE}" != "target" && "${EGCA_REFERENCE_MODE}" != "fixed" ]]; then
+    echo "EGCA_REFERENCE_MODE must be target or fixed: ${EGCA_REFERENCE_MODE}" >&2
+    exit 1
+fi
+
 if [[ ! "${CAPTION_ANCHOR_KL_COEF}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] \
     || ! awk -v value="${CAPTION_ANCHOR_KL_COEF}" 'BEGIN { exit !(value >= 0) }'; then
     echo "CAPTION_ANCHOR_KL_COEF must be a non-negative number: ${CAPTION_ANCHOR_KL_COEF}" >&2
@@ -412,6 +459,20 @@ for threshold_name in REGENERATE_MIN_TEACHER_SCORE REGENERATE_MIN_NORMALIZED_IMP
         exit 1
     fi
 done
+
+for threshold_name in ROUTING_LOW_THRESHOLD ROUTING_HIGH_THRESHOLD; do
+    threshold_value="${!threshold_name}"
+    if [[ ! "${threshold_value}" =~ ^(0|1)(\.[0-9]+)?$ ]] \
+        || ! awk -v value="${threshold_value}" 'BEGIN { exit !(value >= 0 && value <= 1) }'; then
+        echo "${threshold_name} must be a number in [0, 1]: ${threshold_value}" >&2
+        exit 1
+    fi
+done
+if ! awk -v low="${ROUTING_LOW_THRESHOLD}" -v high="${ROUTING_HIGH_THRESHOLD}" \
+    'BEGIN { exit !(low <= high) }'; then
+    echo "ROUTING_LOW_THRESHOLD must be <= ROUTING_HIGH_THRESHOLD: ${ROUTING_LOW_THRESHOLD} > ${ROUTING_HIGH_THRESHOLD}" >&2
+    exit 1
+fi
 
 if [[ -n "${MAX_STEPS}" && ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_STEPS must be empty or a positive integer: ${MAX_STEPS}" >&2
@@ -614,16 +675,17 @@ echo "Training data: ${TRAIN_DATA}"
 echo "Model: ${MODEL_PATH}"
 echo "Teacher EMA decay: ${TEACHER_EMA_DECAY} (1.0 freezes the initial SAMTok teacher)"
 echo "OPSD enabled: ${OPSD_ENABLED} (false uses original HTG token grading)"
-echo "SECA: ${SECA_ENABLED} (evidence min/max=${SECA_MIN_WEIGHT}/${SECA_MAX_WEIGHT}, fp penalty=${SECA_FALSE_POSITIVE_PENALTY}, coarse/fine token=${SECA_COARSE_TOKEN_WEIGHT}/${SECA_FINE_TOKEN_WEIGHT})"
-echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED}"
+echo "Routing thresholds: low=${ROUTING_LOW_THRESHOLD}, high=${ROUTING_HIGH_THRESHOLD}"
+echo "SECA: ${SECA_ENABLED} (self-supervised=${SECA_SELF_SUPERVISED_ENABLED}, evidence min/max=${SECA_MIN_WEIGHT}/${SECA_MAX_WEIGHT}, fp penalty=${SECA_FALSE_POSITIVE_PENALTY}, coarse/fine token=${SECA_COARSE_TOKEN_WEIGHT}/${SECA_FINE_TOKEN_WEIGHT})"
+echo "EGCA: ${EGCA_ENABLED} (OPD=${EGCA_OPD_ENABLED}, update=${EGCA_UPDATE_MODE}, reference mode=${EGCA_REFERENCE_MODE}, actor coef=${EGCA_ACTOR_COEF}, CE weight=${EGCA_CE_LOSS_WEIGHT}, credit mode=${EGCA_CREDIT_MODE}, evidence min/max=${EGCA_EVIDENCE_MIN_WEIGHT}/${EGCA_EVIDENCE_MAX_WEIGHT}, fixed reference=${EGCA_REFERENCE_COARSE_CODE}/${EGCA_REFERENCE_FINE_CODE})"
+echo "Pixel-IoU reward: ${PIXEL_IOU_ENABLED}; OPSD routing: ${ROUTING_ENABLED} (all-sample correction: ${OPSD_ALL_SAMPLES_OPD})"
 echo "Positive segmentation mask decode mode: ${MASK_DECODE_MODE} (union or first_mask)"
 echo "Segmentation response limit: ${SEGMENTATION_MAX_RESPONSE_TOKENS} tokens"
 echo "Training mask decode mode: ${MASK_DECODE_MODE}"
 echo "Localization prompt mode: ${LOCALIZATION_PROMPT_MODE}"
 echo "Cycle prompt mode: ${CYCLE_PROMPT_MODE}"
 echo "No-target reward mode: ${NO_TARGET_REWARD_MODE}"
-echo "Positive empty-mask penalty: ${POSITIVE_EMPTY_MASK_PENALTY}"
-echo "No-target nonempty-mask penalty: ${NO_TARGET_NONEMPTY_MASK_PENALTY}"
+echo "No-target segmentation loss weight: ${NO_TARGET_SEGMENTATION_LOSS_WEIGHT}"
 echo "Caption safety: ${CAPTION_SAFETY_ENABLED} (force regenerate: ${CAPTION_SAFETY_FORCE_REGENERATE})"
 echo "Caption special-token generation block: ${CAPTION_BLOCK_SPECIAL_TOKEN_VOCAB}"
 echo "EMA teacher: ${EMA_TEACHER_ENABLED}; teacher analysis: ${TEACHER_ANALYSIS_ENABLED}"
@@ -677,7 +739,7 @@ while time.monotonic() < deadline:
         alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
         gpu_count = sum(float(node.get("Resources", {}).get("GPU", 0)) for node in alive_nodes)
         last_state = f"alive_nodes={len(alive_nodes)}, gpus={gpu_count:g}"
-        if len(alive_nodes) == expected_nodes and gpu_count == expected_gpus:
+        if len(alive_nodes) == expected_nodes and gpu_count >= expected_gpus:
             print(f"Verified multi-node Ray cluster: {last_state}")
             ray.shutdown()
             break
@@ -687,7 +749,7 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise RuntimeError(
-        f"Ray cluster {address} did not reach exactly {expected_nodes} alive nodes and "
+        f"Ray cluster {address} did not reach {expected_nodes} alive nodes and "
         f"{expected_gpus:g} GPUs within {timeout}s; last state: {last_state}"
     )
 PY
@@ -699,11 +761,7 @@ if [[ "${MULTINODE_ENABLED}" == "true" && "${SUPERVISED_CAPTION_QA_ENABLED}" == 
         exit 1
     fi
     JUDGE_MODELS_URL="${CAPTION_QA_JUDGE_BASE_URL%/}/models"
-    JUDGE_CURL_ARGS=(--fail --silent --show-error --max-time 15)
-    if [[ -n "${CAPTION_QA_JUDGE_API_KEY}" && "${CAPTION_QA_JUDGE_API_KEY}" != "EMPTY" ]]; then
-        JUDGE_CURL_ARGS+=(-H "Authorization: Bearer ${CAPTION_QA_JUDGE_API_KEY}")
-    fi
-    if ! curl "${JUDGE_CURL_ARGS[@]}" "${JUDGE_MODELS_URL}" >/dev/null; then
+    if ! curl --fail --silent --show-error --max-time 15 "${JUDGE_MODELS_URL}" >/dev/null; then
         echo "DLC-QA judge health check failed: ${JUDGE_MODELS_URL}" >&2
         exit 1
     fi
@@ -741,14 +799,36 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.rollout.disable_tqdm=true \
     worker.opsd.enabled="${OPSD_ENABLED}" \
     worker.opsd.seca.enabled="${SECA_ENABLED}" \
+    worker.opsd.seca.self_supervised_enabled="${SECA_SELF_SUPERVISED_ENABLED}" \
     worker.opsd.seca.min_weight="${SECA_MIN_WEIGHT}" \
     worker.opsd.seca.max_weight="${SECA_MAX_WEIGHT}" \
     worker.opsd.seca.false_positive_penalty="${SECA_FALSE_POSITIVE_PENALTY}" \
     worker.opsd.seca.coarse_token_weight="${SECA_COARSE_TOKEN_WEIGHT}" \
     worker.opsd.seca.fine_token_weight="${SECA_FINE_TOKEN_WEIGHT}" \
+    worker.opsd.egca.enabled="${EGCA_ENABLED}" \
+    worker.opsd.egca.opd_enabled="${EGCA_OPD_ENABLED}" \
+    worker.opsd.egca.actor_coef="${EGCA_ACTOR_COEF}" \
+    worker.opsd.egca.credit_mode="${EGCA_CREDIT_MODE}" \
+    worker.opsd.egca.update_mode="${EGCA_UPDATE_MODE}" \
+    worker.opsd.egca.reference_mode="${EGCA_REFERENCE_MODE}" \
+    worker.opsd.egca.ce_loss_weight="${EGCA_CE_LOSS_WEIGHT}" \
+    worker.opsd.egca.ce_min_weight="${EGCA_CE_MIN_WEIGHT}" \
+    worker.opsd.egca.ce_max_weight="${EGCA_CE_MAX_WEIGHT}" \
+    worker.opsd.egca.ce_token_credit_scale="${EGCA_CE_TOKEN_CREDIT_SCALE}" \
+    worker.opsd.egca.ce_token_weight_max="${EGCA_CE_TOKEN_WEIGHT_MAX}" \
+    worker.opsd.egca.evidence_min_weight="${EGCA_EVIDENCE_MIN_WEIGHT}" \
+    worker.opsd.egca.evidence_max_weight="${EGCA_EVIDENCE_MAX_WEIGHT}" \
+    worker.opsd.egca.false_positive_penalty="${EGCA_FALSE_POSITIVE_PENALTY}" \
+    worker.opsd.egca.reference_coarse_code="${EGCA_REFERENCE_COARSE_CODE}" \
+    worker.opsd.egca.reference_fine_code="${EGCA_REFERENCE_FINE_CODE}" \
+    worker.opsd.egca.credit_clip="${EGCA_CREDIT_CLIP}" \
+    worker.opsd.egca.warmup_steps="${EGCA_WARMUP_STEPS}" \
+    worker.opsd.egca.ramp_steps="${EGCA_RAMP_STEPS}" \
+    worker.opsd.egca.max_groups="${EGCA_MAX_GROUPS}" \
     worker.opsd.localization_rollouts="${LOCALIZATION_ROLLOUTS}" \
     worker.opsd.caption_loss_weight=0.5 \
     worker.opsd.localization_loss_weight=0.5 \
+    worker.opsd.no_target_segmentation_loss_weight="${NO_TARGET_SEGMENTATION_LOSS_WEIGHT}" \
     worker.opsd.caption_anchor_kl_coef="${CAPTION_ANCHOR_KL_COEF}" \
     worker.opsd.caption_anchor_kl_all_safe_routes="${CAPTION_ANCHOR_KL_ALL_SAFE_ROUTES}" \
     worker.opsd.segmentation_anchor_kl_coef="${SEGMENTATION_ANCHOR_KL_COEF}" \
@@ -762,11 +842,10 @@ exec "${PYTHON_BIN}" -m verl.trainer.main \
     worker.opsd.pixel_iou.mask_decode_mode="${MASK_DECODE_MODE}" \
     worker.opsd.pixel_iou.localization_prompt_mode="${LOCALIZATION_PROMPT_MODE}" \
     worker.opsd.pixel_iou.no_target_reward_mode="${NO_TARGET_REWARD_MODE}" \
-    worker.opsd.pixel_iou.positive_empty_mask_penalty="${POSITIVE_EMPTY_MASK_PENALTY}" \
-    worker.opsd.pixel_iou.no_target_nonempty_mask_penalty="${NO_TARGET_NONEMPTY_MASK_PENALTY}" \
     worker.opsd.routing.enabled="${ROUTING_ENABLED}" \
-    worker.opsd.routing.low_threshold=0.5 \
-    worker.opsd.routing.high_threshold=0.85 \
+    worker.opsd.routing.low_threshold="${ROUTING_LOW_THRESHOLD}" \
+    worker.opsd.routing.high_threshold="${ROUTING_HIGH_THRESHOLD}" \
+    worker.opsd.routing.all_samples_opsd="${OPSD_ALL_SAMPLES_OPD}" \
     worker.opsd.routing.preserve_original_grpo="${PRESERVE_ORIGINAL_GRPO}" \
     worker.opsd.caption_safety.enabled="${CAPTION_SAFETY_ENABLED}" \
     worker.opsd.caption_safety.max_response_tokens="${CAPTION_MAX_RESPONSE_LENGTH}" \

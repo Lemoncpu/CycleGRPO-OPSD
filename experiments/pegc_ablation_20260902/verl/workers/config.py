@@ -60,7 +60,7 @@ class WorkerConfig:
         self.ref.use_torch_compile = self.actor.use_torch_compile
         if self.opsd.enabled and self.actor.ulysses_size != 1:
             raise ValueError("OPSD privileged distillation currently requires actor.ulysses_size=1.")
-        if self.opsd.pixel_iou.no_target_reward_mode == "pixel_empty" and (
+        if self.opsd.pixel_iou.no_target_reward_mode in {"pixel_empty", "pixel_empty_iou"} and (
             not self.opsd.enabled or not self.opsd.pixel_iou.enabled
         ):
             raise ValueError(
