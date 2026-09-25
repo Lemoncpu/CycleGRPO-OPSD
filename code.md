@@ -212,6 +212,10 @@ GPU 0--2 训练、GPU 3 运行 judge，parent batch 改为可被 3 整除的 `11
 `MAX_STEPS=1`、`SAVE_FREQ=1`、`SAVE_LIMIT=1`，结束后不启动 GPU hold。
 它只用于验证缩量数据、Ray/judge 和训练链路能否启动及完成一步，不能替代正式 7+1
 拓扑的显存与吞吐验证。
+50% 正式 wrapper 未新增独立四卡文件；本机 smoke 通过环境变量覆盖其资源拓扑，使用同样的
+GPU 0--2 训练、GPU 3 judge、`114/228/57` parent batch、`MAX_STEPS=1`、`SAVE_FREQ=1`、
+`SAVE_LIMIT=1` 和 `HOLD_AFTER_EXIT=false`，因此仍保留正式 50% wrapper 的数据抽样与 baseline
+SECA 关闭配置，同时不改变其默认 7+1/90-step 入口。
 新增的 `tools/train_supervised_70k_seca_routing_l030_h085_4gpu_tmp.sh` 复用完整 70k
 SECA 数据流、模型、算法和 routing 配置，仅把 routing 固定为 `low=0.30/high=0.85`，
 并采用同样的 GPU 0--2 训练、GPU 3 judge、`114/228/57` parent batch、1 step 和不启动
@@ -3820,3 +3824,9 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文件：修改 `README.md`、`code.md`；未新增、移动或删除模块。
 - 行为：README 在四组 routing 阈值矩阵之外新增独立的 50% baseline 数据量控制实验，明确其关闭 SECA、使用 `10000/15000/5000/5000` 的确定性四流子集、匹配 5,000 条 DLC-QA JSONL、`112/224/56` parent batch、默认 90 step 和 7+1 拓扑；补充 baseline 的预检、启动命令及结果解释边界。
 - 验证：`tools/train_supervised_70k_baseline_50pct_8gpu.sh` 的 `bash -n` 与 `DRY_RUN=true HOLD_AFTER_EXIT=false` 预检均退出 0，确认生成 `10000/15000/5000/5000` 四流子集及匹配的 5,000 条 JSONL sidecar；按用户要求未启动 Ray、judge、FSDP 或正式 GPU 训练，因此尚无 checkpoint、训练日志或 GPU hold 结果可报告。
+
+### 2026-09-25 - 完成 50% baseline 四卡本机一步 smoke
+
+- 文件：修改本节训练说明和变更日志；未新增或修改训练脚本、未改变正式 8 卡默认配置。
+- 行为：通过环境变量覆盖 `tools/train_supervised_70k_baseline_50pct_8gpu.sh` 的本机资源，使用 GPU 0--2 训练、GPU 3 本地 Llama judge、`114/228/57` parent batch、`MAX_STEPS=1`、`SAVE_FREQ=1`、`SAVE_LIMIT=1` 与 `HOLD_AFTER_EXIT=false`；50% 子集与 baseline SECA 关闭配置保持不变。
+- 验证：运行目录 `logs/cyclegrpo70k_historical_baseline_50pct_4gpu_smoke/` 的数据准备、四流行数校验、Ray head、judge 健康检查、Qwen3-VL actor/reference/teacher FSDP、vLLM、完整首个 optimizer step 和 `global_step_1` 三 rank actor checkpoint 均成功；`run.log` 记录 `[stage:done]` 与 `[stage:exit] status=0`，Ray/judge 已清理，GPU 0--3 已释放。该 smoke 验证四卡链路，不替代正式 7+1 训练。
