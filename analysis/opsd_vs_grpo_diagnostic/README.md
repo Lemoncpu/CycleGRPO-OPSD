@@ -17,7 +17,7 @@ logits 的固定 rollout 缓存。因此严格版本在缺少输入时会标记
 - GRPO-only：`logs/cyclegrpo20k_direct30k_notarget10k_dlcqa10k_nodirectsft`，714 个 step；
 - OPSD：`logs/cyclegrpo20k_withnt_direct30k_notarget10k_dlcqa10k_bs112_directgrpo_ce005_pixel_empty_positivepenalty1`，178 个 step，另读取其 `teacher_diagnoses.jsonl`。
 
-(a) 将 GRPO-only 每个阶段的一个 `pixel_iou_mean` 聚合值广播到六列，直观看到共享标量监督；(b) 保留 OPSD diagnosis 中六个真实 `pixel_ious`，对每条 diagnosis 减去其六次 rollout 均值后显示同一 caption 内的正负证据差异；(c) 分别把两套日志的 `-cap_actor.pg_loss` 与 pixel-IoU 变化标准化后累积，画成两条独立路径。脚本先渲染 12 个候选布局（`variants_dual/`），正式图选用每种方法六个箭头的单一版本，没有平均多版结果，也没有随机数或手工色块。
+(a) 将 GRPO-only 每个阶段的一个 `pixel_iou_mean` 聚合值广播到六列，直观看到共享标量监督；(b) 保留 OPSD diagnosis 中六个真实 `pixel_ious`，对每条 diagnosis 减去其六次 rollout 均值后显示同一 caption 内的正负证据差异；(c) 上半部直接画两套真实 run 的 mean pixel-IoU 和 rollout spread，下半部画 OPSD 的 regenerate/JSD/original-GRPO route share，并以 GRPO 的 100% scalar route 作虚线基线。这样 c 子图明确展示 OPSD 的 route-aware supervision，而不是容易回到原点的累计 z-score 路径。图中使用 18 个阶段，不插值单条 rollout，也不伪造差异。
 
 这是一张真实日志的 rollout/logged-loss 代理图：它能说明 OPSD 保留 rollout-level evidence、GRPO 日志中呈现 row-wise scalar credit 的监督结构差异，但不能隔离 loss 的因果作用，因为两套 run 不是共同 checkpoint/fixed rollout；它也不能称为 token-autograd 或 before/after parameter-update 图。严格共同 rollout 版本仍由 `extract_signals.py` / `plot_signals.py` 提供，缺少 logits 时会阻止生成。
 ## 导出数据契约

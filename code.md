@@ -178,7 +178,21 @@ pixel-IoU、pixel-empty 二值 no-target reward、direct GRPO、direct mask CE �
 并使用物理 GPU 0--6 作为 Ray/FSDP 训练卡、GPU 7 运行本地 Llama-3.1-8B judge。baseline
 wrapper 将 `SECA_ENABLED` 与 `SECA_SELF_SUPERVISED_ENABLED` 都关闭；SECA wrapper 将两者都
 开启，使 20k cycle 的 mid-route JSD 和 direct mask CE 同时获得 SECA evidence/token credit，
-但不改变 reward 或原始 GRPO。每个 wrapper 都通过
+但不改变 reward 或原始 GRPO。新增的 `tools/train_supervised_70k_seca_8b_8gpu.sh` 完整复用
+SECA wrapper 的数据、算法、batch、7+1 GPU 和 judge 配置，只把 `MODEL_PATH` 默认值切换为已下载的
+`/volume/ybo/xyc/Qwen3-VL-8B-SAMTok`；它使用独立的默认 run 名称和端口，避免与 4B 入口并行运行时互相覆盖。
+对应的 `tools/train_supervised_70k_seca_8b_4gpu_tmp.sh` 是本机临时 smoke wrapper：使用 GPU 0--2 训练、GPU 3
+运行 judge，沿用 `114/228/57` parent batch，仅执行 1 个 optimizer step，且关闭退出后的 GPU hold；除模型路径和
+临时资源/步数覆盖外不改变 SECA 训练逻辑。
+新增的 `tools/train_supervised_100k_seca_8b_8gpu.sh` 在上述 8B SECA wrapper 基础上复用已由
+`tools/run_100k_scaling_opsd_8gpu.sh` 生成的 100k scaling 数据：40k self-supervised、32k direct positive、
+8k direct no-target 和 20k DLC-QA，校验对应 parquet/JSONL 行数，默认 `MAX_STEPS=357`（约一轮 40k 主流，
+保持 `112/224/56` batch、7+1 Ray/judge 拓扑和 SECA 开关）。它只切换数据路径、行数校验、训练步数和独立
+run/端口；不重新生成 100k 数据，也不改变 8B 模型或 SECA 算法。该数据的 direct stream 含有
+gRefCOCO、COCO-Stuff 与 PACO label source，因此 wrapper 开启 `DIRECT_GROUNDING_INCLUDE_LABEL_SOURCES`，训练器
+源校验会同步允许所有已启用的 direct source。公共 launcher 支持通过 `EXPECTED_*_ROWS_OVERRIDE` 覆盖历史
+20k/30k/10k/10k 默认校验值。
+每个 wrapper 都通过
 `tools/train_supervised_70k_common_8gpu.sh` 启动独立端口的项目 Ray head、健康检查本地 judge，
 并在退出时只清理自己发现的 Ray session；数据路径、模型路径、端口和输出目录可用环境变量覆盖。
 基于 SECA wrapper 的四个 routing 阈值入口分别为
@@ -229,6 +243,18 @@ SECA 数据流、模型、算法和 routing 配置，仅把 routing 固定为 `l
 AutoModel 映射，失败时直接返回原始 Python 错误；实际训练仍调用同一个已修复的 FSDP worker。
 训练成功或失败后都会请求八卡 GPU hold，避免服务器因显存释放而回收节点；设置
 `DRY_RUN=true` 只执行路径、行数和配置预检，不启动 Ray、Llama 或训练。
+
+新增的 `tools/eval_8b_all_benchmarks_4gpu.sh` 是两个本地 8B 权重的统一离线评测编排器：默认评测
+基础 `/volume/ybo/xyc/Qwen3-VL-8B-SAMTok` 与指定 step 的 HF 导出（支持 `global_step_179`、
+`global_step_200` 和 `global_step_357`），输出分别隔离到 `EVAL_ROOT/<weight>/`，并把 `NUM_GPUS` 固定为 4。它覆盖 RefCOCO/+/g、
+GroundingSuite、DLC-Bench 和 MR-RefCOCO/+/g、MR-PACO；标准 RefCOCO+/g 通过独立数据根复用
+同一多卡 evaluator，默认固定使用仓库 RefCOCO 协议的普通 prompt `Please segment {phrase} in this image.`、
+tokenizer left padding、`legacy_union`、batch 16 和最多 256 个新 token；MR 四项默认读取 sibling `CycleGRPO/data/segllm_data/conversation_folder/all_data_mix_val/`
+下的四个 `*_val_sampled.json`（与 `evaluation/mr_baselines/audit_data.py` 的 6,678/6,655/3,746/9,281
+样本契约一致），按 round 分配到四个 GPU，每个 round 使用独立工作目录避免预测覆盖；可用 `MR_DATA_ROOT`
+或单项 `MR_*_DATASET` 覆盖。
+DLC 当前实现仍是单进程，因此脚本会如实记录该限制，不把单卡 DLC 伪称四卡结果。脚本不自动停止其他
+CUDA 进程，启动阶段若显存不足会保留原始 Python traceback 和退出码，便于区分 OOM 与路径/代码错误。
 
 两套四组 H20 控制器都依赖平台预先创建 Ray cluster，不需要手工 SSH 启动 trainer 或配置 NCCL 网卡。纯自监督使用 `tools/multinode/launch_four_cycle_trials.sh`（其底层为
 `launch_four_trials.sh`）：复制 `clusters.tsv.example`，每个非注释 TSV 行填写 `trial_id`、`ray_address`、
@@ -729,9 +755,9 @@ code-0 reference，避免固定 code-0 在新训练中成为隐含的拒识偏�
 
 `analysis/opsd_vs_grpo_diagnostic/` 是独立的离线诊断管线，不改变训练算法。`extract_signals.py` 只接受共同 student checkpoint 上导出的固定 rollout：必须同时包含完整 GRPO group 的 `advantages`、`response_mask`、`old_log_probs`、sampled `target_ids`、student logits、privileged teacher logits、route 和 `R_Ci`。脚本先验证完整 group（不能在路由子集上重新归一化 advantage），再固定筛选当前实现真正的 `on_policy_distill` 且 `R_Ci>=0.65` 分布教学分支，按 `(R_Ci,sample_id)` 排序，两种方法共用相同行和 mask。GRPO 调用 `verl.trainer.core_algos.compute_policy_loss` 的真实 clipped surrogate；OPSD 调用 `verl.workers.opsd.distillation.chunked_weighted_jsd_loss` 的真实 generalized-JSD、teacher entropy 权重、sample weight 和 response mask。两者均通过 autograd 计算 sampled-token 的 `-∂L/∂z[y]`，并执行有限差分检查。
 
-当前仓库的 teacher diagnosis JSONL 和 FSDP checkpoint 没有保存这些逐 token logits/rollout 张量，因此严格脚本缺少输入时只写 `metadata.json` 的 blocked 状态，不生成随机或手工热力图。为满足日志级诊断需求，`plot_logged_proxy.py` 仍可从单个真实 OPSD run 生成 rollout/logged-loss proxy；新增 `plot_dual_proxy.py` 则读取真实 GRPO-only run 与 OPSD run，按 12 个时间阶段生成双热力图和两条独立的 logged-direction 路径：GRPO 面板把阶段聚合的一个 `pixel_iou_mean` 广播到六列，OPSD 面板保留每条 diagnosis 的六个真实 `pixel_ious`，并以该 diagnosis 的六次 rollout 均值为中心显示正负残差。因此该图直接展示 row-wise scalar credit 与 rollout-level evidence variation 的监督结构差异，但由于两套 run 不是共同 checkpoint/fixed rollout，不能作 loss 因果消融，也不能称为 token autograd 或参数更新图。`plot_signals.py` 的严格二维面板在没有 before/after 参数更新时明确使用允许的 local-logit-gradient fallback；只有 A/B 位置由更新前 teacher/student sampled-token log-prob 差异预注册阈值划分。严格图和两种日志代理图都只覆盖 OPSD 分布教学分支，不覆盖 regenerate、mask-code localization 或 SECA direct-CE 权重。 第一张增强双热力图由 `plot_ab_enhanced.py` 生成，使用统一对称色标和离散色阶；第二张配对更新图由 `plot_paired_update_direction.py` 严格要求共同 checkpoint/fixed rollout 的 `delta_logp_grpo`、`delta_logp_opsd`、`teacher_gap`、`group_id`，当前输入缺失时只写 blocked metadata，不生成模拟路径。
+当前仓库的 teacher diagnosis JSONL 和 FSDP checkpoint 没有保存这些逐 token logits/rollout 张量，因此严格脚本缺少输入时只写 `metadata.json` 的 blocked 状态，不生成随机或手工热力图。为满足日志级诊断需求，`plot_logged_proxy.py` 仍可从单个真实 OPSD run 生成 rollout/logged-loss proxy；`plot_dual_proxy.py` 读取真实 GRPO-only run 与 OPSD run，按 18 个时间阶段生成双热力图，并在 (c) 中直接显示两套真实 run 的 mean pixel-IoU/rollout spread 以及 OPSD 的 regenerate/JSD/original-GRPO route share（GRPO 的 100% scalar route 作虚线基线）。(a) 把阶段聚合的一个 `pixel_iou_mean` 广播到六列，(b) 保留每条 diagnosis 的六个真实 `pixel_ious` 并以该 diagnosis 的六次 rollout 均值为中心显示正负残差，因此图直接展示 row-wise scalar credit 与 rollout-level evidence variation 的监督结构差异。由于两套 run 不是共同 checkpoint/fixed rollout，不能作 loss 因果消融，也不能称为 token autograd 或参数更新图。`plot_signals.py` 的严格二维面板在没有 before/after 参数更新时明确使用允许的 local-logit-gradient fallback；只有 A/B 位置由更新前 teacher/student sampled-token log-prob 差异预注册阈值划分。严格图和两种日志代理图都只覆盖 OPSD 分布教学分支，不覆盖 regenerate、mask-code localization 或 SECA direct-CE 权重。第一张增强双热力图由 `plot_ab_enhanced.py` 生成，使用统一对称色标和离散色阶；第二张配对更新图由 `plot_paired_update_direction.py` 严格要求共同 checkpoint/fixed rollout 的 `delta_logp_grpo`、`delta_logp_opsd`、`teacher_gap`、`group_id`，当前输入缺失时只写 blocked metadata，不生成模拟路径。
 
-新增的 `analysis/token_update_scatter/` 是另一条只读、离线的论文图诊断管线。`extract_token_updates.py` 从文档记录的 disjoint RefCOCO parquet 固定抽取样本，用同一个 processor 对 SAMTok base、官方 GRPO checkpoint、Pixel-OPSD checkpoint 和独立 direct-supervision checkpoint 做真实 teacher-forced 多模态前向；只保留 GT depth-2 mask-code token，并保存四套 log-prob、有限值 mask、目标 token 位置和 `intervention_rollouts.jsonl`。由于历史 run 没有共同 sampled rollout、逐 token logits 或 before/after optimizer state，该管线采用明确命名的 `teacher_alignment` fallback：横轴是独立 teacher 与 base 的 log-prob 差，纵轴是历史 checkpoint 相对 base 的实际 `Δlog p`。这不是重新执行 GRPO/OPSD 更新，也不能将两套不同训练 parquet 的 checkpoint 差异表述为公平 objective 消融或因果 token credit。`plot_token_updates.py` 生成共享点、范围和色标的二维 GRPO/Pixel-OPSD 面板及同一批点的三维视图；三维 reliability 明确定义为 base 对 GT mask-code 序列的 `exp(mean log p)`，不是训练代码的 `R_Ci`。脚本、配置、审计、图注和真实数组均保存在该目录，且不修改论文、训练入口或 checkpoint。
+新增的 `analysis/token_update_scatter/` 是另一条只读、离线的论文图诊断管线。`extract_token_updates.py` 从文档记录的 disjoint RefCOCO parquet 固定抽取样本，用同一个 processor 对 SAMTok base、官方 GRPO checkpoint、Pixel-OPSD checkpoint 和独立 direct-supervision checkpoint 做真实 teacher-forced 多模态前向；只保留 GT depth-2 mask-code token，并保存四套 log-prob、有限值 mask、目标 token 位置和 `intervention_rollouts.jsonl`。由于历史 run 没有共同 sampled rollout、逐 token logits 或 before/after optimizer state，该管线采用明确命名的 `teacher_alignment` fallback：横轴是独立 teacher 与 base 的 log-prob 差，纵轴是历史 checkpoint 相对 base 的实际 `Δlog p`。这不是重新执行 GRPO/OPSD 更新，也不能将两套不同训练 parquet 的 checkpoint 差异表述为公平 objective 消融或因果 token credit。当前 smoke 图使用 16 行/32 token；`extract_token_updates.py --n 128` 是维护的扩展目标，GPU 不可用时不得用 synthetic preview、复制或 jitter 补点。`plot_token_updates.py` 在二维/三维主面板下增加同一批 token 的 paired `Δlog p`（OPSD−GRPO）条带，并在标题报告描述性 Spearman `rho_s`，使真实方法差异可见；三维 reliability 明确定义为 base 对 GT mask-code 序列的 `exp(mean log p)`，不是训练代码的 `R_Ci`。脚本、配置、审计、图注和真实数组均保存在该目录，且不修改论文、训练入口或 checkpoint。
 
 为可观测性，`teacher_analysis` 可在每一步从 regenerate 和 mid route 各抽取一条最低 `R_Ci` 候选。EMA teacher 在独立 privileged prompt 中输出 JSON diagnosis：`failure_mode`、`missing_evidence`、`distractor_evidence`、`correction_focus`。driver 将其写入 checkpoint 根目录的 `teacher_diagnoses.jsonl`，记录 route、`R_Ci`、IoU 向量、student caption 和诊断文本；主标量日志只记录 `opsd/teacher_analysis_count`。诊断严格不进入 student prompt、teacher caption target、模型 checkpoint 或推理输出。该 pass 会增加一次小型 teacher rollout，设置 `worker.opsd.teacher_analysis.enabled=false` 可关闭。
 
@@ -826,11 +852,18 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `tools/train_supervised_70k_baseline_25pct_8gpu.sh` / `tools/train_supervised_70k_baseline_50pct_8gpu.sh` | 历史 baseline 的全流数据量消融 wrapper；分别使用 25%/50% 分层子集和 45/90 默认训练步数，独立 run 名称、Ray/judge 端口与 Ray 临时目录 |
 | `tools/train_supervised_70k_baseline_25pct_4gpu_tmp.sh` | 25% baseline 的本机四卡一步 smoke wrapper；GPU 0--2 训练、GPU 3 judge，batch `114/228/57`，独立端口和日志，不启动结束占卡 |
 | `tools/train_supervised_70k_seca_8gpu.sh` | 70k 历史 OPSD+有监督 SECA wrapper；SECA evidence gate 与 direct mask CE token credit 开启，其他训练配置与 baseline 相同 |
+| `tools/train_supervised_70k_seca_8b_8gpu.sh` | 70k SECA 8B 模型 wrapper；完整复用 4B SECA 入口的数据、算法、batch、7+1 拓扑和 judge，仅将默认 `MODEL_PATH` 切换为 `Qwen3-VL-8B-SAMTok`，并使用独立默认 run/端口 |
+| `tools/train_supervised_100k_seca_8b_8gpu.sh` | 100k scaling 数据的 8B SECA 正式入口；复用 8B SECA wrapper 的模型/算法/7+1 拓扑，读取预生成的 40k/32k/8k/20k 数据流，默认 357 step、独立 run/端口；公共 70k launcher 的 `EXPECTED_*_ROWS_OVERRIDE` 支持非历史数据规模校验 |
+| `tools/train_supervised_100k_seca_8b_2gpu_tmp.sh` | 100k 8B SECA 本机两卡一步 smoke wrapper；固定 CUDA 2 为唯一 Ray/FSDP 训练卡、CUDA 3 为 Llama judge，使用 `112/224/56` parent batch、`MAX_STEPS=1`，不启动退出后的 GPU hold |
+| `tools/train_supervised_70k_seca_8b_4gpu_tmp.sh` | 8B SECA 70k 本机四卡一步 smoke wrapper；GPU 0--2 训练、GPU 3 judge，`114/228/57` parent batch，独立端口和日志，不启动退出后的 GPU hold |
 | `tools/train_supervised_70k_seca_routing_l030_h085_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l070_h085_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l050_h065_8gpu.sh` / `tools/train_supervised_70k_seca_routing_l050_h100_8gpu.sh` | 基于 SECA 正式 70k wrapper 的四个 routing 阈值单因素消融；分别覆盖 `(low,high)=(0.30,0.85)/(0.70,0.85)/(0.50,0.65)/(0.50,1.00)`，其余配置不变 |
 | `tools/train_supervised_70k_seca_routing_l030_h085_4gpu_tmp.sh` | `l030/h085` routing 变体的本机四卡一步 smoke wrapper；复用完整 70k SECA 数据和算法配置，GPU 0--2 训练、GPU 3 judge，batch `114/228/57`，不启动结束占卡 |
 | `tools/demo_refcoco_compare_1000.sh` / `tools/demo_three_capabilities.sh` | 学生演示启动器；在同一 RefCOCO 1k 子集上比较 SAMTok/Ours，及展示最佳 ours mask captioning/VQA；推理期间 GPU 1--3 运行 hold，正常或异常退出时恢复四卡 hold |
 | `tools/demo_refcoco_compare.sh` / `tools/demo_three_capabilities.sh` | 精简演示启动入口；静默调用 GPU hold helper，仅在发现 GPU 正被其他计算占用时输出一条通用提示，不打印逐卡状态表 |
 | `tools/record_pixel_opsd_demo.sh` | 录屏用单图三任务启动器；读取 `logs/pixel_opsd_recording_demo/inputs/` 的三个 JSON 任务描述，在一个模型进程中运行指代分割、region captioning 和 general VQA，并把 JSON/PNG 结果写入对应 `outputs/` 目录；模型、VQ-SAM2 和 CUDA 设备可由环境变量覆盖 |
+| `tools/demo_segmentation.py` / `tools/eval_refcoco.py` / `tools/eval_refcoco_sa2va.py` / `tools/run_demo_segmentation.sh` / `tools/test_refcoco.sh` | 独立功能/性能测试入口及 shell 封装：功能入口扫描 `tools/demo/input/<task>/` 的全部图像和同名 JSON，按任务/相对文件名生成逐样本 JSON 与可视化；目录不存在、无图或标注缺失时失败。`test_refcoco.sh` 按 HF `config.json` 的 `model_type` 分流：SAMTok 权重使用正式 mask protocol evaluator，完整审计样本及协议 metadata 并汇总 cIoU/mIoU；Sa2VA 使用原生 `predict_forward` 和 prediction masks，不依赖 VQ-SAM2/SAMTok 解码器，输出相同 RefCOCO cIoU/mIoU。两种后端都使用普通 prompt、默认 val/unc split，并按模型目录名隔离结果；SAMTok 默认 `legacy_union`、每卡 batch 16 和 256-token 生成，运行参数可由 `REFCOCO_*` 环境变量覆盖 |
+| `tools/eval_8b_all_benchmarks_4gpu.sh` | 8B 权重四卡离线 benchmark 编排器；支持基础模型及指定 `global_step_179`/`global_step_200`/`global_step_357` HF 导出，覆盖 RefCOCO/+/g、GroundingSuite、DLC-Bench、MR-RefCOCO/+/g 与 MR-PACO，标准评测按四卡分片、MR 按 round 分配四卡，模型/结果目录隔离并保留 OOM 原始错误；DLC prediction 单进程限制显式记录 |
+| `tools/demo/input/{refcoco,reasonseg}/` | 目录驱动功能测试输入；每张图像必须与同目录同名 JSON 配对。当前分别保存已验证的 RefCOCO case `115981`（query + target RLE）与 ReasonSeg val case `371426030_646af53def_o`（query + polygon），可继续添加符合各任务 schema 的图像/标注对 |
 | `tools/train_supervised_70k_baseline_4gpu_tmp.sh` / `tools/train_supervised_70k_seca_4gpu_tmp.sh` | 本机临时 smoke wrapper；使用 CUDA 0--2 训练、CUDA 3 本地 Llama judge，batch `114/228/57` 仅跑 1 step，不启动结束占卡 |
 | `tools/patch_official_final_validation.py` | 对官方 CycleGRPO trainer 做幂等的最小补丁，使 `trainer.val_freq<=0` 时跳过训练结束后的通用 validation |
 | `experiments/pegc_ablation_20260902/tools/eval_direct_grpo_refusal_suite.sh` | 探索副本两版 direct-GRPO/Refusal Credit checkpoint 的四 bench 串行评测；使用本地 Llama-3.1 8B 评分 DLC，汇总 GRES 的 T_acc/N_acc/gIoU/cIoU，并在完成后恢复 GPU 占卡
@@ -866,11 +899,11 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `workers/opsd/seca.py` | 统一的 SECA 空间证据信用分配：自监督/混合训练的 mid-route JSD evidence gate 与 direct mask CE hierarchical token credit；由 `worker.opsd.seca.enabled` 和自监督子开关控制 |
 | `workers/opsd/distillation.py` | response-token 分块的 checkpointed generalized-JSD、teacher 置信度权重、caption 分割 special-token vocab 屏蔽和 distillation metrics |
 | `analysis/opsd_vs_grpo_diagnostic/extract_signals.py` / `plot_signals.py` | 共同固定 rollout 的真实 GRPO/OPSD autograd token 梯度提取、相同行热力图和 local-gradient 二维诊断；缺少 logits 时拒绝生成图 |
-| `analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py` | 从真实 GRPO-only 与 OPSD experiment logs 生成双方法 rollout/logged-loss 代理图；渲染 12 个候选布局并选择单一双路径版本 |
+| `analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py` | 从真实 GRPO-only 与 OPSD experiment logs 生成双方法 rollout/logged-loss 代理图；渲染 18 阶段热力图、mean-IoU/spread 曲线和 route-share 面板 |
 | `analysis/opsd_vs_grpo_diagnostic/plot_ab_enhanced.py` | 从真实日志代理信号绘制增强双热力图，采用多级发散色阶和最小机制标注 |
 | `analysis/opsd_vs_grpo_diagnostic/plot_paired_update_direction.py` | 从共同 checkpoint/fixed rollout 的实测 sampled-token `delta_logp` 生成 GRPO/OPSD 配对更新方向；缺少输入时阻止生成 |
 | `analysis/token_update_scatter/extract_token_updates.py` / `estimate_token_contribution.py` | 在固定 disjoint RefCOCO 样本上对真实 HF checkpoint 做 teacher-forced mask-code log-prob 提取，并计算显式 teacher-alignment 横轴；不启动训练 |
-| `analysis/token_update_scatter/plot_token_updates.py` | 以共同点、共同范围和实际 checkpoint `Δlog p` 渲染二维/三维 token-update 诊断图 |
+| `analysis/token_update_scatter/plot_token_updates.py` | 以共同点、共同范围、实际 checkpoint `Δlog p`、Spearman 描述统计和 paired OPSD−GRPO 条带渲染二维/三维 token-update 诊断图 |
 | `analysis/token_update_scatter/implementation_audit.md` / `caption.tex` / `README_zh.md` / `config.yaml` | 记录 GRPO/OPSD 源码审计、坐标单位、可靠性定义、checkpoint/data provenance、限制和复现命令 |
 | `workers/opsd/mask_iou.py` | 完整/合法 SAMTok group 解析和计数、原始 GT 转换、可复用 image embedding 的批量 `union`/`first_mask` 解码、尺寸恢复和像素 IoU |
 | `workers/opsd/routing.py` | `R_Ci` 聚合、三路由边界、caption 特殊 token/JSON/长度安全检查、原始 GRPO 启用判定、packed mask context、GT/reconstruction teacher crop 构造、route 权重与泄漏过滤 |
@@ -972,7 +1005,8 @@ RL 阶段直接通过 Hugging Face checkpoint 加载模型，不实例化上述 
 | `gres/` | `qwen3vl_gres_eval.py` 从官方 gRefCOCO refs/instances 生成评测清单，解码 mask token、保存可恢复 shard，并计算全量与可选 JSONL 子集 gIoU/cIoU/N-acc/T-acc；分割生成默认最多 256 个新 token（可通过 `GRES_MAX_NEW_TOKENS` 覆盖）；mask 解析与 VQ-SAM2 构造共享模块级 `CODEBOOK_SIZE=256`、`CODEBOOK_DEPTH=2`，因此推理分片在首次生成 mask 时不会依赖 `main()` 局部变量；`subset_metrics.py` 复用官方 empty-target cIoU 语义，提供无模型依赖的累积器、multi annotation 数量、GT 面积分桶和 two-instance member coverage/geometry 分组；`run_gres_multigpu.sh` 负责多 GPU 分片和完整性检查 |
 | `mask_protocol.py` | RefCOCO、GRES 和 GroundingSuite 共用的严格离线 SAMTok 协议：`legacy_union` 保留全部完整、codebook 合法的 depth-2 group 并 union，`first_mask` 仅保留首组且在生成时将 `<|mt_end|>` 加入 EOS；另提供仅供 RefCOCO 调用的公开 CycleGRPO raw-token 兼容解析 helper |
 | `mr_baselines/` | 五个本地基线的 MR sampled 推理适配器（Sa2VA、PaDT、UniPixel、InstructSeg、EVF-SAM）、SAMTok/图片预检、PaDT RLE 转换、保留占卡显存的单模型启动器、独立收尾监控及严格全量 RLE scorer；四个推理适配器支持按全局样本序号从中断点续跑，续跑写入独立目录；`finalize_resumed.py` 在各后缀成功退出后逐条校验顺序、严格评分、填表并请求四卡 GPU hold |
-| `refcoco/` | 标准 RefCOCO 的 `instances.json`/`refs(unc).p` 多 GPU 分片推理和 cIoU/mIoU 汇总；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。`cyclegrpo_legacy` 是单独的公开脚本兼容模式，强制 batch 1、128 token、special-token skip 与宽松 raw-token parser，不得作为标准分数和严格协议对比。其他模式每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数、协议与实际生成参数，协议不匹配时会重新生成。`demo_compare_1000.py` 在固定 seed 下抽取同一组 1,000 个 RefCOCO val 样本，按普通表达分割 SAMTok/Ours、实时显示百分比进度、保存实测 cIoU/mIoU、最大逐样本 IoU 增益对比图；`demo_three_capabilities.py` 从该预测目录选取 Ours IoU 最高样本，使用预测 mask token 做 mask-conditioned captioning，并在原图上运行传统 VQA。`record_three_tasks.py` 是独立的录屏入口：读取三个都指向同一图像的 JSON 输入，单进程依次执行 referring segmentation、region captioning、general VQA，输出三份结构化 JSON、预测/GT mask 和三张大字 PNG；固定录屏案例为 RefCOCO case `115981`（已有成功 IoU 约 `0.9747`） |
+| `projects/vlm/tokenmask/evaluation/qwen3vl/qwen3vl_mrrefcoco*_eval.py` / `qwen3vl_mrrefcocog_eval.py` / `qwen3vl_mrpaco_eval.py` | CycleGRPO 原生 MR-RefCOCO/+/g、MR-PACO 多轮 mask-conditioned evaluator；读取 `all_data_mix_val/*_val_sampled.json` 的 round/history/target_masks，保留原始对话协议；所有四个入口均按完整 round 推理，不在 evaluator 内隐式截取 1/8 分片。检测可选的 detectron2 仅用于未调用的可视化 helper，纯推理环境不再因缺少该可选依赖阻断模型加载 |
+| `refcoco/` | 标准 RefCOCO/+/g 的 `instances.json` 与 split refs 多 GPU 分片推理和 cIoU/mIoU 汇总；RefCOCO 与 RefCOCO+ 使用 `refs(unc).p`，RefCOCOg 官方 val 使用 `refs(umd).p`；四卡 8B runner 通过 `REFCOCO_SPLIT_BY`/`REFCOCOG_SPLIT_BY` 传递 split；默认 `legacy_union` 解码全部合法 group，显式 `first_mask` 才在首个 `<|mt_end|>` 终止并只解码首组。`cyclegrpo_legacy` 是单独的公开脚本兼容模式，强制 batch 1、128 token、special-token skip 与宽松 raw-token parser，不得作为标准分数和严格协议对比。其他模式每个 GPU 的 VLM generation 通过 `EVAL_BATCH_SIZE` 批处理，默认 16，并固定使用 decoder-only 模型所需的 tokenizer left padding；逐样本 JSON 保存 group 数、协议与实际生成参数，协议不匹配时会重新生成。`tools/eval_refcoco.py` 复用该正式 evaluator 编排完整 split，默认使用普通 prompt `Please segment {phrase} in this image.`，不会走强制 positive 模板；它在计分前检查文件全集及 prompt/protocol metadata。`tools/eval_refcoco_sa2va.py` 对 Sa2VA 调用原生 `predict_forward`，将输出的 segmentation masks union 后转换为 RLE，并按同一 RefCOCO target 计算 cIoU/mIoU；shell 根据 `model_type` 自动选择后端。`tools/demo_segmentation.py` 按任务名扫描输入子目录中的全部图像/同名标注，用普通 RefCOCO prompt 或 ReasonSeg annotation instruction 推理，并按任务子目录输出预测与 GT 叠加图。`demo_compare_1000.py` 在固定 seed 下抽取同一组 1,000 个 RefCOCO val 样本，按普通表达分割 SAMTok/Ours、实时显示百分比进度、保存实测 cIoU/mIoU、最大逐样本 IoU 增益对比图；`demo_three_capabilities.py` 从该预测目录选取 Ours IoU 最高样本，使用预测 mask token 做 mask-conditioned captioning，并在原图上运行传统 VQA。`record_three_tasks.py` 是独立的录屏入口：读取三个都指向同一图像的 JSON 输入，单进程依次执行 referring segmentation、region captioning、general VQA，输出三份结构化 JSON、预测/GT mask 和三张大字 PNG；固定录屏案例为 RefCOCO case `115981`（已有成功 IoU 约 `0.9747`） |
 | `groundingsuite/` | Qwen3-VL 推理、按 task 分片和自动合并；支持显式 data root 与可选 COCO 图像根；分割生成默认上限为 256（可通过 `GROUNDINGSUITE_MAX_NEW_TOKENS` 覆盖），默认 `legacy_union`，可显式切为严格 `first_mask`，逐样本 JSON 保存协议且不打印逐样本 response |
 | `gcg/` | 生成 interleaved text-mask，解码 mask 并保存 RLE/文本供官方 GCG 指标；数据根需替换 |
 | `gar/` | VQA 和 detailed caption 两个推理入口；`gar_vqa_metrics.py` 汇总总体与属性类别准确率 |
@@ -3830,3 +3864,129 @@ direct GRPO/CE/DLC-QA 全开。平台预先提供隔离 Ray cluster；controller
 - 文件：修改本节训练说明和变更日志；未新增或修改训练脚本、未改变正式 8 卡默认配置。
 - 行为：通过环境变量覆盖 `tools/train_supervised_70k_baseline_50pct_8gpu.sh` 的本机资源，使用 GPU 0--2 训练、GPU 3 本地 Llama judge、`114/228/57` parent batch、`MAX_STEPS=1`、`SAVE_FREQ=1`、`SAVE_LIMIT=1` 与 `HOLD_AFTER_EXIT=false`；50% 子集与 baseline SECA 关闭配置保持不变。
 - 验证：运行目录 `logs/cyclegrpo70k_historical_baseline_50pct_4gpu_smoke/` 的数据准备、四流行数校验、Ray head、judge 健康检查、Qwen3-VL actor/reference/teacher FSDP、vLLM、完整首个 optimizer step 和 `global_step_1` 三 rank actor checkpoint 均成功；`run.log` 记录 `[stage:done]` 与 `[stage:exit] status=0`，Ray/judge 已清理，GPU 0--3 已释放。该 smoke 验证四卡链路，不替代正式 7+1 训练。
+
+### 2026-09-25 - 增强监督诊断图的差异可见性
+
+- 代码：更新 `analysis/token_update_scatter/extract_token_updates.py`、`analysis/token_update_scatter/plot_token_updates.py`、`analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py`；同步更新两个诊断目录的 README/caption、本节 3.7 和模块清单。
+- 行为：token extractor 的维护目标从 smoke 的 16 行提高为 `--n 128`（约 256 个合法 depth-2 mask-code token），但不以复制、抖动或 synthetic preview 补点；当前已生成 smoke 图仍如实标注 `n=32`。2D/3D token 图在相同主面板下增加同一 token 对的 OPSD−GRPO `Δlog p` 条带，并报告描述性 Spearman `ρ_s`。`opsd_vs_grpo` 的 (c) 子图改为真实日志的 normalized-progress mean pixel-IoU/rollout-spread 曲线和 OPSD regenerate/JSD/original-GRPO route-share 堆叠，显式对照 GRPO 的 100% scalar route，不再使用容易回到原点的累计 z-score 路径。两套历史 run 仍明确标记为非共同 checkpoint/fixed rollout，不能作因果优越性结论。
+- 验证：运行 `PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile analysis/token_update_scatter/plot_token_updates.py analysis/token_update_scatter/extract_token_updates.py analysis/opsd_vs_grpo_diagnostic/plot_dual_proxy.py`；用现有真实 `token_data.npz`（32 finite tokens）和两套真实训练日志重绘 PDF/SVG/PNG，人工检查 token paired strip、Spearman 标注、18-stage heatmap 及 route-aware (c) 面板。当前四张 GPU 均有既有进程/保活占用，未中断它们执行新的 128-row 模型前向；因此扩展点数仍待 GPU 空闲后按 `--n 128` 实测提取。
+
+### 2026-10-05 - 修复 8B checkpoint CPU 重组的无关模型导入
+
+- 文件：修改 `tools/reassemble_fsdp_checkpoint.py`；更新本变更日志。
+- 行为：HF 导出阶段根据实际 `config.model_type` 选择 `AutoModelForImageTextToText`；不再枚举完整 AutoModel 映射，避免服务器 timm 版本不兼容的 Gemma3n 导入阻断 Qwen3-VL-8B checkpoint 重组。其他模型类型仍回退到 `AutoModelForCausalLM`。
+- 验证：首次重组已完成 750 个 state-dict 条目但复现 Gemma3n/`ImageNetInfo` 导入错误；补丁后将重新执行 7-rank CPU/Gloo 重组。已通过静态语法检查，未改变 checkpoint 内容。
+
+### 2026-09-30 - 停止 GPU 占卡并新增 8B 四卡临时 smoke 入口
+
+- 文件：新增 `tools/train_supervised_70k_seca_8b_4gpu_tmp.sh`；更新第 2.2、5.1 节及本变更日志。
+- 行为：停止 `tools/gpu_power_hold.sh` 管理的 GPU 0--3 worker；新增 8B 临时入口，使用 GPU 0--2 训练、GPU 3 运行 Llama judge，`114/228/57` parent batch、`MAX_STEPS=1`、`SAVE_FREQ=1`、`SAVE_LIMIT=1`，并关闭退出后的 GPU hold。
+- 验证：停止命令确认原有 4 个 hold worker 均已移除；新脚本通过 `bash -n`，实际启动一次四卡 smoke 训练并完成数据预检、Ray/judge 健康检查、8B actor/reference/teacher FSDP 加载、vLLM CUDA graph 初始化和首个 batch generation；按用户要求在 optimizer step 完成前停止，进程退出码为 `141`。随后仅重新启动 `gpu_power_hold.sh` 的 GPU 0--3 worker，确认每卡约 41 GiB 显存、99% 利用率，未触碰其他 GPU 进程。
+
+### 2026-09-30 - 下载 Qwen3-VL-8B-SAMTok 并新增 8B SECA 70k 入口
+
+- 文件：新增 `tools/train_supervised_70k_seca_8b_8gpu.sh`；新增模型目录 `/volume/ybo/xyc/Qwen3-VL-8B-SAMTok`；更新第 2.2、5.1 节及本变更日志。
+- 行为：8B wrapper 完整继承 `tools/train_supervised_70k_seca_8gpu.sh` 的 SECA 开关、70k 四流数据、`112/224/56` parent batch、179 step、7+1 Ray/Llama 拓扑和 checkpoint 配置，仅将默认 `MODEL_PATH` 改为 `zhouyik/Qwen3-VL-8B-SAMTok` 的本地下载目录；独立默认 run 名称和端口只用于避免与 4B 入口的运行产物冲突。
+- 验证：使用项目环境 `huggingface_hub.snapshot_download(..., token=False, resume_download=True)` 完成 21 个文件下载；检查 `config.json`、`model.safetensors.index.json`、4 个 safetensors 分片、SAMTok mask tokenizer 与 SAM2 权重均为非空文件；执行新 wrapper 和共享 launcher 的 `bash -n` 及 `git diff --check`，未启动 GPU/Ray/FSDP 正式训练。
+
+### 2026-09-27 - 新增 SAMTok RefCOCO/ReasonSeg 功能与性能测试入口
+
+- 文件：新增 `tools/demo_segmentation.py`、`tools/eval_refcoco.py`；同步更新第 5.1、5.6 节模块说明。
+- 行为：功能脚本复用同一模型和 VQ-SAM2 进程，分别运行 RefCOCO 指代分割与 ReasonSeg 推理分割，并按 `tools/demo.py` 的布局写出 `tools/demo/output/result/*.json` 和 `tools/demo/output/visualization/*.jpg`。性能脚本多 GPU 编排正式 RefCOCO evaluator，完整性检查覆盖样本文件、mask protocol 与 prompt metadata，汇总 cIoU/mIoU，并以默认 cIoU 70 阈值写出 PASS/FAIL。RefCOCO 默认 prompt 固定为普通模板 `Please segment {phrase} in this image.`，不采用强制 positive 模板；`first_mask` 模式沿用 `<|mt_end|>` EOS，默认 `legacy_union` 保持历史兼容。
+- 验证：两个脚本 `py_compile` 和 `--help` 均通过；无 GPU 单元检查覆盖 task 展开、真实 ReasonSeg val 标注解析、预测/GT 可视化写出以及 RefCOCO prediction metadata 审计。使用 step 179 导出权重完成双任务端到端冒烟：RefCOCO case `115981` 单样本 IoU `97.47%`，ReasonSeg val case `371426030_646af53def_o` 单样本 IoU `96.43%`，两份 JSON 和两张 JPG 均成功写出；单样本 IoU 不替代全量 RefCOCO 指标。
+
+### 2026-09-27 - 增加分割功能与性能测试 shell 封装
+
+- 文件：新增 `tools/run_demo_segmentation.sh`、`tools/run_eval_refcoco.sh`；同步更新第 5.1 节模块清单。
+- 行为：两个封装将首个非选项参数解析为 Hugging Face 模型目录，其余参数不改写地传给对应 Python 入口；未传模型时默认 step-179 导出权重，也支持 `MODEL_PATH`。base SAMTok 与 SAMTok-co 自动选择各自目录内的 `mask_tokenizer_256x2.pth` 和 `sam2.1_hiera_large.pt`，不含 decoder 文件的训练导出权重回退到 base SAMTok 文件；`VQ_SAM2_PATH`、`SAM2_PATH`、`PYTHON_BIN` 均可显式覆盖。默认输出追加模型目录名，分别写入 `tools/demo/output/<model>/` 和 `tools/demo/output/performance/<model>/`，防止正式 evaluator 将另一模型同 prompt/protocol 的 JSON 当成可恢复结果；显式 `--output-root`/`--output-dir` 可覆盖。
+- 验证：两份 shell 的 `bash -n` 通过；分别以 `/volume/ybo/xyc/Qwen3-VL-4B-SAMTok`、`/volume/ybo/xyc/Qwen3-VL-4B-SAMTok-co` 和 step-179 HF 导出目录执行两个封装的 `--help`，六次目录/参数检查均退出 0，未重复执行模型推理或全量性能评测。
+
+### 2026-09-27 - 固定功能测试的双任务高 IoU 默认样例
+
+- 文件：修改 `tools/demo_segmentation.py`；未改变性能评测入口或全量指标协议。
+- 行为：功能测试默认固定使用已完成端到端验证的 RefCOCO case `115981` 和 ReasonSeg val case `371426030_646af53def_o`；直接运行 Python 和 shell 封装行为一致。命令行仍可通过 `--refcoco-case-id`、`--reasonseg-case` 显式覆盖，`--refcoco-index`/`--reasonseg-index` 仅在对应 case 参数显式传空值的自定义调用中生效。
+- 验证：默认两例在 step-179 权重下的既有实测单样本 IoU 分别为 `97.47%` 和 `96.43%`；本次默认值修改通过 `py_compile`、shell 语法和 `--help` 检查，未重复加载模型。高 IoU 仅用于稳定功能演示，不代表其他权重也必然达到 90%，且不替代全量 RefCOCO 指标。
+
+### 2026-09-27 - 功能测试改为任务子目录批量发现
+
+- 文件：修改 `tools/demo_segmentation.py`；新增 `tools/demo/input/refcoco/115981.{jpg,json}` 与 `tools/demo/input/reasonseg/371426030_646af53def_o.{jpg,json}`；同步更新第 5.1、5.6 节。
+- 行为：`--input-root` 默认指向 `tools/demo/input`，对每个选中任务递归扫描 `<input-root>/<task_name>/` 的全部常见格式图像，并要求每张图有同路径同 stem 的 JSON。不存在输入根/任务目录、目录无图、缺少标注、RefCOCO 缺 query/RLE 或 mask 尺寸不符均在加载模型前报错。输出按 `<model>/{result,visualization}/<task>/<relative-stem>` 隔离；终端打印模型路径、输入根、总样本数、任务类型、逐样本图像/指令/视觉提示/模型文本和保存路径。
+- 验证：无 GPU 发现测试准确加载两个任务目录各一例并核对 mask/image 尺寸；`py_compile`、shell `bash -n`、`--help` 与 `git diff --check` 通过。使用 step-179 权重从新输入目录完成真实双任务推理，新路径下 RefCOCO/ReasonSeg IoU 仍分别为 `97.47%`/`96.43%`，JSON 与 JPG 均成功写出。
+
+### 2026-09-27 - 统一 RefCOCO shell 测试协议
+
+- 文件：修改 `tools/test_refcoco.sh`；同步更新第 5.1 节工具职责。
+- 行为：shell 显式调用仓库 `tools/eval_refcoco.py`，默认使用 RefCOCO val/unc、普通 prompt `Please segment {phrase} in this image.`、`legacy_union` mask 解码、每卡 batch 16 和 256 个生成 token。Python 入口继续执行完整样本及 prompt/protocol metadata 审计；新增 `REFCOCO_SPLIT`、`REFCOCO_SPLIT_BY`、`REFCOCO_GPUS`、`REFCOCO_BATCH_SIZE`、`REFCOCO_MAX_NEW_TOKENS`、`REFCOCO_MASK_PROTOCOL` 和 `REFCOCO_PROMPT_TEMPLATE` 环境变量，显式 CLI 参数可覆盖默认值。
+- 验证：`bash -n tools/test_refcoco.sh`、shell 参数展开检查、Python 入口 `--help` 和 `git diff --check`；未启动全量推理。
+
+### 2026-09-27 - 移除 RefCOCO 终端阈值判定行
+
+- 文件：修改 `tools/eval_refcoco.py`；更新第 5.1 节终端输出说明。
+- 行为：终端仍报告 cIoU、mIoU、完成样本数和结果路径，不再单独打印 cIoU 阈值 PASS/FAIL 行。阈值及 PASS/FAIL 元数据仍写入 `metrics.json` 和 `results.txt`；`tools/demo.py` 没有该阈值输出，无需修改。
+- 验证：执行评测入口 `--help` 和 Python 编译检查，并确认 `tools/eval_refcoco.py` 不再包含该终端输出语句；未启动 GPU 推理。
+
+### 2026-09-27 - 为 Sa2VA baseline 接入 RefCOCO shell 评测
+
+- 文件：修改 `tools/test_refcoco.sh`；新增 `tools/eval_refcoco_sa2va.py`；同步更新第 5.1、5.6 节模块说明。
+- 行为：shell 根据 checkpoint 的 `model_type` 自动分流；Sa2VA 通过原生 `predict_forward` 获取 segmentation masks 并按 RefCOCO val/unc 普通 prompt 评测 cIoU/mIoU，不再要求 SAMTok 的 VQ-SAM2 与 mask-token 解码器。SAMTok 权重仍由原有严格 mask-protocol evaluator 处理。Sa2VA 逐样本输出可恢复，并记录后端、权重、prompt 和 RLE。
+- 验证：`bash -n`、Sa2VA evaluator `py_compile`、Sa2VA baseline 与 SAMTok-co 两条 shell `--help` 路由及 `git diff --check` 均通过；未启动 GPU 推理或全量评测。
+
+### 2026-10-06 - 新增两个 8B 权重的四卡全 benchmark 编排脚本
+
+- 文件：新增 `tools/eval_8b_all_benchmarks_4gpu.sh`；更新第 2.2、5.1 节及模块清单。
+- 行为：脚本固定四卡，分别隔离基础 `Qwen3-VL-8B-SAMTok` 和 `global_step_179` HF 导出，覆盖 RefCOCO/+/g、GroundingSuite、DLC-Bench、MR-RefCOCO/+/g 与 MR-PACO；MR 默认读取 sibling CycleGRPO 的 `all_data_mix_val/*_val_sampled.json`，按 1--10 round 分配 GPU 并用独立工作目录保存预测。不停止其他 CUDA 进程，并保留原始 OOM traceback。DLC 入口当前仍为单进程，脚本显式记录该实现边界。
+- 验证：`chmod +x`、`bash -n tools/eval_8b_all_benchmarks_4gpu.sh`、`git diff --check` 通过；两个 8B 权重的四卡 RefCOCO 启动探测均只观察到 `torch.OutOfMemoryError: CUDA out of memory`，未观察到路径、导入或权重格式错误；探测进程已停止，其他 GPU 进程未修改。
+
+### 2026-10-06 - 按 MR 审计记录校准四卡评测数据与运行时依赖
+
+- 文件：修改 `tools/eval_8b_all_benchmarks_4gpu.sh`、`projects/vlm/tokenmask/evaluation/qwen3vl/qwen3vl_mrrefcoco_eval.py`、`qwen3vl_mrrefcoco+_eval.py`、`qwen3vl_mrrefcocog_eval.py`、`qwen3vl_mrpaco_eval.py`；更新第 5.6 节和变更日志。
+- 行为：MR 默认切换为 `CycleGRPO/data/segllm_data/conversation_folder/all_data_mix_val/*_val_sampled.json`，使用文档审计的 1--10 round 和四项样本数；四卡 runner 为每个 round 建独立工作目录。四个原生 MR evaluator 将 detectron2 视觉化导入降为可选依赖，推理路径不再因缺少未调用的可视化模块失败。
+- 验证：四个 MR JSON 实际校验为 6678/6655/3746/9281 条且 round 键为 1--10；首次 MR 启动暴露并修复 runner 日志相对路径错误，随后又按审计规则修复相对 COCO 图像路径，最终四卡启动检查已加载 8B 基础模型并进入 MR-RefCOCO round 1 推理；`bash -n`、四脚本 `py_compile` 和 `git diff --check` 通过。该启动检查随后主动停止，未修改其他 GPU 进程。
+
+### 2026-10-06 - 补齐标准 RefCOCO+ / RefCOCOg 数据并修正四卡 split 选择
+
+- 文件：修改 `tools/eval_8b_all_benchmarks_4gpu.sh`；补充服务器数据目录 `/volume/ybo/xyc/refcoco-plus-train2014-assets/` 与 `/volume/ybo/xyc/refcocog-train2014-assets/` 的官方 `instances.json`/refs 文件；更新第 5.6 节。
+- 行为：全 benchmark runner 继续默认使用 RefCOCO/RefCOCO+ 的 `unc`，但 RefCOCOg 改用官方 val 所需的 `umd` split，通过 `REFCOCO_SPLIT_BY` 和 `REFCOCOG_SPLIT_BY` 可覆盖；之前因缺少标注文件退出的两项现在具备完整数据输入。
+- 验证：从官方归档下载并校验 RefCOCO+ 46 MB、RefCOCOg 57 MB 数据包，确认 RefCOCO+ `refs(unc).p` 与 RefCOCOg `refs(umd).p` 非空；shell `bash -n` 和 `git diff --check` 通过；补挂公共 COCO `train2014` 符号链接后，四卡补跑的 base/step179 RefCOCO+（各 10,758 条）与 RefCOCOg（各 4,896 条，`umd`）均退出码 0，主日志 `logs/8b_all_benchmarks_4gpu_missing_retry.log` 记录 `overall_status=0`。
+
+### 2026-10-06 - 对齐 8B RefCOCO 编排器的仓库评测协议并重测
+
+- 文件：修改 `tools/eval_8b_all_benchmarks_4gpu.sh`；新增 `logs/8b_all_benchmarks_4gpu_ordinary/` 下两个 8B 权重的 RefCOCO/+/g 普通 prompt 重测结果与汇总。
+- 行为：8B 统一入口默认固定为普通 prompt `Please segment {phrase} in this image.`，并显式传递给评测入口；left padding、`legacy_union`、batch 16、256 max new tokens、RefCOCO/+/g 的 `unc/unc/umd` split 保持一致。此前结果使用强制正例长 prompt，不能与仓库普通 prompt 对照结果直接比较。
+- 验证：两个 8B 权重的 RefCOCO/+/g 共六项全部完成，样本数分别为 10,834/10,758/4,896；逐样本 metadata 核对 prompt、`legacy_union`、generation batch 16 和 max new tokens 256；`bash -n tools/eval_8b_all_benchmarks_4gpu.sh` 与 `git diff --check` 通过。
+
+### 2026-10-06 - 修正 MR-RefCOCO+ / MR-RefCOCOg 隐式八分之一截取
+
+- 文件：修改 `projects/vlm/tokenmask/evaluation/qwen3vl/qwen3vl_mrrefcoco+_eval.py`、`qwen3vl_mrrefcocog_eval.py`；更新本节 MR evaluator 说明和模块清单。
+- 行为：移除两个 evaluator 中遗留的 `task_id` 八分之一切片逻辑；每个 `round_id` 现在处理该 round 的全部样本，符合四卡 runner 按 round 分配、而不是在 evaluator 内再次分片的协议。旧的 MR-RefCOCO+（836 条）和 MR-RefCOCOg（472 条）汇总不再作为完整结果使用。
+- 验证：先用修复前入口确认旧运行只处理 836/472 条并主动停止；修复后通过 `py_compile`、runner `bash -n` 和 `git diff --check`，随后重新启动两个 8B 权重的四卡完整评测。
+
+### 2026-10-06 - 完成两个 8B 权重 MR-RefCOCO+ / MR-RefCOCOg 全量复测并恢复占卡
+
+- 文件：新增 `logs/8b_all_benchmarks_4gpu_mr_complete/` 下四项完整预测与 `mr_complete_summary.{json,md}`；无新增代码模块。
+- 行为：base 与 step179 均按 1--10 round 完成 MR-RefCOCO+ 6655 条和 MR-RefCOCOg 3746 条，使用修复后的完整 round evaluator；汇总按原生 MR evaluator 的 CIoU/GIoU 定义计算，旧的 836/472 条结果不再作为有效全量结果。
+- 验证：四项输出计数逐项核对为 `6655/6655/3746/3746`，runner 返回 `overall_status=0`；汇总结果写入 `logs/8b_all_benchmarks_4gpu_mr_complete/mr_complete_summary.{json,md}`。评测结束后通过原 `gpu_hold` tmux 会话恢复 GPU 0--3 worker，确认四个 worker 存活且 GPU 0/1 原有进程仍在。
+
+### 2026-10-07 - 新增 100k scaling 数据的 8B SECA 训练入口
+
+- 文件：新增 `tools/train_supervised_100k_seca_8b_8gpu.sh`；修改 `tools/train_supervised_70k_common_8gpu.sh` 以支持 `EXPECTED_*_ROWS_OVERRIDE`；更新第 2.2 节、训练入口说明和模块清单。
+- 行为：新入口保留 8B SECA wrapper 的 Qwen3-VL-8B-SAMTok 模型、SECA/OPSD/direct/DLC-QA 配置、`112/224/56` batch 和 7+1 Ray/judge 拓扑，切换到 `cyclegrpo100k_scaling_20260911` 已生成的 40k self-supervised、32k direct-positive、8k no-target、20k DLC-QA 数据，默认 357 step、独立端口和 run 目录；不会重新生成 100k 数据。公共 launcher 仍保持历史数据规模默认值，仅在 wrapper 显式提供 override 时校验新行数。
+- 验证：检查四个 parquet 和 JSONL 实际行数为 `40000/32000/8000/20000`，执行新 wrapper 的 `DRY_RUN=true` 前置校验、两个 shell `bash -n` 和 `git diff --check`；未启动 Ray、Llama 或正式训练。
+
+### 2026-10-08 - 新增 100k 8B SECA 两卡临时 smoke 入口
+
+- 文件：新增 `tools/train_supervised_100k_seca_8b_2gpu_tmp.sh`；修改 `tools/train_supervised_100k_seca_8b_8gpu.sh`、`tools/train_supervised_70k_common_8gpu.sh`、`verl/trainer/ray_trainer.py`；更新 100k 训练入口说明和模块清单。
+- 行为：临时入口复用 100k 8B SECA 正式脚本的数据、模型和算法配置，将 CUDA 2 固定为单个 Ray/FSDP 训练 rank、CUDA 3 固定为 judge，覆盖为一步训练并关闭结束占卡；公共 launcher 保留 wrapper 对 label-source 开关的覆盖，训练器源校验允许启用的 Stuff/PACO/GRefCOCO direct source；不改变正式 100k 入口。
+- 验证：shell 语法检查、`ray_trainer.py` 编译和 `git diff --check` 通过；最终 CUDA 2/3 smoke 完成数据预检、Ray/judge 健康检查、8B FSDP 加载、CUDA graph、mask tokenizer、112 条 rollout generation 并进入 direct supervision 训练路径；未出现 OOM 或其他运行时错误，按用户要求停止临时进程。随后恢复既有 GPU hold 程序并确认 GPU 0--3 的四个 worker 存活；未触碰其他 GPU 进程。
+
+### 2026-10-10 - 支持 8B global_step_200 的统一四卡 benchmark 入口
+
+- 文件：修改 `tools/eval_8b_all_benchmarks_4gpu.sh`；更新第 5.6 节和模块清单。
+- 行为：统一 8B 评测 runner 新增 `step200` 权重标签，可通过 `WEIGHTS=step200` 与独立 `HF_MODEL_PATH`/`EVAL_ROOT` 评测 intermediate checkpoint 导出的 HF 权重；原有 base/step179 默认路径和评测协议保持不变。
+- 验证：`bash -n tools/eval_8b_all_benchmarks_4gpu.sh`、`git diff --check` 通过；使用项目 `cyclegrpo` 环境的 `tools/reassemble_fsdp_checkpoint.py` 将 `intermediate_checkpoints/global_step_200` 重组为 HF 权重，成功导出 750 个 state-dict entries 和 8 个 safetensors 分片。四卡评测主日志 `logs/cyclegrpo100k_seca_8b_8gpu/evaluation/step200_all_benchmarks_4gpu.log` 返回 `overall_status=0`：RefCOCO/+/g 分别完成 10,834/10,758/4,896 条，GroundingSuite 完成 3,715 条且 mean GIoU 为 0.7254，DLC caption prediction 完成 100 条；MR-RefCOCO/+/g/PACO 分别完成 6,678/6,655/3,746/9,281 条，均按 1--10 round 完成。随后按既有 DLC-Bench 协议以 Llama-3.1-8B 评分，结果为 positive 0.431、negative 0.878、平均 0.654，输出写入 step200 DLC 目录；评测结束后恢复 `gpu_hold` tmux 会话并确认四个占卡 worker 存活。
+
+### 2026-10-11 - 支持并完成 8B global_step_357 全 benchmark 评测
+
+- 文件：修改 `tools/eval_8b_all_benchmarks_4gpu.sh` 支持 `WEIGHTS=step357`；更新第 5.6 节与模块清单。
+- 行为：统一 runner 可通过独立 `HF_MODEL_PATH`/`EVAL_ROOT` 评测 100k 8B 正式训练的 `global_step_357`，输出隔离在 `step357_all_benchmarks_4gpu/step357/`；既有模型标签与评测协议保持不变。
+- 验证：`bash -n` 和 `git diff --check` 通过；由 `tools/reassemble_fsdp_checkpoint.py` 成功导出 750 个 state-dict entries。完整四卡主日志 `logs/cyclegrpo100k_seca_8b_8gpu/evaluation/step357_all_benchmarks_4gpu.log` 返回 `overall_status=0`：RefCOCO/+/g 分别为 10,834/10,758/4,896 条、cIoU/mIoU 为 80.95/81.51、75.48/77.38、77.60/78.35；GroundingSuite 3,715 条、mean GIoU 0.7230；DLC prediction 100 条；MR-RefCOCO/+/g/PACO 分别 6,678/6,655/3,746/9,281 条且各自完成 1--10 round。DLC Llama-3.1-8B 评分 positive/negative/平均为 0.476/0.864/0.670。评测和 judge 退出后恢复四卡 `gpu_hold`。

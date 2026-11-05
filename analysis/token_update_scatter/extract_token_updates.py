@@ -34,7 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--opsd", required=True)
     p.add_argument("--teacher", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--n", type=int, default=16)
+    # The 16-row pass is a smoke test; the maintained figure target is 128
+    # held-out rows (256 depth-2 code tokens when every row is valid).
+    p.add_argument("--n", type=int, default=128)
     p.add_argument("--seed", type=int, default=20260921)
     p.add_argument("--max-memory-gib", type=int, default=28)
     p.add_argument("--device", default="cuda")
@@ -187,6 +189,7 @@ def main() -> None:
         "data": os.path.abspath(args.data),
         "seed": args.seed,
         "n_rows": len(rows),
+        "target_rows": 128,
         "valid_tokens": int(valid.sum()),
         "coverage": float(valid.mean()),
         "base_checkpoint": os.path.abspath(args.base),

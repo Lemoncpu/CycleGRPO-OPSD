@@ -23,6 +23,10 @@ PYTHONPATH=. /volume/ybo/xyc/envs/cyclegrpo/bin/python \
   --output-dir analysis/token_update_scatter
 ```
 
+当前提交的 PNG/PDF 是 16 行、32 个真实 mask-code token 的 smoke-sized 版本。二维/三维图底部增加了
+同一批 token 的 paired `Δlog p`（OPSD−GRPO）条带，标题报告描述性 Spearman `ρ_s`，没有复制、抖动或拟合任何点。
+正式扩展应在 GPU 空闲后使用 `--n 128` 重新提取 128 行（约 256 个 token）；不能用 synthetic preview 补点。
+
 这是一项 checkpoint-to-checkpoint 机制诊断：两套历史训练使用了不同的训练 parquet，未重新执行配对
 GRPO/OPSD optimizer step，因此不能表述为公平 objective 消融、独立 correctness 证明、benchmark 结果或
 因果 credit。3D 的 reliability 明确定义为 base 对 GT mask-code 序列的 `exp(mean log p)`，不是训练代码的
