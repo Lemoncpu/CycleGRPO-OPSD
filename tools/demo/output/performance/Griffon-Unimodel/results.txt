@@ -1,0 +1,10 @@
+RefCOCO PERFORMANCE TEST RESULTS
+Model: /volume/ybo/xyc/models/Griffon-Unimodel
+Dataset: RefCOCO val (unc)
+Samples: 10834/10834
+cIoU: 83.1658
+mIoU: 83.4395
+cIoU threshold: 70.0000
+Status: PASS
+Prompt: Please segment {phrase} in this image.
+Mask protocol: legacy_union

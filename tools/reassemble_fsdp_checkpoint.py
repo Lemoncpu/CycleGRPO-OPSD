@@ -199,9 +199,13 @@ def _save_huggingface_model(state_dict: dict[str, Any], model_path: str, output_
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # Do not enumerate the complete AutoModel mapping here.  Transformers
+    # lazily imports every registered vision model while resolving that
+    # mapping; on this server an unrelated Gemma3n entry requires a newer
+    # timm and can abort an otherwise valid Qwen3-VL export.
     model_class = (
         AutoModelForImageTextToText
-        if type(config) in AutoModelForImageTextToText._model_mapping.keys()
+        if getattr(config, "model_type", None) == "qwen3_vl"
         else AutoModelForCausalLM
     )
     with init_empty_weights():

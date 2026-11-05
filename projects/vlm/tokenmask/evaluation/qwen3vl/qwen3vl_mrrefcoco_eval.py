@@ -20,11 +20,14 @@ from qwen_vl_utils import process_vision_info
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 
 from types import MethodType
-from detectron2.data import MetadataCatalog
-from detectron2.utils.visualizer import ColorMode, Visualizer
-
-from detectron2.data.detection_utils import read_image, _apply_exif_orientation, convert_PIL_to_numpy
-from detectron2.utils.visualizer import GenericMask
+try:
+    from detectron2.data import MetadataCatalog
+    from detectron2.utils.visualizer import ColorMode, Visualizer, GenericMask
+    from detectron2.data.detection_utils import read_image, _apply_exif_orientation, convert_PIL_to_numpy
+except ModuleNotFoundError:
+    # MR inference does not call the legacy visualization helper; keep the
+    # evaluator usable in the lightweight project environment.
+    MetadataCatalog = ColorMode = Visualizer = GenericMask = None
 import matplotlib.colors as mplc
 def draw_instance_predictions_cache(self, labels, np_masks, jittering: bool = True):
     """

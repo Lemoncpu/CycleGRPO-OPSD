@@ -1,0 +1,43 @@
+{
+  "case_id": "371426030_646af53def_o",
+  "dataset": "ReasonSeg val",
+  "instruction": "Can you segment the the food that the bird likes to eat in this image?",
+  "visual_prompt": "无",
+  "text": [
+    "the food that the bird likes to eat"
+  ],
+  "is_sentence": false,
+  "shapes": [
+    {
+      "label": "target",
+      "labels": [
+        "target"
+      ],
+      "shape_type": "polygon",
+      "image_name": "371426030_646af53def_o.jpg",
+      "points": [
+        [
+          724.2727272727273,
+          3.8311688311688243
+        ],
+        [
+          1026.8701298701299,
+          0.0
+        ],
+        [
+          993.1038961038961,
+          1199.0
+        ],
+        [
+          691.8051948051948,
+          1199.0
+        ]
+      ],
+      "group_id": null,
+      "group_ids": [
+        null
+      ],
+      "flags": {}
+    }
+  ]
+}

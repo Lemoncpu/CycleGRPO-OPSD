@@ -2337,7 +2337,7 @@ class RayPPOTrainer:
                             and direct_mask_ce_config.include_positive_sources
                         )
                     ):
-                        allowed_direct_sources.add("refcoco_cycle")
+                        allowed_direct_sources.update({"refcoco_cycle", "grefcoco_cycle"})
                     if (
                         (
                             direct_grounding_config.enabled
@@ -2349,10 +2349,20 @@ class RayPPOTrainer:
                         )
                     ):
                         allowed_direct_sources.add("gres_no_target")
+                    if (
+                        (
+                            direct_grounding_config.enabled
+                            and direct_grounding_config.include_label_sources
+                        )
+                        or (
+                            direct_mask_ce_config.enabled
+                            and direct_mask_ce_config.include_label_sources
+                        )
+                    ):
+                        allowed_direct_sources.update({"cocostuff_cycle", "paco_part_cycle"})
                     if not direct_sources or not direct_sources.issubset(allowed_direct_sources):
                         raise ValueError(
-                            "Direct supervision data may contain only enabled human-expression sources "
-                            "refcoco_cycle and gres_no_target; "
+                            "Direct supervision data may contain only enabled direct-grounding sources; "
                             f"allowed={sorted(allowed_direct_sources)}, got={sorted(direct_sources)}."
                         )
                 if cycle_batch is not None and (

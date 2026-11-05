@@ -1,0 +1,26 @@
+{
+  "task_name": "refcoco_performance",
+  "model_path": "/volume/ybo/xyc/models/Griffon-Unimodel",
+  "dataset": "RefCOCO val (unc)",
+  "samples_expected": 10834,
+  "samples_completed": 10834,
+  "prompt_template": "Please segment {phrase} in this image.",
+  "mask_protocol": "legacy_union",
+  "max_new_tokens": 256,
+  "batch_size_per_gpu": 16,
+  "gpus": [
+    "0",
+    "1",
+    "2",
+    "3"
+  ],
+  "metrics": {
+    "samples": 10834,
+    "cIoU": 83.16581448649663,
+    "mIoU": 83.43950452181772
+  },
+  "ciou_threshold": 70.0,
+  "passed": true,
+  "predictions": "/volume/ybo/xyc/CycleGRPO-OPSD/tools/demo/output/performance/Griffon-Unimodel/predictions",
+  "logs": "/volume/ybo/xyc/CycleGRPO-OPSD/tools/demo/output/performance/Griffon-Unimodel/logs"
+}

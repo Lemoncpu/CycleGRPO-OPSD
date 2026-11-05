@@ -1,0 +1,36 @@
+{
+  "task_name": "refcoco",
+  "title": "指代分割",
+  "dataset": "RefCOCO val (UNC)",
+  "case_id": "115981",
+  "image": "/volume/ybo/xyc/refcoco-train2014-assets/train2014/COCO_train2014_000000105685.jpg",
+  "instruction": "Please segment man on right in this image.",
+  "query": "man on right",
+  "output": "<think>\n\n</think>\n\n```json\n[{\"mask_2d\": \"<|mt_start|><|mt_0075|><|mt_0473|><|mt_end|>\", \"label\": \"man on right\"}]\n```<|im_end|>",
+  "mask_groups": [
+    [
+      75,
+      217
+    ]
+  ],
+  "mask_protocol": "legacy_union",
+  "prediction_rle": {
+    "size": [
+      640,
+      480
+    ],
+    "counts": "fo[6a0]c07G6L5H:G:H4K6K5K5L2L7J5K4L4L5K4J6L4I8I5N2L6K5J7e@eKh>k4M5K6TBbJl<d5`B^J52Y=Y6M3N2N1O2M2O1O2N1O1O1O1O2O0O101N2N2O1O000O2N1000O01O1M3N2O1O1O101O0O1000000O100O10000O100N2O1O1O1O1M3M3O1N2N2M3N2N1O2L4M3K5M3N2N2L4M3N2L4N2N2N3M2N2O1O1O1O1O1O1O1O2N1O1O3N0O100O010O10M2N3N1O2O0O2O0O2O0O2O1O1N2O1O1O1O1N2O1O1O1N2O1O1O2M2O011N1O1O101N10XN"
+  },
+  "target_rle": {
+    "size": [
+      640,
+      480
+    ],
+    "counts": "l_Y61lc08H8H7J5J6J6J6J7I7J6J6K3L4L4L4M3L4L4L4M3L4@`0L4L4L4L3k@dKb>`4ZAeK23i=\\4PBhKM4o=X4oA^L9jNX=T6cBoI[=]6M2N3N1O1O2N1O100O1O1O1O2N100YCPI]<]7L2O1N2O1O1N2O0OCmCoHS<Q7PDlHP<T7=100K5N110O10000O10000O10000O10000O01000O100O1N2N2M3N2M3N2M3N2M3N2M3N2M3M3M3N2M3M4L3M3M3N2N2N2N2N2N2O2M2N2O1O1O100O1O100O2N100O1O10O0O2O1O0O2O1N101O1N2O0O2O1O0O2O1O1N101N2O001O1O1O2N100O2N1O100N3M2N2N3M[N"
+  },
+  "intersection": 37442,
+  "union": 38412,
+  "iou": 0.9747474747474747,
+  "visualization": "/volume/ybo/xyc/CycleGRPO-OPSD/tools/demo/output/visualization/refcoco.jpg",
+  "model_path": "/volume/ybo/xyc/CycleGRPO-OPSD/logs/cyclegrpo70k_historical_seca_8gpu/evaluation/step_179_cpu_export/hf_global_step_179"
+}

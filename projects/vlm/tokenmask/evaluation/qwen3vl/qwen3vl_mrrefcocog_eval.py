@@ -20,11 +20,12 @@ from qwen_vl_utils import process_vision_info
 from projects.transformers.vq_sam2 import VQ_SAM2, VQ_SAM2Config, SAM2Config
 
 from types import MethodType
-from detectron2.data import MetadataCatalog
-from detectron2.utils.visualizer import ColorMode, Visualizer
-
-from detectron2.data.detection_utils import read_image, _apply_exif_orientation, convert_PIL_to_numpy
-from detectron2.utils.visualizer import GenericMask
+try:
+    from detectron2.data import MetadataCatalog
+    from detectron2.utils.visualizer import ColorMode, Visualizer, GenericMask
+    from detectron2.data.detection_utils import read_image, _apply_exif_orientation, convert_PIL_to_numpy
+except ModuleNotFoundError:
+    MetadataCatalog = ColorMode = Visualizer = GenericMask = None
 import matplotlib.colors as mplc
 def draw_instance_predictions_cache(self, labels, np_masks, jittering: bool = True):
     """
@@ -297,13 +298,7 @@ def main():
             all_data_dict.append(item)
             case_id += 1
 
-    rows = len(all_data_dict)
-    chunk_size = (rows+7) // 8
-    _start_ = args.task_id * chunk_size
-    _end_ = _start_ + chunk_size
-    _end_ = rows if _end_ > rows else _end_
-
-    for data_dict in tqdm.tqdm(all_data_dict[_start_:_end_]):
+    for data_dict in tqdm.tqdm(all_data_dict):
         image_path = data_dict['image']
         history_chat = data_dict['history']
         target_masks = data_dict['target_masks']

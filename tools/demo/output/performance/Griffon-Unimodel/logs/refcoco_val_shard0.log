@@ -1,0 +1,5 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+Unrecognized keys in `rope_scaling` for 'rope_type'='default': {'rope_theta'}
+[task 0/4] evaluating 2709 RefCOCO samples on cuda:0 with batch_size=16, mask_protocol=legacy_union.
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 34.32it/s]
+The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
